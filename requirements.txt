@@ -1,0 +1,32 @@
+# ── Install first ──────────────────────────────────────────────
+# setuptools provides 'distutils', removed in Python 3.12+.
+setuptools
+packaging
+
+# ── Terminal UI ────────────────────────────────────────────────
+rich>=13.0.0
+questionary>=2.0.0
+
+# ── Routing brain ──────────────────────────────────────────────
+requests
+
+# ── Browser automation (only needed for real runs) ────────────
+undetected-chromedriver
+selenium>=4.0.0
+
+# ── File attachments: text extraction (optional but recommended) ─
+# Without these, PDFs/DOCX are still uploaded to tools — only inline
+# text extraction is skipped. Plain text/code/csv/json need nothing.
+pypdf
+python-docx
+
+# ── Voice input (SPACE-to-speak at the prism › prompt) — OPT-IN ─
+# Commented out so the main installer never breaks: pyaudio needs
+# PortAudio on the system first (macOS: `brew install portaudio`,
+# Debian/Ubuntu: `sudo apt install portaudio19-dev`). Then:
+#   pip install pyaudio
+# Without it, the prompt is typed-only (exactly as before).
+# pyaudio
+#
+# The standalone whisper.py reference app additionally needs:
+#   pip install numpy aiohttp

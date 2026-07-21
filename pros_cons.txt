@@ -1,0 +1,140 @@
+Perplexity:
+Pros:
+1)good at web scraping
+2)good at understanding research paper and finding the relevance
+3)quick output
+Cons:
+1)doesn’t have good RAG model , it forgets things
+2)answers we get are short
+3)relatively less accurate answers
+4)expensive for paid plans
+5)less tokens for free version
+6)not good for understanding documents, tokens will exhaust
+7)cross questions are good
+My recommendation:
+1)we can use perplexity for webscraping mainly, it doest reason well and not good for multiple prompts.its better for 1 prompt for web scraping and getting the knowledge accordingly
+
+Lazycook:
+Pros:
+1)deep knowledge about the topic
+2)good for research purpose
+3)webscraping is done on pretty good level
+4)used for high level high level understanding about the topic
+cons:
+1)takes much time to give output
+2)memory model is not the best , best for 1 prompt
+My recommendation:
+1)we can use lazycook as a one time shot, it takes time but it gives you the answer perfectly. So what I would suggest is that don’t cross question it , we can also use lazycook as replacement of webscarping ability of perplexity and the reasoning and giving knowledge about the scraped content doing 2 tasks perfectly at a time.
+
+Chatgpt:
+Pros:
+1)best image generation
+2)best context limit
+3)good for understanding the documents
+4)very quick response
+5)best human like reasoning
+Cons:
+1)hallucinates a lot
+2)not good for research purpose.
+3)gives short answers
+My recommendation:
+We can use chatgpt for some simple transcription of documents, reasoning tasks, cross questioning prompts, best for image generation
+
+Claude:
+Pros:
+1)best for coding
+2)best for technical understanding
+3)best for making the documents(pdf, ppt, md,txt,docs)
+4)it can make both frontend+backend
+5)webscraping done on good scale
+6)good RAG model
+7)good context limit for the input
+Cons:
+1)the time of output can be variable
+2)not good production of frontend
+3)certainly not good with good templates in ppt
+4)cross questioning after giving a heavy coding task can be time consuming
+5)the free model doesn’t provide much tokens
+My recommendation:
+We can use for the making all types of documents from the input given. It’s very good for backend and frontend if the user wants the backend working with frontend.
+Not good for designing the landing pages and all. Good for making quick ppt and deck making
+
+Gamma:
+Pros:
+1)best for presentations
+Cons:
+1. You must provide it with the actual document if given by the user to the prism in terminal
+2. It takes much time
+3. The user have to select the template
+  4. Not easy to work with through automation
+My recommendation:
+It should not be given the files if there are any inserted in the prism , it should also receive the structure of slide, and information.
+
+kimi2.6:
+Pros:
+1.fast
+2.can be mainly used for web designing, website analyses and fetching information
+3.interactive websites
+4.has a good token limit so if web design is there do provide it with files as well
+Cons:
+1)might give the result in Chinese
+2)have token limit for the free user
+3)shouldn’t be used as the research tool.
+My recommendation:
+Do use this as a web design and analysis tool
+
+Omma:
+Pros:
+1)good 3d type websites
+2)
+Cons:
+1)not good with token limit for the free users
+My recommendation:
+Only to be used when the user has premium
+== MULTI-FILE TASKS (routing rules) ==
+- When MULTIPLE files are attached: ChatGPT must do the file analysis first.
+  It has the biggest intake (up to 20 files per message on paid; the FREE plan
+  allows only a handful of uploads per day, so keep attachments few and vital).
+- When multiple files feed a DELIVERABLE (deck, visual layout, design piece):
+  prefer Claude Design as the make-stage.
+- Claude Design CANNOT edit or process video files - it never receives video.
+  Reels from real phone footage are a video-tool job (Runway at best, and even
+  Runway restyles single clips rather than editing many clips together).
+
+== VIDEO/REEL TASKS — pick by what the source material actually is ==
+- Real footage assembly (business already has phone-shot clips of products,
+  clients, sites and wants them cut together with branded intro/outro,
+  captions, music, animated overlays, tailored per platform/audience —
+  Instagram vs LinkedIn vs an investor pitch): use InVideo AI. It is
+  prompt-driven like Prism's other tools and edits the user's OWN uploaded
+  clips together rather than generating new ones.
+- Pure generated cinematic video (no real footage exists yet, everything is
+  AI-imagined motion/scenes): use Runway.
+- Deck/design work from documents, images or brand assets (no video
+  involved): use Claude Design.
+- Don't default every "make a reel/video" request to Runway — ask (or infer
+  from attachments) whether real footage exists first. If it does, InVideo AI
+  is almost always the better fit.
+
+== NOTEBOOKLM — pick this over a plain research/brains tool when the task is ==
+- Explaining/summarizing a LARGE amount of source material at once (many
+  files, long documents, a whole project/codebase's worth of context, long
+  video transcripts) rather than a single narrow question.
+- The deliverable itself is an explainer VIDEO or narrated walkthrough:
+  NotebookLM has a built-in "Video Overview" generator (and "Audio Overview",
+  podcast-style) built specifically to turn a pile of uploaded source
+  material into a spoken/visual explanation — this is a real, distinct
+  capability, not just document Q&A.
+- Concretely: a request like "explain our whole project/workflow/every tool
+  we use, make it a video I can show someone" is a NotebookLM job first, even
+  though it looks like a generic "media"/video task.
+- NotebookLM is listed under BOTH "research" and "media" for exactly this
+  reason — its Video/Audio Overview output IS the finished video, not a
+  research brief that still needs a separate video-maker afterwards. When
+  the deliverable is an explainer video built FROM a large pile of the
+  user's own material, assign NotebookLM as the MEDIA-stage tool directly
+  (not Runway/InVideo AI/Claude Design) — those only animate a script or
+  restyle real footage, they don't digest and explain source material.
+- Still prefer Perplexity/Consensus/WolframAlpha for narrow, single-fact or
+  live-web lookups — NotebookLM needs the material uploaded/attached first,
+  it doesn't search the open web.

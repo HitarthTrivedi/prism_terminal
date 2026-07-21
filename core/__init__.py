@@ -1,0 +1,1 @@
+"""Prism Terminal — core package."""

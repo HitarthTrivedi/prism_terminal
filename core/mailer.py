@@ -125,6 +125,25 @@ def recipients_from_text(text: str):
 
 # ── the draft (what the AI produced) ──────────────────────────────────────────
 
+# Fingerprints of the instructions Prism itself typed into the tool. A scrape
+# that contains any of them is our own prompt read back off the page — several
+# tools render the user's message with the same CSS classes as the reply — and
+# it parses as a perfectly valid draft whose subject is "<one subject line>".
+_PROMPT_MARKERS = (
+    "your only task is",
+    "reply with nothing except",
+    "<one subject line>",
+    "<the full email body>",
+    "strict pipeline rules",
+    "every character you output will be sent",
+)
+
+
+def is_prompt_echo(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _PROMPT_MARKERS)
+
+
 def parse_draft(text: str):
     """Pull (subject, body) out of the drafting agent's answer. The agent is
     ordered to reply in exactly 'SUBJECT: …' / 'BODY: …' — but scrapes can
@@ -135,14 +154,23 @@ def parse_draft(text: str):
     t = re.sub(r"^```[a-z]*\n|\n```$", "", t)                    # markdown fences
     t = re.split(r"\n\s*HANDOFF\b", t, flags=re.IGNORECASE)[0]   # leaked handoff
 
-    m = re.search(r"^\s*SUBJECT:\s*(.+)$", t, re.IGNORECASE | re.MULTILINE)
-    if not m:
-        return None
-    subject = m.group(1).strip()
-
-    b = re.search(r"^\s*BODY:\s*", t[m.end():], re.IGNORECASE | re.MULTILINE)
-    body = t[m.end() + b.end():].strip() if b else t[m.end():].strip()
-    return (subject, body) if body else None
+    # Take the LAST SUBJECT: on the page, not the first. When the capture also
+    # holds the prompt (or the tool restated the format before answering), the
+    # earlier ones are the template and the real draft is the final block.
+    # Tools love to bold the labels: **SUBJECT:** … / **BODY:** …
+    for m in reversed(list(re.finditer(r"^[ \t]*\**\s*SUBJECT\s*\**\s*:\s*\**(.+)$",
+                                       t, re.IGNORECASE | re.MULTILINE))):
+        subject = m.group(1).strip().strip("*").strip()
+        # A placeholder straight out of our own instructions is never a draft.
+        if not subject or subject.startswith("<") or is_prompt_echo(subject):
+            continue
+        rest = t[m.end():]
+        b = re.search(r"^[ \t]*\**\s*BODY\s*\**\s*:\s*\**[ \t]*\n?", rest,
+                      re.IGNORECASE | re.MULTILINE)
+        body = rest[b.end():].strip() if b else rest.strip()
+        if body and not body.startswith("<") and not is_prompt_echo(body):
+            return subject, body
+    return None
 
 
 # ── account setup ─────────────────────────────────────────────────────────────
@@ -152,9 +180,77 @@ def smtp_for(address: str):
     return _SMTP_HOSTS.get(domain)
 
 
+# Google shows app passwords as four groups of four — "abcd efgh ijkl mnop" —
+# and people paste them exactly as shown, spaces and all. Gmail's SMTP then
+# rejects the login with the same 535 it gives a wrong password, which is the
+# single most common reason sending "just doesn't work".
+_APP_PASSWORD = re.compile(r"^([A-Za-z0-9]{4}[ \t ]){3}[A-Za-z0-9]{4}$")
+
+
+def clean_password(password: str) -> str:
+    """Trim a pasted password. Outer whitespace always goes; inner spaces go
+    only when the string is exactly an app password's shape, because a real
+    passphrase is allowed to contain spaces and we must not corrupt it."""
+    p = (password or "").strip().replace(" ", " ")
+    if _APP_PASSWORD.match(p):
+        return re.sub(r"\s+", "", p)
+    return p
+
+
+def explain_error(error: str, address: str = "") -> str:
+    """Turn an smtplib failure into the sentence that actually unblocks the
+    user. The raw text ('(535, b\\'5.7.8 Username and Password not accepted\\')')
+    says nothing about app passwords, which is what it almost always means."""
+    e = (error or "").lower()
+    domain = address.rsplit("@", 1)[-1].lower() if "@" in address else ""
+    if "535" in e or "auth" in e or "username and password" in e:
+        if domain in ("gmail.com", "googlemail.com"):
+            return ("Google rejected the sign-in. Gmail needs a 16-character "
+                    "APP PASSWORD (not your Google password), created at "
+                    "myaccount.google.com/apppasswords with 2-Step "
+                    "Verification switched on.")
+        if domain in ("outlook.com", "hotmail.com", "live.com"):
+            return ("Microsoft rejected the sign-in. Personal Outlook accounts "
+                    "no longer allow SMTP passwords — you need an app password "
+                    "from account.microsoft.com/security, or a different "
+                    "sending account.")
+        if domain in ("yahoo.com",):
+            return ("Yahoo rejected the sign-in. Generate an app password "
+                    "under Account Security → App passwords.")
+        return ("The server rejected that address/password. Most providers "
+                "require an app password for SMTP rather than your normal one.")
+    if "certificate" in e or "ssl" in e:
+        return ("TLS handshake failed — check the port: 465 is SSL, 587 is "
+                "STARTTLS. Using the wrong one for your host fails like this.")
+    if "getaddrinfo" in e or "name or service" in e or "resolve" in e:
+        return "Couldn't resolve the SMTP host — check it for typos."
+    if "timed out" in e or "timeout" in e:
+        return ("The mail server didn't answer. Some networks block SMTP "
+                "ports — try another connection, or port 587 instead of 465.")
+    return error
+
+
 def is_configured(cfg: dict) -> bool:
     ec = cfg.get("email") or {}
     return bool(ec.get("address") and ec.get("password") and ec.get("host"))
+
+
+def verify(cfg: dict) -> str:
+    """Open a session and log in, then hang up. Returns "" on success or a
+    human error. Credentials are otherwise only ever tested by a real blast,
+    which is the worst moment to discover that Gmail wants an app password."""
+    ec = (cfg or {}).get("email") or {}
+    if not is_configured(cfg or {}):
+        return "No sending account is set up yet."
+    try:
+        server = _connect(ec, timeout=30)
+    except Exception as e:
+        return explain_error(str(e), ec.get("address", ""))
+    try:
+        server.quit()
+    except Exception:
+        pass
+    return ""
 
 
 # ── sending ───────────────────────────────────────────────────────────────────
@@ -166,7 +262,9 @@ def _connect(ec: dict, timeout: int = 60):
     else:
         server = smtplib.SMTP(ec["host"], int(ec["port"]), timeout=timeout)
         server.starttls(context=ssl.create_default_context())
-    server.login(ec["address"], ec["password"])
+    # Cleaned here as well as at save time, so an account stored by an older
+    # build (spaced app password → permanent 535) starts working by itself.
+    server.login(ec["address"].strip(), clean_password(ec["password"]))
     return server
 
 
@@ -202,23 +300,39 @@ def _build_message(ec, recipient, subject, body, files):
 
 
 def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
-              files: list[dict], delay: float = SEND_DELAY):
+              files: list[dict], delay: float = SEND_DELAY,
+              on_progress=None, should_stop=None):
     """Send the draft to every recipient, one message each (so {name} can be
     personalised and one bad address can't sink the rest).
-    Returns (sent emails, [(email, error), …])."""
+    Returns (sent emails, [(email, error), …]).
+
+    on_progress(i, total, email, ok, error) is called after every attempt, and
+    should_stop() is polled between them — a blast of 200 addresses takes
+    minutes at SEND_DELAY, and the GUI needs both a live count and a way out.
+    Neither is used by the CLI, which has ui.* and Ctrl-C for the same jobs."""
     ec = cfg["email"]
     timeout = _send_timeout(files)
     if timeout > 60:
         ui.info(f"   📦  large attachment(s) — allowing up to {timeout}s per send")
     server = _connect(ec, timeout)
     sent, failed = [], []
+
+    def report(i, r, ok, error=""):
+        if on_progress:
+            on_progress(i, len(recipients), r["email"], ok, error)
+
     try:
         for i, r in enumerate(recipients, 1):
+            if should_stop and should_stop():
+                ui.warn(f"stopped after {len(sent)} send(s) — "
+                        f"{len(recipients) - i + 1} not attempted")
+                break
             msg = _build_message(ec, r, subject, body, files)
             try:
                 server.send_message(msg)
                 sent.append(r["email"])
                 ui.info(f"   ✉️   {i}/{len(recipients)}  {r['email']}")
+                report(i, r, True)
             except smtplib.SMTPServerDisconnected:
                 # Provider dropped the connection mid-run — reconnect once.
                 try:
@@ -226,14 +340,24 @@ def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
                     server.send_message(msg)
                     sent.append(r["email"])
                     ui.info(f"   ✉️   {i}/{len(recipients)}  {r['email']}  (reconnected)")
+                    report(i, r, True)
                 except Exception as e:
                     failed.append((r["email"], str(e)))
                     ui.err(f"   ✗   {r['email']}: {e}")
+                    report(i, r, False, str(e))
             except Exception as e:
                 failed.append((r["email"], str(e)))
                 ui.err(f"   ✗   {r['email']}: {e}")
+                report(i, r, False, str(e))
             if i < len(recipients):
-                time.sleep(delay)
+                # Split the pause so a cancel lands in ~a quarter second
+                # instead of after the full provider-friendly delay.
+                waited = 0.0
+                while waited < delay:
+                    if should_stop and should_stop():
+                        break
+                    time.sleep(min(0.25, delay - waited))
+                    waited += 0.25
     finally:
         try:
             server.quit()

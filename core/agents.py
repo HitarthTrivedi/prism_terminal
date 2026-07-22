@@ -91,16 +91,23 @@ _GENERIC = {
 }
 
 
+# How generous the caps are. wait_time is a CEILING, not a sleep: _smart_wait
+# returns the moment the answer settles, so a bigger number costs a fast tool
+# nothing and only buys headroom for a slow one. The old floor of 120s was
+# routinely hit by reasoning models and by any tool that renders a document,
+# and hitting it means the run walks away from an answer that was seconds out.
+WAIT_FLOOR = 300          # 5 min for even the quickest tool
+WAIT_MULTIPLIER = 2.0     # slow tools scale from their registered estimate
+WAIT_CEILING = 1800       # 30 min — past this something is genuinely stuck
+
+
 def _agent(url, specialty, cost, avg, wait, **overrides):
     base = {
         "url": url,
         "specialty": specialty,
         "cost": cost,
         "avg": avg,
-        # wait_time is a CAP, not a sleep — _smart_wait returns as soon as the
-        # response settles. Floor of 2 minutes so no agent gets cut off early;
-        # slower tools keep their larger values.
-        "wait_time": max(wait, 120),
+        "wait_time": int(min(max(wait * WAIT_MULTIPLIER, WAIT_FLOOR), WAIT_CEILING)),
         **_GENERIC,
     }
     base.update(overrides)

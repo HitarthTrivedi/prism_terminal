@@ -655,7 +655,8 @@ def cmd_email(cfg, arg: str, attachments: list):
         else:
             host = _ask_text("SMTP host (e.g. smtp.yourcompany.com):")
             port = _ask_text("SMTP port (465 = SSL, 587 = STARTTLS):", default="587")
-        cfg["email"] = {"address": address.strip(), "password": password,
+        cfg["email"] = {"address": address.strip(),
+                        "password": mailer.clean_password(password),
                         "host": host, "port": int(port)}
         C.save(cfg)
         ui.ok(f"Email account saved ({address} via {host}).")
@@ -706,6 +707,8 @@ def cmd_email(cfg, arg: str, attachments: list):
     draft_stage = avail[-1]
     routing = {draft_stage: {"needed": True,
                              "reason": "write the email draft — and ONLY the draft",
+                             # the wait isn't over until the draft marker shows
+                             "expect": "SUBJECT:",
                              "questions": [mailer.draft_question(arg)]}}
 
     ui.routing_plan(routing, agents)
@@ -722,7 +725,8 @@ def cmd_email(cfg, arg: str, attachments: list):
     responses, links = automation.run(routing, cfg, attachments=source_files,
                                       query=f"write an email: {arg}")
 
-    draft_texts = responses.get(draft_stage) or []
+    draft_texts = [t for t in (responses.get(draft_stage) or [])
+                   if not mailer.is_prompt_echo(t)]
     draft = mailer.parse_draft(draft_texts[0] if draft_texts else "")
     if not draft:
         ui.err("Couldn't find a 'SUBJECT: … / BODY: …' draft in the response.")

@@ -65,36 +65,101 @@ def detect_chrome_version() -> int | None:
     return None
 
 
-def _setup_chrome_driver(version_main=None):
-    """Clone the user's real Chrome profile into a temp dir so their logins are
-    available, then launch undetected-chromedriver against it."""
-    import undetected_chromedriver as uc
+# Prism's own browser profile. It lives beside the config (NOT in /tmp, which
+# the OS clears on reboot) and it PERSISTS: every login you complete inside the
+# automated window — including the ones a tool forces mid-run — is still there
+# next time. It used to be wiped and re-cloned on every launch, which meant any
+# session Prism itself established was thrown away, and a tool that had logged
+# you out once stayed logged out forever.
+PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".prism", "chrome_profile")
 
-    system=platform.system()
-    if system=="Linux":
-        src=os.path.expanduser("~/.config/google-chrome")
-    elif system=="Windows":
-        src = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data")
-    elif system=="Darwin":
-        src = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-    else:
-        ui.err("prism yet doesnt support your OS")
-        raise RuntimeError(f"Unsupported operating system: {system}")
+# Caches are re-created on demand and are the bulk of a Chrome profile —
+# copying them makes seeding take minutes and adds nothing. Logins live in
+# Cookies / Login Data / Local Storage / IndexedDB, which are all kept.
+_PROFILE_SKIP = shutil.ignore_patterns(
+    "Singleton*", "*.lock", "Cache", "Cache*", "Code Cache", "GPUCache",
+    "ShaderCache", "GrShaderCache", "DawnCache", "DawnGraphiteCache",
+    "DawnWebGPUCache", "Service Worker", "Application Cache", "Media Cache",
+    "component_crx_cache", "extensions_crx_cache", "optimization_guide*",
+    "segmentation_platform", "Crashpad", "blob_storage",
+)
 
-    tmp = os.path.join(tempfile.gettempdir(), "uc_chrome_prism_terminal")
-    if os.path.exists(tmp):
-        shutil.rmtree(tmp, ignore_errors=True)
-    os.makedirs(tmp, exist_ok=True)
 
+def user_chrome_dir() -> str:
+    """Where the real Chrome keeps its profiles on this OS."""
+    system = platform.system()
+    if system == "Linux":
+        return os.path.expanduser("~/.config/google-chrome")
+    if system == "Windows":
+        return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google",
+                            "Chrome", "User Data")
+    if system == "Darwin":
+        return os.path.expanduser("~/Library/Application Support/Google/Chrome")
+    ui.err("prism yet doesnt support your OS")
+    raise RuntimeError(f"Unsupported operating system: {system}")
+
+
+def profile_is_seeded() -> bool:
+    default = os.path.join(PROFILE_DIR, "Default")
+    return any(os.path.exists(os.path.join(default, f))
+               for f in ("Cookies", "Preferences", "Login Data"))
+
+
+def seed_profile(force: bool = False) -> bool:
+    """Copy the real Chrome profile into Prism's, once. Returns True if it
+    copied. Call with force=True to refresh from the real browser — that's the
+    fix for 'I logged into the tool in my normal Chrome but Prism still asks'."""
+    if profile_is_seeded() and not force:
+        return False
+    src = user_chrome_dir()
     src_default = os.path.join(src, "Default")
-    if os.path.exists(src_default):
-        shutil.copytree(
-            src_default, os.path.join(tmp, "Default"), dirs_exist_ok=True,
-            ignore=shutil.ignore_patterns("Singleton*", "*.lock"),
-        )
+    if not os.path.exists(src_default):
+        os.makedirs(os.path.join(PROFILE_DIR, "Default"), exist_ok=True)
+        ui.warn("No Chrome profile found to copy — starting a blank one. "
+                "Sign in to your tools in the window Prism opens.")
+        return False
+    # A running Chrome hasn't flushed its newest cookies to disk, so a copy
+    # taken now can be missing the login the user just completed.
+    if os.path.exists(os.path.join(src, "SingletonLock")):
+        ui.warn("Chrome is running — close it for the most reliable copy of "
+                "your logins.")
+    ui.info("   🧬  copying your Chrome logins into Prism's profile (once)…")
+    if force and os.path.exists(PROFILE_DIR):
+        shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    shutil.copytree(src_default, os.path.join(PROFILE_DIR, "Default"),
+                    dirs_exist_ok=True, ignore=_PROFILE_SKIP)
     local_state = os.path.join(src, "Local State")
     if os.path.exists(local_state):
-        shutil.copy2(local_state, os.path.join(tmp, "Local State"))
+        shutil.copy2(local_state, os.path.join(PROFILE_DIR, "Local State"))
+    return True
+
+
+def _clear_profile_locks():
+    """A run that was killed (or a crash) leaves SingletonLock behind, and the
+    next launch then fails with 'profile appears to be in use'. The profile is
+    Prism's alone, so a leftover lock is always stale."""
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        path = os.path.join(PROFILE_DIR, name)
+        try:
+            if os.path.islink(path) or os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _setup_chrome_driver(version_main=None, reseed: bool = False):
+    """Launch undetected-chromedriver against Prism's own persistent profile,
+    seeded from the user's real Chrome the first time so their logins carry
+    over."""
+    import undetected_chromedriver as uc
+
+    seed_profile(force=reseed)
+    if not reseed and profile_is_seeded():
+        ui.info("   🍪  reusing Prism's browser profile (logins persist "
+                "between runs)")
+    _clear_profile_locks()
+    tmp = PROFILE_DIR
 
     opts = uc.ChromeOptions()
     opts.add_argument("--profile-directory=Default")
@@ -301,19 +366,76 @@ def _harvest_images(driver, agent_cfg, stage: str) -> list[dict]:
     return out
 
 
+# Phrases that only ever appear in what Prism types, never in a tool's answer.
+# Every stage prompt ends with the pipeline rules, and /email's draft prompt
+# carries the SUBJECT/BODY template — an element containing either is the user
+# turn, not the reply.
+_PROMPT_ECHO_MARKERS = (
+    "strict pipeline rules:",
+    "your only task is:",
+    "reply with nothing except",
+    "<one subject line>",
+    "<the full email body>",
+    "your output will be passed directly to",
+    "context from the previous pipeline stage",
+)
+
+
+def _is_prompt_echo(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _PROMPT_ECHO_MARKERS)
+
+
+def _safe_url(driver, exclude=()) -> str:
+    """The current tab's URL, for the paths where the stage blew up. Never
+    raises (the session itself may be what died) and never returns a link that
+    isn't this stage's: a blank tab, or a page already credited to an earlier
+    stage, means we failed before we ever got to the tool."""
+    try:
+        url = (driver.current_url or "").strip()
+    except Exception:
+        return ""
+    if not url or url.startswith(("about:", "data:", "chrome:")):
+        return ""
+    return "" if url in exclude else url
+
+
 def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
-                stable_for: int = 15, min_wait: int = 20) -> int:
+                stable_for: int = 25, min_wait: int = 35,
+                expect: str = "") -> tuple[int, bool]:
     """Wait for the agent to finish generating — but no longer than needed.
     Polls the response selector and returns once the total response text has
     stopped growing for `stable_for` seconds (after having grown at least
     once). `cap` is the hard maximum (the old fixed sleep), so a selector
-    that never matches degrades to the previous behaviour, not a hang."""
+    that never matches degrades to the previous behaviour, not a hang.
+
+    Returns (seconds_waited, settled). settled is False when the cap ran out
+    with the answer still growing — the tool has NOT failed, we just stopped
+    watching, and it will keep working in its tab. Callers use this to say so
+    and to hand the user the link instead of claiming the scrape missed.
+
+    `expect` is a marker the finished answer must contain (e.g. "SUBJECT:" for
+    an email draft). Tools routinely pause mid-answer — thinking, rendering a
+    tool call, streaming in bursts — and a pause longer than `stable_for` reads
+    exactly like being finished. When the marker is set, a lull that doesn't
+    contain it is treated as the tool still working."""
     from selenium.webdriver.common.by import By
     sel = agent_cfg.get("response_selector", "")
     start = time.time()
     baseline = last_len = None
     last_change = start
     grown = False
+    settled = False
+
+    def has_marker() -> bool:
+        if not expect:
+            return True
+        try:
+            return any(expect.lower() in (el.text or "").lower()
+                       for el in driver.find_elements(By.CSS_SELECTOR, sel))
+        except Exception:
+            return False
+
     while time.time() - start < cap:
         time.sleep(poll)
         try:
@@ -331,9 +453,11 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
             last_len = total
             last_change = time.time()
         elif (grown and time.time() - start >= min_wait
-              and time.time() - last_change >= stable_for):
+              and time.time() - last_change >= stable_for
+              and has_marker()):
+            settled = True
             break
-    return int(time.time() - start)
+    return int(time.time() - start), settled
 
 
 def _click_by_text(driver, texts: list[str], timeout: int = 10) -> bool:
@@ -524,6 +648,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             emit("stage_start", {"stage": stage, "agent": agent_name})
             ui.rule(f"{stage.upper()}  ·  {agent_name}", style=A.CATEGORIES.get(stage, {}).get("color", "pink"))
 
+            timed_out = False
             try:
                 if not first_tab:
                     driver.execute_script("window.open('');")
@@ -678,10 +803,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             ui.err(f"   prompt error: {e}")
 
                     wait = agent_cfg.get("wait_time", 60)
+                    # A caller that knows what a finished answer looks like says
+                    # so (e.g. /email needs "SUBJECT:"), and a mid-answer pause
+                    # can no longer end the wait early.
+                    expect = (routing.get(stage) or {}).get("expect", "")
                     ui.info(f"   ⏳  waiting up to {wait}s for {agent_name} to finish…")
                     emit("waiting", {"stage": stage, "seconds": wait})
-                    took = _smart_wait(driver, agent_cfg, wait)
-                    ui.info(f"   ✓  response settled after {took}s")
+                    took, settled = _smart_wait(driver, agent_cfg, wait, expect=expect)
+                    if settled:
+                        ui.info(f"   ✓  response settled after {took}s")
+                    else:
+                        # The cap ran out, not the tool: it is still generating
+                        # in its tab and will finish there. Whatever is on the
+                        # page gets scraped anyway (a partial answer beats
+                        # none), and the link below is the real deliverable.
+                        timed_out = True
+                        ui.warn(f"still generating after {took}s — scraping what "
+                                f"is on the page and keeping the link")
 
                     elements = driver.find_elements(By.CSS_SELECTOR, agent_cfg.get("response_selector", ""))
                     texts = []
@@ -696,6 +834,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     # (sections, citation chips…). Keep only the fullest captures:
                     # drop any text that is contained inside another element's text.
                     texts = [t for t in texts if not any(t != u and t in u for u in texts)]
+                    # Several tools render OUR message with the same classes as
+                    # the reply, so the prompt comes back as a "response" —
+                    # which then gets forwarded downstream, or (for /email)
+                    # parsed as a draft whose subject is the template we typed.
+                    echoes = [t for t in texts if _is_prompt_echo(t)]
+                    if echoes:
+                        texts = [t for t in texts if t not in echoes]
+                        ui.info(f"   ↩️   ignored {len(echoes)} echo(es) of our own prompt")
                     if not texts:
                         stage_responses = []
                     elif len(questions) == 1:
@@ -722,16 +868,26 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     ui.ok(f"captured {len(stage_responses)} response(s)")
                     emit("stage_done", {"stage": stage, "count": len(stage_responses),
                                         "snippet": stage_responses[0][:200],
-                                        "texts": stage_responses, "url": driver.current_url})
+                                        "texts": stage_responses, "url": driver.current_url,
+                                        "timed_out": timed_out})
                 else:
                     ui.warn("no response scraped, but link saved")
                     emit("stage_done", {"stage": stage, "count": 0, "texts": [],
-                                        "url": driver.current_url})
+                                        "url": driver.current_url,
+                                        "timed_out": timed_out})
                 ui.info(f"   🔗  {driver.current_url}")
 
             except Exception as ex:
+                # The tab is still open on whatever the tool was doing, and for
+                # the slow producers (decks, video, apps) that page IS the
+                # deliverable — it keeps rendering server-side after we gave up.
+                # So the link goes out with the error, not instead of it.
+                url = _safe_url(driver, exclude=set(all_links.values()))
+                if url:
+                    all_links[stage] = url
+                    ui.info(f"   🔗  {url}  (still open — the tool may finish there)")
                 ui.err(f"stage {stage} failed: {ex}")
-                emit("stage_error", {"stage": stage, "error": str(ex)})
+                emit("stage_error", {"stage": stage, "error": str(ex), "url": url})
     finally:
         try:
             driver.quit()
@@ -742,18 +898,33 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 
 
 def open_login_tabs(urls: list[str]):
-    """Open each tool's URL in Chrome so the user can sign in before a real run."""
+    """Open each tool's URL so the user can sign in before a real run.
+
+    Crucially this opens PRISM's profile, not the everyday one. Runs use
+    PROFILE_DIR, so a login done in the normal browser lands in a different
+    cookie jar and the run still hits a sign-in wall — which is exactly the
+    'it isn't staying logged in' complaint. Signing in here writes to the same
+    profile the automation drives, and it persists."""
+    seed_profile()
+    _clear_profile_locks()
+    chrome = next((c for c in _CHROME_BINARIES if os.path.exists(c)), None)
+    if not chrome:
+        ui.warn("Chrome not found — opening in your default browser instead. "
+                "Logins there will NOT carry into Prism's runs.")
+        for url in urls:
+            webbrowser.open(url)
+        return
+
+    args = [chrome, f"--user-data-dir={PROFILE_DIR}", "--profile-directory=Default"]
+    ui.info("   🔐  opening Prism's browser profile — sign in here and it "
+            "sticks for every run")
     first = True
     for url in urls:
-        for chrome in _CHROME_BINARIES:
-            if os.path.exists(chrome):
-                subprocess.Popen([chrome, url])
-                break
-        else:
-            webbrowser.open(url)
+        subprocess.Popen(args + [url],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Chrome may be cold-starting on the first URL — give its singleton
         # lock time to settle so the remaining tabs join the same instance
         # instead of racing it and getting dropped.
-        time.sleep(2.5 if first else 0.4)
+        time.sleep(3.5 if first else 0.5)
         first = False
 

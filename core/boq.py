@@ -918,26 +918,20 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
     # are (so cameras and cable routes can be placed sensibly) and one that
     # only reshuffles a table of totals.
     cad_note = (
-        "\n\nSTEP 1 — ANALYSE THE DRAWING YOURSELF, BEFORE WRITING ANYTHING. "
-        "The original CAD file is attached to this message. Open and parse it "
-        "directly with your code-execution/analysis tool — convert or read it "
-        "with a CAD library (ezdxf and similar handle DXF; convert the DWG "
-        "first if needed) and enumerate for yourself: every layer name, every "
-        "block/INSERT name with its count and the layer it sits on, polyline "
-        "and line lengths, and closed-polyline/hatch areas. Then:\n"
-        "  (a) State briefly what the drawing actually IS (site survey, "
-        "services layout, floor plan…) and what it contains.\n"
-        "  (b) Cross-check your own figures against the MEASURED QUANTITIES "
-        "listed below, which were extracted programmatically from the same "
-        "file. They are the authoritative numbers for the BOQ — but if your "
-        "own reading disagrees materially, say so explicitly rather than "
-        "quietly picking one.\n"
-        "  (c) Use the drawing's GEOMETRY, not just its totals: where the "
-        "gates, boundary, roads, buildings and existing poles actually sit. "
-        "That spatial layout is what lets you place cameras sensibly, route "
-        "cable along real paths, and count termination points — do not derive "
-        "any of that from the summary table alone.\n"
-        "Do not skip this step and jump to formatting."
+        "\n\nThe drawing has ALREADY been measured for you — the quantities "
+        "listed below were extracted programmatically from its geometry and "
+        "are authoritative. Treat them as ground truth; do not recompute them. "
+        "Do NOT build, install, compile or download any tool, library or "
+        "converter, and do NOT try to convert a DWG — that is never worth your "
+        "time here and is not the task. Any CAD file attached is there only so "
+        "you can glance at the spatial LAYOUT (where the boundary, gates, "
+        "roads, buildings and existing poles sit) to place any DERIVED items "
+        "sensibly. If it opens in a second with a tool you already have (ezdxf "
+        "reads DXF directly), use it for that layout; if it does not open "
+        "trivially, work entirely from the measured summary below — never "
+        "spend effort acquiring a CAD toolchain. Briefly say what the drawing "
+        "IS (site survey, services layout, floor plan…) from its measured "
+        "layers and blocks, then write the BOQ."
     ) if has_cad else ""
     if not has_cad:
         # Spec mode: no drawing exists at all. Everything is derived from the
@@ -1009,7 +1003,7 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "CAD drawing's geometry — treat them as ground truth and do not "
         "recalculate or contradict them."
     ) if has_cad else ""
-    step2 = "\n\nSTEP 2 — BUILD THE BOQ." if has_cad else "\n\n"
+    step2 = "\n\n"
     # Stating a "basis" is not enough on its own: the writer will still invent a
     # precise-but-wrong spec (a real run produced a "250 mm emergency-stop
     # button" and "100 mm proximity sensor"). One physically-impossible figure

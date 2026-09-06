@@ -656,3 +656,206 @@ def write_boq_csv(boq: Boq, path: str) -> str:
         w.writerow(["", "", "", "", "", "", "Grand total",
                     f"{boq.grand_total():.2f}"])
     return path
+
+
+# ── the deliverable, part two: a government-format tender PDF ──────────────────
+# Schedule A (Abstract of Cost) + Schedule B (item-wise BOQ), rendered from the
+# SAME Boq model to HTML and printed by the browser engine Prism already ships
+# for Studio (core.browser → Chromium's page.pdf) — no new dependency. This is
+# the shape a state-PWD / municipal tender or a bank-loan file expects: rupees
+# in words, sections carried to an abstract, a signature block.
+
+def _inr(value) -> str:
+    """Indian-grouped rupee string with no symbol: 1,23,45,678.90."""
+    value = quoting.rupees(value)
+    sign = "-" if value < 0 else ""
+    whole, _, frac = f"{abs(value):.2f}".partition(".")
+    if len(whole) <= 3:
+        grouped = whole
+    else:
+        last3, rest, parts = whole[-3:], whole[:-3], []
+        while len(rest) > 2:
+            parts.insert(0, rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            parts.insert(0, rest)
+        grouped = ",".join(parts) + "," + last3
+    return f"{sign}{grouped}.{frac}"
+
+
+def _qty_str(value) -> str:
+    """A quantity without trailing-zero noise: 108, 54, 142.7."""
+    v = quoting.to_decimal(value)
+    if v == v.to_integral_value():
+        return str(int(v))
+    return ("%f" % v).rstrip("0").rstrip(".")
+
+
+_PDF_CSS = """
+* { box-sizing: border-box; }
+body { font-family: "Segoe UI", Arial, sans-serif; color:#1b1b1b; background:#fff;
+       font-size:11px; margin:0; }
+html { background:#fff; }
+h1 { font-size:17px; text-align:center; margin:0 0 2px; letter-spacing:.4px; }
+.sub { text-align:center; color:#555; font-size:10px; margin-bottom:10px; }
+table.meta { border-collapse:collapse; margin:0 auto 12px; font-size:10.5px; }
+table.meta td { padding:1px 8px; }
+table.meta .k { color:#555; }
+.sched { font-size:13px; font-weight:700; margin:16px 0 6px; color:#243b53;
+         border-bottom:2px solid #243b53; padding-bottom:3px; }
+table.boq { width:100%; border-collapse:collapse; font-size:10.5px; }
+table.boq thead { display:table-header-group; }
+table.boq th { background:#243b53; color:#fff; padding:5px 6px; text-align:left; font-weight:600; }
+table.boq td { padding:4px 6px; border-bottom:1px solid #dbe0e7; vertical-align:top; }
+.num { text-align:right; white-space:nowrap; }
+tr.sec td { background:#eaeff5; font-weight:700; color:#243b53; }
+tr.subrow td { background:#f4f7fb; font-weight:700; }
+tr.total td { font-weight:700; }
+tr.grand td { background:#e4efe1; font-weight:700; font-size:11.5px; }
+tr.unpriced td { color:#b00020; }
+.words { margin:8px 2px; font-style:italic; font-weight:600; }
+.note { color:#6a6a6a; font-size:9.5px; margin-top:8px; }
+.warn { color:#b00020; font-weight:600; font-size:10px; margin-top:6px; }
+.break { break-before:page; }
+table.sign { width:100%; margin-top:40px; border-collapse:collapse; }
+table.sign td { width:50%; border-top:1px solid #444; padding-top:6px; font-size:10px;
+                color:#333; text-align:center; }
+"""
+
+_PDF_FOOTER = (
+    '<div style="font-size:8px;color:#777;width:100%;text-align:center;">'
+    'Bill of Quantities &nbsp;&middot;&nbsp; Page <span class="pageNumber"></span> '
+    'of <span class="totalPages"></span></div>')
+
+
+def _rollup_rows(boq: Boq, cols: int) -> str:
+    """Sub-total → contingency → GST → grand-total, as table rows that fit a
+    3-column (abstract) or 6-column (detailed) table."""
+    def row(label, amount, cls):
+        mid = f'<td colspan="4">{label}</td>' if cols == 6 else f'<td>{label}</td>'
+        return f'<tr class="{cls}"><td></td>{mid}<td class="num">{_inr(amount)}</td></tr>'
+
+    out = row("Sub-total (all works)", boq.subtotal(), "subrow")
+    out += row(f"Add: Contingency @ {_pct(boq.contingency_pct)}%",
+               boq.contingency_amount(), "total")
+    out += row("Total before GST", boq.pre_tax_total(), "total")
+    if boq.interstate:
+        out += row(f"Add: IGST @ {_pct(boq.gst_pct)}%", boq.gst_amount(), "total")
+    else:
+        half = quoting.to_decimal(boq.gst_pct) / 2
+        cgst = quoting.rupees(boq.pre_tax_total() * half / 100)
+        out += row(f"Add: CGST @ {_pct(half)}%", cgst, "total")
+        out += row(f"Add: SGST @ {_pct(half)}%", boq.gst_amount() - cgst, "total")
+    out += row("GRAND TOTAL", boq.grand_total(), "grand")
+    return out
+
+
+def boq_html(boq: Boq) -> str:
+    """The whole Schedule A + Schedule B document as one self-contained HTML
+    string (inline CSS, no external assets) — ready for the browser to print."""
+    import html as H
+    esc = H.escape
+    sections = boq.sections()
+
+    meta = "".join(
+        f'<tr><td class="k">{esc(k)}</td><td>{esc(str(v))}</td></tr>'
+        for k, v in (("Project", boq.project), ("Client", boq.client),
+                     ("Location", boq.location), ("Date", boq.date),
+                     ("Revision", boq.revision)) if v)
+
+    a_rows = ""
+    for n, (name, items) in enumerate(sections, 1):
+        amt = quoting.rupees(sum((it.amount for it in items), Decimal(0)))
+        a_rows += (f'<tr><td>{n}</td><td>{esc(name)}</td>'
+                   f'<td class="num">{_inr(amt)}</td></tr>')
+    a_rows += _rollup_rows(boq, cols=3)
+
+    b_rows = ""
+    for name, items in sections:
+        b_rows += f'<tr class="sec"><td colspan="6">{esc(name)}</td></tr>'
+        for n, it in enumerate(items, 1):
+            desc = esc(it.description)
+            if it.code:
+                desc += f' <span style="color:#888">[{esc(it.code)}]</span>'
+            if it.is_derived:
+                desc += ' <span style="color:#b06a00">(estimated)</span>'
+            if it.priced:
+                rate, amount, cls = _inr(it.rate), _inr(it.amount), ""
+            else:
+                rate, amount, cls = "&mdash;", "&mdash;", ' class="unpriced"'
+            b_rows += (f'<tr{cls}><td>{n}</td><td>{desc}</td><td>{esc(it.unit)}</td>'
+                       f'<td class="num">{_qty_str(it.quantity)}</td>'
+                       f'<td class="num">{rate}</td><td class="num">{amount}</td></tr>')
+        sub = quoting.rupees(sum((it.amount for it in items), Decimal(0)))
+        b_rows += (f'<tr class="subrow"><td></td><td colspan="4">Sub-total &mdash; '
+                   f'{esc(name)}</td><td class="num">{_inr(sub)}</td></tr>')
+    b_rows += _rollup_rows(boq, cols=6)
+
+    unpriced = boq.unpriced()
+    warn = (f'<div class="warn">{len(unpriced)} item(s) are unpriced (shown as '
+            '&mdash;) and excluded from the totals — price them before this goes '
+            'to tender.</div>') if unpriced else ""
+
+    words = esc(amount_in_words(boq.grand_total()))
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<style>{_PDF_CSS}</style></head><body>
+<h1>{esc(boq.title).upper()}</h1>
+<div class="sub">{esc(boq.project or "")}</div>
+<table class="meta">{meta}</table>
+
+<div class="sched">Schedule A &mdash; Abstract of Cost</div>
+<table class="boq"><thead><tr><th style="width:8%">Item</th><th>Description</th>
+<th class="num" style="width:24%">Amount (&#8377;)</th></tr></thead><tbody>{a_rows}</tbody></table>
+<div class="words">{words}</div>
+
+<div class="sched break">Schedule B &mdash; Detailed Bill of Quantities</div>
+<table class="boq"><thead><tr><th style="width:6%">Item</th><th>Description</th>
+<th style="width:7%">Unit</th><th class="num" style="width:9%">Qty</th>
+<th class="num" style="width:13%">Rate (&#8377;)</th>
+<th class="num" style="width:15%">Amount (&#8377;)</th></tr></thead><tbody>{b_rows}</tbody></table>
+<div class="words">{words}</div>
+{warn}
+<div class="note">Quantities are measured from the drawing geometry; rates are
+to be verified against the applicable DSR / state SOR or your own quotation.
+This is a computed estimate — check every figure before tendering.</div>
+<table class="sign"><tr><td>Contractor / Tenderer</td>
+<td>Prepared &amp; Checked by</td></tr></table>
+</body></html>"""
+
+
+def write_boq_pdf(boq: Boq, path: str) -> str:
+    """Render the Schedule A + B document to a PDF at `path` via the bundled
+    Chromium (Playwright's page.pdf) and return `path`. Raises BoqError with a
+    plain message if the browser engine isn't available — the Excel export
+    still works without it."""
+    html_str = boq_html(boq)
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:                              # noqa: BLE001
+        raise BoqError(
+            "Exporting a tender PDF needs the bundled browser engine "
+            "(Playwright/Chromium), which isn't available here. The priced "
+            "Excel export works without it.") from e
+    from . import browser
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    try:
+        with sync_playwright() as pw:
+            b = browser.launch_chromium(
+                pw, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
+            try:
+                page = b.new_page()
+                page.set_content(html_str, wait_until="load")
+                page.pdf(path=path, format="A4", print_background=True,
+                         margin={"top": "14mm", "bottom": "16mm",
+                                 "left": "12mm", "right": "12mm"},
+                         display_header_footer=True,
+                         header_template="<span></span>",
+                         footer_template=_PDF_FOOTER)
+            finally:
+                b.close()
+    except BoqError:
+        raise
+    except Exception as e:                              # noqa: BLE001
+        first = (str(e).strip().splitlines() or [""])[0]
+        raise BoqError(f"Couldn't render the tender PDF: {first[:200]}") from e
+    return path

@@ -465,9 +465,148 @@ def _build_message(ec, recipient, subject, body, files):
     return msg
 
 
+# ── save a copy to the Sent folder (IMAP APPEND) ──────────────────────────────
+# A plain SMTP send reaches the recipient but never writes to the sender's OWN
+# mailbox, so a Prism-sent mail is invisible in Outlook/webmail's "Sent". A real
+# mail client fixes this with a second step — it APPENDS the message to the
+# account's Sent folder over IMAP — and so do we, after each send, reusing the
+# engine's tested IMAP host-discovery (inbox.guess_hosts / inbox._connect).
+#
+# Best-effort by contract: a mailbox that refuses the append, has IMAP switched
+# off, or whose Sent folder can't be found NEVER breaks the send. The copy is a
+# convenience; the delivery is the job.
+
+# Providers whose SMTP already files sent mail into Sent for you — a second copy
+# would just duplicate it, so skip the append entirely.
+_SMTP_AUTOSAVES_SENT = ("gmail.com", "googlemail.com")
+
+# Folder names to try when the server doesn't advertise the RFC-6154 \Sent
+# special-use flag, best-known first.
+_SENT_NAMES = ("Sent", "Sent Items", "Sent Mail", "INBOX.Sent", "[Gmail]/Sent Mail")
+
+_LIST_LINE = re.compile(
+    r'^\((?P<flags>[^)]*)\)\s+(?:"[^"]*"|NIL|\S+)\s+'
+    r'(?P<name>"(?:[^"\\]|\\.)*"|\S+)\s*$')
+
+
+def _unquote_mailbox(raw: str) -> str:
+    raw = (raw or "").strip()
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        raw = raw[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+    return raw
+
+
+def sent_folder_from_list(lines) -> str:
+    """The account's Sent folder name from raw IMAP LIST output. Prefers the
+    RFC-6154 \\Sent special-use flag; otherwise the first well-known name the
+    server actually lists. '' when nothing matches (the caller then skips)."""
+    names = []
+    for raw in lines or []:
+        line = (raw.decode(errors="ignore")
+                if isinstance(raw, (bytes, bytearray)) else str(raw)).strip()
+        m = _LIST_LINE.match(line)
+        if not m:
+            continue
+        name = _unquote_mailbox(m.group("name"))
+        names.append(name)
+        if re.search(r"\\Sent\b", m.group("flags"), re.IGNORECASE):
+            return name
+    lower = {n.lower(): n for n in names}
+    for cand in _SENT_NAMES:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return ""
+
+
+class _SentSaver:
+    """Opens ONE IMAP connection for a whole send run and drops each sent
+    message into the account's Sent folder. Every method swallows its own
+    errors — saving a copy must never break sending."""
+
+    def __init__(self, cfg: dict):
+        self._conn = None
+        self._folder = ""
+        self.active = False
+        self.note = ""
+        self._cfg = cfg or {}
+        ec = self._cfg.get("email") or {}
+        addr = (ec.get("address") or "").strip()
+        domain = addr.rsplit("@", 1)[-1].lower() if "@" in addr else ""
+        if not ec.get("save_to_sent", True) or not addr or not ec.get("password"):
+            return
+        if domain in _SMTP_AUTOSAVES_SENT:
+            self.note = "your provider files sent mail into Sent automatically"
+            return
+        try:                                            # construction must never
+            self._open()                                # break the send that
+        except Exception:                               # noqa: BLE001  follows it
+            self.active = False
+
+    def _candidate_hosts(self):
+        from . import inbox
+        ec = self._cfg["email"]
+        addr = ec["address"].strip()
+        dom = addr.rsplit("@", 1)[-1].lower()
+        hosts = []
+        # A mailbox already set up for READING is a known-good IMAP server — use
+        # it first when it's the same provider as the sending address.
+        ic = self._cfg.get("inbox") or {}
+        if ic.get("host") and (ic.get("address") or "").rsplit("@", 1)[-1].lower() == dom:
+            hosts.append(ic["host"])
+        for h in inbox.guess_hosts(addr):
+            if h and h not in hosts:
+                hosts.append(h)
+        return hosts
+
+    def _open(self):
+        from . import inbox
+        ec = self._cfg["email"]
+        for host in self._candidate_hosts():
+            ic = {"address": ec["address"], "password": ec["password"],
+                  "host": host, "port": 993}
+            try:
+                conn = inbox._connect(ic, timeout=20)
+            except Exception:                           # noqa: BLE001
+                continue                                # wrong host / refused → next
+            try:
+                typ, data = conn.list()
+                folder = sent_folder_from_list(data) if typ == "OK" else ""
+            except Exception:                           # noqa: BLE001
+                folder = ""
+            if folder:
+                self._conn, self._folder, self.active = conn, folder, True
+                return
+            try:
+                conn.logout()
+            except Exception:                           # noqa: BLE001
+                pass
+        self.note = "couldn't reach the Sent folder — copies were not saved there"
+
+    def save(self, msg) -> None:
+        if not self.active:
+            return
+        import imaplib
+        box = '"%s"' % self._folder.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            self._conn.append(box, r"(\Seen)",
+                              imaplib.Time2Internaldate(time.time()),
+                              msg.as_bytes())
+        except Exception:                               # noqa: BLE001
+            pass                                        # a lost copy is not a lost send
+
+    def close(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            self._conn.logout()
+        except Exception:                               # noqa: BLE001
+            pass
+        self._conn = None
+
+
 def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
               files: list[dict], delay: float = SEND_DELAY,
-              on_progress=None, should_stop=None):
+              session_max: int = 20, on_progress=None, should_stop=None):
     """Send the draft to every recipient, one message each (so {name} can be
     personalised and one bad address can't sink the rest).
     Returns (sent emails, [(email, error), …]).
@@ -481,11 +620,43 @@ def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
     if timeout > 60:
         ui.info(f"   📦  large attachment(s) — allowing up to {timeout}s per send")
     server = _connect(ec, timeout)
+    saver = _SentSaver(cfg)             # best-effort IMAP copy → account's Sent
+    if saver.active:
+        ui.info("   🗂   a copy of each message is saved to your Sent folder")
+    elif saver.note and "automatically" not in saver.note:
+        ui.info(f"   🗂   {saver.note}")
     sent, failed = [], []
+    in_session = 0                      # messages sent on the current connection
+    every = max(1, session_max)
 
     def report(i, r, ok, error=""):
         if on_progress:
             on_progress(i, len(recipients), r["email"], ok, error)
+
+    def _fresh():
+        # Drop and reopen the SMTP session. Providers (GoDaddy especially) cap
+        # "messages per session" and defer the rest with a 452 "too many
+        # messages sent in a single session" — a fresh session resets that
+        # counter, so a large blast doesn't stall on the last few.
+        nonlocal server
+        try:
+            server.quit()
+        except Exception:                               # noqa: BLE001
+            pass
+        server = _connect(ec, timeout)
+
+    def _attempt(msg):
+        try:
+            server.send_message(msg)
+            return True, ""
+        except Exception as e:                          # noqa: BLE001
+            return False, str(e)
+
+    def _session_limit(err: str) -> bool:
+        e = (err or "").lower()
+        return any(x in e for x in ("serverdisconnected", "too many",
+                                    "single session", "452", "try again",
+                                    "temporarily"))
 
     try:
         for i, r in enumerate(recipients, 1):
@@ -493,28 +664,25 @@ def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
                 ui.warn(f"stopped after {len(sent)} send(s) — "
                         f"{len(recipients) - i + 1} not attempted")
                 break
+            if in_session >= every:          # proactively cycle before the cap
+                _fresh()
+                in_session = 0
             msg = _build_message(ec, r, subject, body, files)
-            try:
-                server.send_message(msg)
+            ok, err = _attempt(msg)
+            if not ok and _session_limit(err):   # session/rate limit → fresh session, retry once
+                _fresh()
+                in_session = 0
+                ok, err = _attempt(msg)
+            if ok:
                 sent.append(r["email"])
+                in_session += 1
+                saver.save(msg)          # mirror into Sent (best-effort, silent)
                 ui.info(f"   ✉️   {i}/{len(recipients)}  {r['email']}")
                 report(i, r, True)
-            except smtplib.SMTPServerDisconnected:
-                # Provider dropped the connection mid-run — reconnect once.
-                try:
-                    server = _connect(ec, timeout)
-                    server.send_message(msg)
-                    sent.append(r["email"])
-                    ui.info(f"   ✉️   {i}/{len(recipients)}  {r['email']}  (reconnected)")
-                    report(i, r, True)
-                except Exception as e:
-                    failed.append((r["email"], str(e)))
-                    ui.err(f"   ✗   {r['email']}: {e}")
-                    report(i, r, False, str(e))
-            except Exception as e:
-                failed.append((r["email"], str(e)))
-                ui.err(f"   ✗   {r['email']}: {e}")
-                report(i, r, False, str(e))
+            else:
+                failed.append((r["email"], err))
+                ui.err(f"   ✗   {r['email']}: {err}")
+                report(i, r, False, err)
             if i < len(recipients):
                 # Split the pause so a cancel lands in ~a quarter second
                 # instead of after the full provider-friendly delay.
@@ -529,6 +697,7 @@ def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
             server.quit()
         except Exception:
             pass
+        saver.close()
     return sent, failed
 
 

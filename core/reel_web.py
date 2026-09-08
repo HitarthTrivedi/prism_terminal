@@ -39,6 +39,7 @@ import subprocess
 W, H = 1080, 1920
 SAFE_X, SAFE_Y = 90, 130
 DEFAULT_FPS = 30
+_CONTACT_PANEL_CACHE: dict[str, list[str]] = {}
 
 # Minimum type sizes for a 1080-wide frame, unchanged from the Pillow
 # renderer: a phone is watched at arm's length for under a second a scene.
@@ -453,7 +454,11 @@ def _asset_uris(table: dict, scene_index: int | None = None) -> dict:
             if not panels and a.get("path"):
                 try:
                     from .assets import split_contact_sheet
-                    panels = split_contact_sheet(a["path"])
+                    key = str(a["path"])
+                    panels = _CONTACT_PANEL_CACHE.get(key)
+                    if panels is None:
+                        panels = split_contact_sheet(key)
+                        _CONTACT_PANEL_CACHE[key] = panels
                 except Exception:
                     panels = []
             if panels and scene_index is not None:
@@ -466,9 +471,19 @@ def _asset_uris(table: dict, scene_index: int | None = None) -> dict:
         # safe: inspect the source file lazily when they are re-rendered.
         if isinstance(a, dict) and path:
             try:
-                from .assets import looks_like_contact_sheet
-                if looks_like_contact_sheet(path) and scene_index is None:
-                    continue
+                from .assets import looks_like_contact_sheet, split_contact_sheet
+                if looks_like_contact_sheet(path):
+                    # Specs saved before composite metadata was introduced
+                    # still need scene-aware panel extraction.
+                    key = str(path)
+                    panels = _CONTACT_PANEL_CACHE.get(key)
+                    if panels is None:
+                        panels = split_contact_sheet(key)
+                        _CONTACT_PANEL_CACHE[key] = panels
+                    if panels and scene_index is not None:
+                        path = panels[scene_index % len(panels)]
+                    else:
+                        continue
             except Exception:
                 pass
         try:

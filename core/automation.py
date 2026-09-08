@@ -3351,7 +3351,11 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
     with open(spec_path, "w", encoding="utf-8") as f:
         _json.dump(new_spec, f, indent=2)
     ui.info(f"   🎬  re-filming {len(new_spec['scenes'])} scenes…")
-    _web.render(new_spec, out, on_progress=on_progress, check=False)
+    # Follow-ups must pass the same browser preflight as first renders.  This
+    # used to be disabled here, allowing a changed scene to export clipped
+    # text, off-canvas imagery, or an unresolved asset even though refine_spec
+    # had already attempted a layout check.
+    _web.render(new_spec, out, on_progress=on_progress, check=True)
     note = f"reel re-filmed — {os.path.basename(out)} ({'; '.join(notes)})"
     emit("stage_done", {"stage": "media", "count": 1, "texts": [note],
                         "url": out, "timed_out": False})

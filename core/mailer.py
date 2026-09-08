@@ -518,6 +518,38 @@ def sent_folder_from_list(lines) -> str:
     return ""
 
 
+# Known SMTP host → the IMAP host that goes with it. We ALWAYS know the SMTP
+# host (we just sent through it), so deriving IMAP from it needs no DNS — which
+# is what makes the Sent copy work even when dnspython isn't installed and
+# inbox.guess_hosts() can't resolve a hosted provider (GoDaddy being the case in
+# point: smtpout.secureserver.net has no imap.<domain>, only imap.secureserver.net).
+_SMTP_TO_IMAP = {
+    "smtpout.secureserver.net": "imap.secureserver.net",   # GoDaddy Workspace
+    "smtp-mail.outlook.com": "outlook.office365.com",
+    "smtp.office365.com": "outlook.office365.com",
+    "smtp.mail.yahoo.com": "imap.mail.yahoo.com",
+    "smtp.zoho.com": "imap.zoho.com",
+    "smtp.zoho.in": "imap.zoho.in",
+    "smtp.mail.me.com": "imap.mail.me.com",
+    "smtp.gmail.com": "imap.gmail.com",
+}
+
+
+def _imap_from_smtp(smtp_host: str) -> str:
+    """The IMAP host implied by an SMTP host: a known mapping, else the common
+    'smtp…'→'imap…' rewrite (covers cPanel/hosted mail), else ''."""
+    h = (smtp_host or "").strip().lower()
+    if not h:
+        return ""
+    if h in _SMTP_TO_IMAP:
+        return _SMTP_TO_IMAP[h]
+    if h.startswith("smtp"):
+        return re.sub(r"^smtp[a-z-]*", "imap", h)
+    if h.startswith("mail."):
+        return h                        # mail.<domain> often serves both
+    return ""
+
+
 class _SentSaver:
     """Opens ONE IMAP connection for a whole send run and drops each sent
     message into the account's Sent folder. Every method swallows its own
@@ -553,6 +585,10 @@ class _SentSaver:
         ic = self._cfg.get("inbox") or {}
         if ic.get("host") and (ic.get("address") or "").rsplit("@", 1)[-1].lower() == dom:
             hosts.append(ic["host"])
+        # Derived from the SMTP host — no DNS, so it works without dnspython.
+        derived = _imap_from_smtp(ec.get("host"))
+        if derived and derived not in hosts:
+            hosts.append(derived)
         for h in inbox.guess_hosts(addr):
             if h and h not in hosts:
                 hosts.append(h)

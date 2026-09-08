@@ -447,6 +447,11 @@ def _asset_uris(table: dict, scene_index: int | None = None) -> dict:
         # image in the final video; the design prompt receives the rejection
         # and can fall back to type/CSS or request individual art.
         if isinstance(a, dict) and a.get("composite"):
+            if a.get("kind") == "logo":
+                # A contact sheet is never a logo.  Leaving the image
+                # unresolved lets _drop_missing remove the tag while the
+                # designed wordmark/kicker remains intact.
+                continue
             # Storyboard boards are useful only as individual tiles.  Asset
             # collection records the deterministic 4+3 panel crops; choose a
             # tile per scene so a board can never appear as a giant card.
@@ -475,6 +480,8 @@ def _asset_uris(table: dict, scene_index: int | None = None) -> dict:
                 if looks_like_contact_sheet(path):
                     # Specs saved before composite metadata was introduced
                     # still need scene-aware panel extraction.
+                    if isinstance(a, dict) and a.get("kind") == "logo":
+                        continue
                     key = str(path)
                     panels = _CONTACT_PANEL_CACHE.get(key)
                     if panels is None:

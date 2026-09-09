@@ -910,7 +910,19 @@ def cmd_email(cfg, arg: str, attachments: list):
                                               "recipients": len(recipients), "confirmed": False}})
         return
 
-    sent, failed = mailer.send_bulk(cfg, recipients, subject, body, source_files)
+    # The same pace and per-run cap the GUI window uses (prism_gui's
+    # email_config.send_policy writes cfg["email"]["send"]); a config without
+    # the block sends as it always has. The daily cap is counted off the
+    # GUI's sent log and is not applied here.
+    pace = (cfg.get("email") or {}).get("send") or {}
+    try:
+        gap = max(0.5, float(pace.get("gap_seconds", mailer.SEND_DELAY)))
+        jitter = max(0.0, float(pace.get("jitter_seconds", 0) or 0))
+        per_run = max(0, int(pace.get("max_per_run", 0) or 0))
+    except (TypeError, ValueError):
+        gap, jitter, per_run = mailer.SEND_DELAY, 0.0, 0
+    sent, failed = mailer.send_bulk(cfg, recipients, subject, body, source_files,
+                                    delay=gap, jitter=jitter, limit=per_run)
     if sent:
         ui.ok(f"Sent to {len(sent)}/{len(recipients)} recipient(s).")
     if failed:

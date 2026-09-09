@@ -2721,8 +2721,14 @@ def _clean_capture(text: str) -> str:
     return t.strip()
 
 
-def _capture(driver, agent_cfg: dict) -> list[str]:
+def _capture(driver, agent_cfg: dict, keep: str = "") -> list[str]:
     """Everything on the page that reads as a reply, longest captures only.
+
+    `keep` is a marker a caller is waiting for. A reply that carries it is
+    kept however short it is: the length floor below exists to drop
+    buttons and chips, and "CANVA LINK: none" is sixteen characters -- so
+    the one answer _make_editable most needs to see was the one this used
+    to throw away, and a disconnected Canva app read as a silent one.
 
     Falls back to the GENERIC selector when the hand-tuned one matches nothing.
     The tuned selectors are pinned to markup we do not own: these sites roll
@@ -2747,7 +2753,8 @@ def _capture(driver, agent_cfg: dict) -> list[str]:
             t = el.text.strip()
         except Exception:
             continue
-        if len(t) > 50 and t not in texts:
+        wanted = bool(keep) and keep.lower() in t.lower()
+        if (len(t) > 50 or wanted) and t not in texts:
             texts.append(t)
     # Response selectors often match a container AND pieces inside it
     # (sections, citation chips…). Keep only the fullest captures: drop any
@@ -2781,7 +2788,8 @@ _EDITABLE_STAGES = ("visual", "presentation")
 
 def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
                    responses: list,
-                   machine_shaped: bool = False) -> tuple[list, str]:
+                   machine_shaped: bool = False,
+                   made_image: bool = False) -> tuple[list, str]:
     """Hand the image just generated to Canva, in the same conversation.
 
     Two prompts, not one. The first asked for the best picture the tool can
@@ -2810,10 +2818,18 @@ def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
         return responses, ""
     if not A.wants_canva(query):
         return responses, ""
-    if not responses:
+    if not responses and not made_image:
         # Nothing was made, so there is nothing to convert. Asking anyway
         # would have Canva invent a design from the prompt alone, which is
         # exactly the template-instead-of-artwork failure this avoids.
+        #
+        # `made_image` is the half this check used to miss. ChatGPT answers
+        # an image request with the picture and NO prose -- the assistant
+        # turn holds an <img> and an "Edit" button -- so the text capture
+        # is empty even though the artwork is right there. Seen on the
+        # 2026-09-09 Playwright run: the picture rendered, the Canva step
+        # was skipped as "nothing to make editable", and the customer who
+        # had asked for something editable got a flat PNG.
         ui.warn("   nothing to make editable — skipping the Canva step")
         return responses, ""
 
@@ -2871,7 +2887,7 @@ def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
             box.send_keys(Keys.ENTER)
         _smart_wait(driver, agent_cfg,
                     wait or agent_cfg.get("wait_time", 60), expect=expect)
-        return _capture(driver, agent_cfg)
+        return _capture(driver, agent_cfg, keep=expect)
     except Exception as e:
         ui.err(f"   follow-up failed: {e}")
         return []
@@ -4334,6 +4350,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             f"is on the page and keeping the link")
 
                 promised = set(image_stages or ())
+                got = 0            # images that rendered this turn, if any
                 if stage in ("artwork", "visual", "media") or stage in promised:
                     # The images are the deliverable here, not the text, so
                     # this stage gets its own budget ON TOP of the agent's —
@@ -4637,7 +4654,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # prompt in the same chat rather than a different first prompt.
             stage_responses, canva_url = _make_editable(
                 driver, agent_cfg, stage, query, stage_responses,
-                machine_shaped=machine_shaped)
+                machine_shaped=machine_shaped, made_image=bool(got))
 
             if stage_responses:
                 ui.info(f"   📥  captured {sum(len(t) for t in stage_responses)} chars")

@@ -446,7 +446,11 @@ def _stage_lines(agents: dict, premium: list | None = None) -> str:
         # 3.12+. Prism supports 3.10+, and on anything older this is a
         # SyntaxError raised at IMPORT time — so the whole engine, and the GUI
         # that imports it through core_bridge, failed to start at all.
-        lines.append(f"- {stage.upper()} → {name}: {spec}{star}\n"
+        makes = (A.AGENT_REGISTRY.get(name) or {}).get("makes", "")
+        maker = (f"\n    MAKES: {makes}. Its stage's deliverable is the thing "
+                 f"itself — brief it to BUILD that, never to write text about it."
+                 if makes else "")
+        lines.append(f"- {stage.upper()} → {name}: {spec}{star}{maker}\n"
                      f"    USE FOR: {_STAGE_HELP.get(stage, '')}")
     return "\n".join(lines)
 
@@ -628,6 +632,39 @@ def _self_directing_rule(agents: dict) -> str:
         f"  which is the entire reason it was picked over a plain search tool.\n")
 
 
+def _maker_names(agents: dict) -> list[str]:
+    return sorted(n for n in set(agents.values())
+                  if A.is_maker(A.AGENT_REGISTRY.get(n) or {}))
+
+
+def _maker_rule(agents: dict) -> str:
+    """For a tool that builds the thing, the prompt is a brief to build it.
+
+    Included only when such a tool is in the plan. Without this the planner
+    writes every stage the same way -- a text deliverable spec with a
+    "do not create files" non-goal -- and a deck-building tool obeys it and
+    types the outline back (Canva, 2026-09-10).
+    """
+    names = _maker_names(agents)
+    if not names:
+        return ""
+    listed = " and ".join(names)
+    what = "; ".join(f"{n} makes {A.AGENT_REGISTRY[n]['makes']}" for n in names)
+    return (
+        f"- MAKER TOOLS ({listed}). {what}. For such a stage the deliverable is\n"
+        f"  the THING, built inside that tool, and the prompt is a brief to build\n"
+        f"  it -- written the way a senior person briefs a designer:\n"
+        f"    • Name the tool actually assigned to the stage, never another one.\n"
+        f"    • Say what to build (a 7-slide deck; one square post), what goes on\n"
+        f"      it (the headings and bullets from the previous stage, verbatim, in\n"
+        f"      order), the look (palette, tone, audience), and the size/count.\n"
+        f"    • Never ask for \"plain text\", a \"text format\", a description,\n"
+        f"      an outline, or an export file, and never say \"do not generate\n"
+        f"      files\" -- the tool would obey and hand back words.\n"
+        f"    • DELIVERABLE SPEC = the built thing; QUALITY BAR = about the thing\n"
+        f"      (every slide present, headings exact, readable at a glance).\n")
+
+
 def build_prompt(query: str, profile: str, agents: dict, attachments: list | None = None,
                  premium: list | None = None, brief: str = "") -> str:
     profile_line = (
@@ -657,6 +694,7 @@ def build_prompt(query: str, profile: str, agents: dict, attachments: list | Non
         "tool is premium.\n" if enabled_premium else ""
     )
     self_directing_block = _self_directing_rule(agents)
+    maker_block = _maker_rule(agents)
     brief_block = (
         "\n═══ TASK BRIEF (auto-expanded from the raw request by a prompt-"
         "engineering pass; mine it for context, deliverable specs, quality "
@@ -726,7 +764,7 @@ outputs as context:
   stage genuinely needs distinct prompts.
 - DEVELOPMENT prompts must include full specs so the agent can ship a working
   result. SUMMARY must explicitly reference and combine the earlier outputs.
-{self_directing_block}- PROMPT CRAFT (this is why Prism exists — every stage prompt must read like
+{self_directing_block}{maker_block}- PROMPT CRAFT (this is why Prism exists — every stage prompt must read like
   professional prompt engineering, never a paraphrase of the user's words).
   After the mandatory "Your ONLY task is:" opener, every prompt MUST contain:
     • ROLE: cast the agent as a specific senior expert matched to the task

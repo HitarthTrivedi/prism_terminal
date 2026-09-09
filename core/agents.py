@@ -128,6 +128,7 @@ CATEGORIES = {
     },
 }
 
+
 # The "summary" stage is not user-selectable; it reuses whichever agent the
 # user picked for "brains" (falling back to content / research).
 SUMMARY_FALLBACK_ORDER = ["brains", "content", "research"]
@@ -138,6 +139,44 @@ _GENERIC = {
     "response_selector": "[data-message-author-role='assistant'], .response, .message, .prose, .markdown",
     "submit_selector": "button[type='submit'], button[aria-label*='Send'], button[data-testid='send-button']",
 }
+
+
+# ── makers: tools whose deliverable is a THING, not text ─────────────────────
+# A chat model answers with words, and Prism's stage prompts are written for
+# that: a deliverable spec, a text format, "do not create files". Handed to a
+# tool that BUILDS -- Canva, Gamma, Runway -- those same words are a wrong
+# instruction, and the tool obeys them: the 2026-09-10 run asked Canva for
+# "the final deck in plain-text slide format ready for import into Gamma.app
+# ... do NOT generate actual PPT files", and Canva typed the outline back.
+#
+# `makes` says what the tool produces. The router names it when it writes
+# the stage prompt (router._maker_rule), and the engine opens the stage with
+# a brief that says "build it here" and sets aside any text-format ask below
+# (automation._maker_brief). Empty for a chat tool.
+_MAKES = {
+    "Canva": "an editable Canva design — a presentation, a social post or a "
+             "brochure — built in the customer's own Canva account",
+    "Gamma.app": "a finished Gamma presentation, built in Gamma",
+    "Tome": "a finished Tome presentation, built in Tome",
+    "Leonardo.ai": "generated images",
+    "Adobe Firefly": "generated images",
+    "Midjourney": "generated images",
+    "Runway": "a generated video",
+    "Pika Labs": "a generated video",
+    "Google Flow": "a generated video",
+    "InVideo AI": "a finished promo video cut from the uploaded footage",
+    "HeyGen": "an AI-avatar video",
+    "ElevenLabs": "a voice-over audio file",
+    "Suno": "a music track",
+    "omma.build": "a working, deployed app",
+    "emergent.sh": "a working, deployed app",
+    "v0.dev": "a working UI, deployed",
+    "Claude Design": "a designed artifact",
+}
+
+
+def is_maker(cfg: dict) -> bool:
+    return bool((cfg or {}).get("makes"))
 
 
 # How generous the caps are. wait_time is a CEILING, not a sleep: _smart_wait
@@ -771,3 +810,10 @@ def summary_agent_name(agents: dict) -> str | None:
 def specialty_for(stage: str, name: str) -> str:
     cfg = resolve_agent(stage, name)
     return cfg["specialty"] if cfg else "general-purpose AI"
+
+
+# Applied last: the registry has to exist before a field can be written on it.
+for _name, _what in _MAKES.items():
+    if _name in AGENT_REGISTRY:
+        AGENT_REGISTRY[_name]["makes"] = _what
+del _name, _what

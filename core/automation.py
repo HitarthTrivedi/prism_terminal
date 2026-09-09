@@ -1956,6 +1956,46 @@ def _is_natural(agent_cfg: dict) -> bool:
     return (agent_cfg or {}).get("prompt_style") == "natural"
 
 
+def _is_maker(agent_cfg: dict) -> bool:
+    """A tool whose deliverable is a thing it builds, not text -- see
+    agents._MAKES."""
+    return bool((agent_cfg or {}).get("makes"))
+
+
+def _maker_brief(agent_name: str, agent_cfg: dict) -> str:
+    """The opening of a maker's stage prompt: what it is for, in plain words.
+
+    Written as a person would brief a designer, and put FIRST so it frames
+    everything after it. The one thing it must do is set aside any
+    text-shaped instruction further down: the stage prompt is written by
+    the router for a chat tool, and "deliver the deck in plain-text format,
+    do NOT generate files" reached Canva verbatim on 2026-09-10 -- so Canva
+    typed the outline back instead of building the deck. Saying so up
+    front, in the tool's own terms, is what stops that.
+    """
+    makes = (agent_cfg or {}).get("makes", "")
+    if not makes:
+        return ""
+    return (
+        f"You are {agent_name}, and what I need from you is {makes}. Build "
+        f"it here, in this tool — the thing itself is the deliverable of "
+        f"this step, and it is what gets collected from this page. Use the "
+        f"content below exactly as written: the headings, the order, the "
+        f"wording. If anything below asks for plain text, a text-format "
+        f"version, a description or an outline instead of the thing, or "
+        f"says not to create files — that was written for a chat tool and "
+        f"does not apply to you: build it. When it is built, say so in one "
+        f"line.\n\n"
+    )
+
+
+def _maker_handoff() -> str:
+    """The closing rule for a maker: nothing but the thing, and one line."""
+    return ("\n\nWhat you build is what is collected. Do not add a handoff "
+            "section, a summary, an explanation or a follow-up question — "
+            "build it, then one line saying it is done.")
+
+
 # How much of the user's own request travels into every stage prompt. Generous
 # on purpose: this is the one piece of text nothing else can reconstruct, and
 # truncating the sentence that says what the product DOES is exactly the
@@ -2085,7 +2125,7 @@ def _intent_block(query: str) -> str:
 
 def _context_header(agent_cfg: dict, prev_stage: str) -> str:
     """The line that introduces the previous stage's output."""
-    if _is_natural(agent_cfg):
+    if _is_natural(agent_cfg) or _is_maker(agent_cfg):
         return ("Here's what I've got so far on this — use whatever is useful "
                 "and ignore the rest:\n\n")
     return (f"Context from the previous pipeline stage ({prev_stage.upper()}) — "
@@ -2094,7 +2134,7 @@ def _context_header(agent_cfg: dict, prev_stage: str) -> str:
 
 
 def _context_footer(agent_cfg: dict) -> str:
-    if _is_natural(agent_cfg):
+    if _is_natural(agent_cfg) or _is_maker(agent_cfg):
         return "\n\nWith that in mind:\n\n"
     return "\n\nNow continue the pipeline and complete the following:\n\n"
 
@@ -4308,23 +4348,28 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 handoff = A.AGENT_REGISTRY[stages[stage_idx + 1][1]]["handoff_spec"]
             elif stage_idx + 1 < len(stages):
                 nxt_stage, nxt_agent, _ = stages[stage_idx + 1]
+                # Said the way a senior colleague briefs another: what this
+                # answer is for, who reads it next, and the one thing that
+                # has to be there. The old numbered "STRICT PIPELINE RULES"
+                # read as a rule sheet, and a rule sheet is what a chat model
+                # answers thinly or not at all.
                 rules = [
-                    "Perform ONLY the task above — nothing more. Do not build, "
-                    "design or produce anything that was not explicitly asked of you.",
+                    "Do the task above and only that — nothing extra built, "
+                    "designed or produced that was not asked for.",
                 ]
                 if prior:
                     rules.append(
-                        "First analyse the context above from the previous stage and "
-                        "extract its most important findings in a short, precise form — "
-                        "they must survive into your handoff."
+                        "Read the context above first and pull out what "
+                        "matters from it, briefly and exactly — those points "
+                        "have to survive into your handoff."
                     )
                 rules.append(
-                    f"Your output will be passed directly to {nxt_agent} (the "
-                    f"'{nxt_stage}' stage of this pipeline), and {nxt_agent} will see "
-                    f"ONLY your answer — nothing from earlier stages. End with a "
-                    f"section titled 'HANDOFF FOR {nxt_agent.upper()}' containing a "
-                    f"short, precise summary of every key finding, decision and "
-                    f"constraint so far (earlier stages' AND your own) that "
+                    f"This is not for a person yet: it goes straight to "
+                    f"{nxt_agent} for the '{nxt_stage}' step, and {nxt_agent} "
+                    f"sees only your answer, nothing from before. So end with a "
+                    f"section titled 'HANDOFF FOR {nxt_agent.upper()}' — a "
+                    f"short, exact summary of every fact, decision and "
+                    f"constraint so far (earlier steps' and your own) that "
                     f"{nxt_agent} needs to do its job."
                 )
                 rules.append(
@@ -4335,17 +4380,24 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 handoff = (
                     _natural_handoff(nxt_agent, final=False)
                     if _is_natural(agent_cfg) else
-                    "\n\nSTRICT PIPELINE RULES:\n" + "\n".join(
+                    "\n\nHOW THIS FITS IN:\n" + "\n".join(
                         f"{i}. {r}" for i, r in enumerate(rules, 1)))
             else:
                 handoff = _natural_handoff("", final=True) if _is_natural(agent_cfg) else (
-                    "\n\nSTRICT PIPELINE RULES:\n"
-                    "You are the FINAL stage. The context above is your complete "
-                    "brief — everything important from earlier stages is already "
-                    "distilled into it. Perform ONLY the task above and deliver the "
-                    "polished final result. Do not add any handoff or summary "
-                    "section, and do not ask any follow-up questions."
+                    "\n\nHOW THIS FITS IN:\n"
+                    "You are the last step, so this goes to the person. "
+                    "Everything above is the whole brief — the earlier steps "
+                    "are already distilled into it. Do the task above and give "
+                    "the finished result: no handoff or summary section for a "
+                    "next step, and no questions back, because nobody is here "
+                    "to answer them."
                 )
+            if _is_maker(agent_cfg) and stage_idx not in machine_stages \
+                    and stage_idx != spec_feeder:
+                # A maker is never asked for a handoff section: what it
+                # builds is what the next stage gets (the harvest), and the
+                # STRICT PIPELINE RULES above read to it as "answer in text".
+                handoff = _maker_handoff()
 
             # The user asked for answers in their own language. Appended last
             # so it is the final instruction the model reads, and skipped for
@@ -4376,7 +4428,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # Canva AI answers with an outline first and needs its
                 # "Generate design" pressed before a deck exists -- see
                 # _run_canva. Handed the same prompt a chat tool would get.
-                canva_prompt = _bmp_safe(context + "\n\n".join(questions) + handoff)
+                canva_prompt = _bmp_safe(_maker_brief(agent_name, agent_cfg)
+                                         + context + "\n\n".join(questions)
+                                         + handoff)
                 stage_responses = _run_canva(driver, agent_cfg, stage,
                                              canva_prompt, should_stop=stage_halt)
             elif agent_name == "NotebookLM":
@@ -4484,6 +4538,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 
                         full_prompt = ((context + prompt) if (idx == 1 and context) else prompt) + handoff
                         if idx == 1:
+                            # A maker hears what it is for before anything
+                            # else -- see _maker_brief.
+                            full_prompt = _maker_brief(agent_name, agent_cfg) + full_prompt
                             # The chat's name — see _chat_header.
                             full_prompt = _chat_header(run_title, stage) + full_prompt
                         full_prompt = _bmp_safe(full_prompt)  # strip emoji ChromeDriver can't type

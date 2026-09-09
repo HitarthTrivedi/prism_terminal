@@ -1680,6 +1680,25 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
     last_change = start
     grown = False
     settled = False
+    # An answer that is EMPTY and FINISHED. ChatGPT sometimes puts up a new
+    # assistant turn with nothing in it -- the toolbar, no text, no stop
+    # button -- and this loop, watching for text to grow, waited the whole
+    # cap for text that was never coming (300s on the 2026-09-10 run). A
+    # tool that says which element means "still generating" (busy_selector)
+    # and which means "a reply" (turn_selector) lets the wait end as soon
+    # as a new turn has sat idle and empty for a while; the caller then
+    # regenerates once (_regenerate_once) or fails the stage NOW, so the
+    # fallback tool gets it minutes earlier.
+    busy_sel = agent_cfg.get("busy_selector", "")
+    turn_sel = agent_cfg.get("turn_selector", "")
+    turns0 = None
+    empty_since = None
+
+    def _count(css: str) -> int:
+        try:
+            return len(driver.find_elements(By.CSS_SELECTOR, css))
+        except Exception:
+            return 0
 
     def has_marker() -> bool:
         if not expect:
@@ -1705,6 +1724,8 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
             # First reading — whatever is already on the page (our own typed
             # prompt, old chat turns) doesn't count as generation.
             baseline = last_len = total
+            if turn_sel:
+                turns0 = _count(turn_sel)
             continue
         if total != last_len:
             grown = grown or total > baseline
@@ -1715,7 +1736,63 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
               and has_marker()):
             settled = True
             break
+        if (turn_sel and busy_sel and not grown
+                and time.time() - start >= EMPTY_TURN_AFTER):
+            # A reply turn exists, nothing is generating, and no text has
+            # arrived: an empty answer. Give it a moment to be a slow start
+            # rather than a blank, then stop waiting.
+            if _count(turn_sel) > (turns0 or 0) and not _count(busy_sel):
+                empty_since = empty_since or time.time()
+                if time.time() - empty_since >= EMPTY_TURN_PATIENCE:
+                    ui.warn("   the tool finished with an empty answer — "
+                            "not waiting out the cap")
+                    settled = True
+                    break
+            else:
+                empty_since = None
     return int(time.time() - start), settled
+
+
+# How long an empty, finished reply turn is given before it is called empty:
+# seconds into the wait before the check starts, and how long the turn has to
+# stay idle and blank. Short on purpose -- a genuine answer starts streaming
+# text within seconds of the turn appearing.
+EMPTY_TURN_AFTER = 20
+EMPTY_TURN_PATIENCE = 15
+
+
+def _regenerate_once(driver, agent_cfg: dict) -> bool:
+    """Press the tool's own "regenerate" on an empty answer, once.
+
+    An empty ChatGPT turn is usually a hiccup, not a refusal: the same
+    prompt regenerated a moment later answers normally. One press, then the
+    ordinary wait; if it is empty again the stage fails and the fallback
+    tool takes it. Best-effort: the control is hover-only in the DOM and is
+    clicked through the page rather than the mouse. Returns whether
+    anything was clicked."""
+    sel = agent_cfg.get("regenerate_selector", "")
+    turn_sel = agent_cfg.get("turn_selector", "")
+    if not sel:
+        return False
+    js = """
+        const sel = arguments[0], turnSel = arguments[1];
+        let scope = document;
+        if (turnSel) {
+            const turns = document.querySelectorAll(turnSel);
+            if (turns.length) scope = turns[turns.length - 1];
+        }
+        let btn = scope.querySelector(sel) || document.querySelector(sel);
+        if (!btn) return false;
+        btn.click();
+        return true;
+    """
+    try:
+        clicked = bool(driver.execute_script(js, sel, turn_sel))
+    except Exception:
+        clicked = False
+    if clicked:
+        ui.info("   🔁  empty answer — asked the tool to regenerate once")
+    return clicked
 
 
 def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
@@ -1999,13 +2076,10 @@ def _intent_block(query: str) -> str:
         "---\n"
         f"{text}\n"
         "---\n"
-        "Everything below is Prism's engineered version of that request. It "
-        "is there to help you, but it is a SUMMARY and summaries lose things. "
-        "Where the two differ, or where the text below is vaguer about what "
-        "the thing actually does, the words above win. Specific facts above — "
-        "how a product works, what a button does, what must be avoided — must "
-        "survive into your answer even if the brief below does not repeat "
-        "them.\n\n"
+        "Below is Prism's engineered summary of that request. Summaries lose "
+        "things: where the two differ, the words above win, and every "
+        "specific fact above (how a product works, what a button does, what "
+        "to avoid) must survive into your answer.\n\n"
     )
 
 
@@ -2461,6 +2535,195 @@ def _run_apollo(driver, agent_cfg: dict, stage: str, brief: str) -> list[str]:
                 "tabs, check you can see the People table, and check your "
                 "credit balance at the top of Apollo.")
     return rows
+
+
+def _click_control(driver, labels, timeout: int = 10) -> str:
+    """Click the CONTROL whose own text starts with one of `labels` -- a
+    button, a role=button, or a link -- choosing the smallest match.
+
+    _click_by_text matches any span or div that CONTAINS the words, which
+    on a page like Canva AI's is the whole chat pane: the first live run
+    "pressed Generate design" on a container div and nothing happened.
+
+    A real WebDriver click first (it scrolls into view and fires the
+    pointer events a React card listens for -- a JS .click() opened
+    nothing on Canva's "View outline" card, the second live run), and the
+    page's own click only if that is intercepted. Returns the label that
+    was clicked, or "".
+    """
+    js = """
+        const labels = arguments[0].map(l => l.toLowerCase());
+        const vis = el => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2; };
+        const els = Array.from(document.querySelectorAll("button, [role='button'], a"));
+        let best = null, bestLabel = "";
+        for (const el of els) {
+            if (!vis(el)) continue;
+            const t = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+            for (const l of labels) {
+                // First line of the control's text, so "View outline" with a
+                // chevron or a second line still matches -- and no literal
+                // newline inside this JS string (that is what silently broke
+                // the whole matcher on the fourth live run).
+                const first = t.split(String.fromCharCode(10))[0].trim();
+                const hit = first === l || t.startsWith(l + " ");
+                if (hit && (!best || t.length < (best.innerText || '').trim().length)) {
+                    best = el; bestLabel = l;
+                }
+            }
+        }
+        return best ? [best, bestLabel] : null;
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            hit = driver.execute_script(js, list(labels))
+        except Exception:
+            hit = None
+        if hit:
+            el, label = hit
+            try:
+                el.click()
+            except Exception:
+                try:
+                    driver.execute_script("arguments[0].click()", el)
+                except Exception:
+                    return ""
+            return label
+        time.sleep(1)
+    return ""
+
+
+def _run_canva(driver, agent_cfg: dict, stage: str, prompt: str,
+               should_stop=None) -> list[str]:
+    """Canva AI is a chat that answers a deck request in two moves.
+
+    Read off the live page with Playwright on 2026-09-10
+    (devtools/canva_probe.py's sibling probes), because the generic path
+    failed twice on the owner's run -- "the prompt would not go into
+    Canva's message box" on the old /magic-design/ marketing page, and,
+    once the box was found, no generate button was ever pressed:
+
+      1. https://www.canva.com/ai opens with a promo dialog over the page
+         (student discount, free trial) whose video swallows every click.
+         Escape closes it. The composer is the one textarea with an
+         aria-label ("Describe your idea, and I'll bring it to life"); the
+         send control is button[aria-label='Submit'].
+      2. The first reply is an OUTLINE, not a design -- "I'll draft a
+         concise outline, then you can turn it into the full presentation"
+         -- with a "View outline" card and, once that is open, a
+         "Generate design" button at the foot of the outline pane. Pressing
+         it is what builds the deck; the reply then carries a preview card
+         and "Your N-slide presentation ... has been created".
+
+    The thread URL is the link Prism keeps: the deck opens from its card
+    there, and the design also lands in the customer's Canva Projects.
+    Best-effort throughout, like the NotebookLM runner: every step fails
+    soft with a message rather than hanging the run, and stop/skip/
+    fallback are polled between the long waits.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    def halted() -> bool:
+        return bool(should_stop and should_stop())
+
+    try:
+        if "canva.com/ai" not in (driver.current_url or ""):
+            driver.get(agent_cfg.get("url") or "https://www.canva.com/ai")
+        time.sleep(agent_cfg.get("page_wait", 10))
+        # The promo dialog. Escape is what closed it on the live page; a
+        # close button is tried as well in case the dialog changes.
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        _click_control(driver, ["not now", "maybe later"], timeout=2)
+        time.sleep(1)
+
+        box = WebDriverWait(driver, agent_cfg.get("input_wait", 30)).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, agent_cfg["textarea_selector"])))
+        box.click()
+        if not _fast_type(driver, box, _bmp_safe(prompt)):
+            box.send_keys(_bmp_safe(prompt))
+        time.sleep(1)
+        if not _text_landed(_composer_text(driver, box), prompt):
+            return ["Canva AI: the prompt would not go into the message box "
+                    "— nothing was sent. Its tab is open if you want to "
+                    "paste it by hand."]
+        sent = False
+        try:
+            WebDriverWait(driver, 8).until(EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, agent_cfg.get("submit_selector", "")))).click()
+            sent = True
+        except Exception:
+            pass
+        if not sent:
+            box.send_keys(Keys.ENTER)
+        ui.info("   ✓  prompt sent to Canva AI — waiting for the outline")
+
+        # Move one: the outline. Canva thinks for a while before the card
+        # appears; poll for either button rather than sleeping a fixed time.
+        # Canva AI sometimes asks a question first -- a brand/style picker
+        # ("Choose an existing layout or select Style only", with Skip),
+        # seen on the third live run once it had a brand in memory. Skip is
+        # answered for it; the outline follows.
+        found = ""
+        deadline = time.time() + min(int(agent_cfg.get("wait_time", 400)), 300)
+        while time.time() < deadline and not halted():
+            found = _click_control(
+                driver, ["generate design", "view outline", "skip"], timeout=3)
+            if found == "skip":
+                ui.info("   ⏭  skipped a Canva question (brand/style picker)")
+                found = ""
+                time.sleep(3)
+                continue
+            if found:
+                break
+        if halted():
+            return []
+        if not found:
+            return ["Canva AI answered, but no outline or Generate design "
+                    "button appeared — check the open tab."]
+        if found == "view outline":
+            # The card answers a click only once the reply has settled; the
+            # fifth live run pressed it while "Updated memory" was still
+            # landing and the pane never opened. Press, look for the button,
+            # and press again for up to a minute.
+            pressed = False
+            until = time.time() + 60
+            while time.time() < until and not halted():
+                time.sleep(3)
+                if _click_control(driver, ["generate design"], timeout=4):
+                    pressed = True
+                    break
+                _click_control(driver, ["view outline"], timeout=2)
+            if not pressed:
+                return ["Canva AI drafted an outline but the Generate design "
+                        "button was not found — open the tab and press it by "
+                        "hand."]
+        ui.info("   🎨  pressed Generate design — waiting for the deck")
+        # The outline pane closes and the reply grows a preview card once
+        # the press took. If the button is still there after a moment, the
+        # click did not land -- press it once more before waiting.
+        time.sleep(4)
+        if _click_control(driver, ["generate design"], timeout=2):
+            ui.info("   🎨  pressed Generate design again")
+
+        # Move two: the deck. The reply grows a preview card and a closing
+        # message; watch the text settle the way every other tool's is.
+        _smart_wait(driver, agent_cfg, int(agent_cfg.get("wait_time", 400)),
+                    expect="", should_stop=should_stop)
+        texts = _capture(driver, agent_cfg)
+        # Left on the thread on purpose: that is where the card that opens
+        # the deck lives, and it is what the saved link points at.
+        return texts or ["Canva AI generated the design — open the tab to "
+                         "see it (the reply text could not be read)."]
+    except Exception as e:
+        return [f"Canva AI automation stopped early ({e}). Its tab is open — "
+                "the design may still be there."]
 
 
 def _run_notebooklm(driver, agent_cfg: dict, stage: str, prompt: str) -> list[str]:
@@ -4109,6 +4372,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 stage_responses = _run_apollo(
                     driver, agent_cfg, stage,
                     _bmp_safe("\n".join(questions) + "\n" + context))
+            elif agent_cfg.get("runner") == "canva":
+                # Canva AI answers with an outline first and needs its
+                # "Generate design" pressed before a deck exists -- see
+                # _run_canva. Handed the same prompt a chat tool would get.
+                canva_prompt = _bmp_safe(context + "\n\n".join(questions) + handoff)
+                stage_responses = _run_canva(driver, agent_cfg, stage,
+                                             canva_prompt, should_stop=stage_halt)
             elif agent_name == "NotebookLM":
                 # NotebookLM is not a chat box — it's a "sources" notebook
                 # (add a source, then either ask about it or generate a
@@ -4447,6 +4717,19 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     first_tab = False
                     continue
                 texts = _capture(driver, agent_cfg)
+                if (not texts and not stage_halt()
+                        and agent_cfg.get("regenerate_selector")
+                        and _regenerate_once(driver, agent_cfg)):
+                    # An empty turn is usually a hiccup. One regenerate, one
+                    # more (shorter) wait, then the honest answer.
+                    emit("retry", {"stage": stage,
+                                   "reason": "empty answer — regenerated once"})
+                    took2, settled2 = _smart_wait(
+                        driver, agent_cfg, min(wait, 300), expect=expect,
+                        should_stop=stage_halt)
+                    took += took2
+                    timed_out = timed_out and not settled2
+                    texts = _capture(driver, agent_cfg)
                 if not texts:
                     stage_responses = []
                 elif len(questions) == 1:

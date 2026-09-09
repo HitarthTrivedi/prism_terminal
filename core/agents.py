@@ -346,6 +346,18 @@ AGENT_REGISTRY = {
                              "asked": _CANVA_SUFFIX,
                              "otherwise": _NO_CANVA_SUFFIX},
         },
+        # An empty, finished reply -- a new assistant turn with no text and
+        # no Stop button -- ends the wait early instead of running out the
+        # cap, and is regenerated once (automation._smart_wait,
+        # _regenerate_once). Read off the live page on 2026-09-10: the turn
+        # is a <section data-turn="assistant">; the per-message toolbar's
+        # regenerate control is hover-only but present in the DOM.
+        busy_selector="button[data-testid='stop-button']",
+        turn_selector="section[data-turn='assistant']",
+        regenerate_selector=("button[aria-label='Regenerate'], "
+                             "button[aria-label*='Try again' i], "
+                             "button[aria-label*='Retry' i], "
+                             "button[data-testid*='regenerate' i]"),
     ),
     "Claude": _agent(
         "https://claude.ai",
@@ -518,7 +530,12 @@ AGENT_REGISTRY = {
     # still succeeded, and CompletionDialog already treats a URL-only step
     # that way.
     "Canva": _agent(
-        "https://www.canva.com/magic-design/",
+        # Canva AI, the chat -- not the /magic-design/ marketing page, which
+        # has no composer at all (the "prompt would not go into Canva's
+        # message box" run of 2026-09-10). Driven by automation._run_canva:
+        # promo dialog dismissed, prompt into the one labelled textarea,
+        # Submit, then the outline's "Generate design" pressed for the deck.
+        "https://www.canva.com/ai",
         "social posts, brochures, decks and brand assets that stay EDITABLE — "
         "the design lands in the customer's own Canva account as a real file, "
         "so a price, caption, photo or logo can be changed afterwards without "
@@ -526,13 +543,14 @@ AGENT_REGISTRY = {
         "the client will want to tweak the result themselves, or needs it in "
         "their own brand kit. Output is the Canva design link",
         "Freemium", "30–60s", 400,
-        # A heavy SPA behind a login: the prompt box mounts well after load and
-        # the design opens on a new editor route. Same treatment as Gamma, with
-        # more headroom.
-        page_wait=14,
+        page_wait=12,
         input_wait=45,
-        textarea_selector=("textarea, div[contenteditable='true'], "
-                           "input[type='text'], input[type='search']"),
+        runner="canva",
+        textarea_selector="textarea[aria-label]",
+        submit_selector="button[aria-label='Submit']",
+        # Canva's class names are generated; the reply is ordinary
+        # paragraphs, and _capture keeps the long ones and drops our echo.
+        response_selector="main p, p",
     ),
 
     # ── Video & Audio ─────────────────────────────────────────────────────────

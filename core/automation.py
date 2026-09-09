@@ -3335,8 +3335,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         reel_design_stage: str = "", pipeline_files_out: list | None = None,
         motion_design_stage: str = "", resume_urls: dict | None = None,
         skip_signal=None, skip_stages: list | None = None,
-        min_wait: int = 0, image_stages=None):
+        min_wait: int = 0, image_stages=None, fallback_signal=None):
     """Execute the pipeline. Returns (responses, links).
+
+    fallback_signal: a threading.Event the screen sets for "Use fallback" —
+                 stop waiting for the tool on the stage that is running and
+                 hand that stage to the next tool in its category NOW, the
+                 way the failover pass would after the cap ran out. For the
+                 person who can see the tool has errored and does not want
+                 to sit out a 600-second wait for Prism to notice. Cleared by
+                 the engine per press, like skip_signal.
 
     image_stages: stage keys the caller PROMISES will produce a picture —
                  /step-auto's "visual" stage, the STEP dialog's Draft. Such a
@@ -3732,10 +3740,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     def skip_requested() -> bool:
         return bool(skip_signal is not None and skip_signal.is_set())
 
+    def fallback_requested() -> bool:
+        return bool(fallback_signal is not None and fallback_signal.is_set())
+
     def stage_halt() -> bool:
-        # What the per-stage waits poll: a full Stop, or a skip of the stage
-        # that is waiting right now.
-        return stopped() or skip_requested()
+        # What the per-stage waits poll: a full Stop, a skip of the stage
+        # that is waiting right now, or "use fallback" on it.
+        return stopped() or skip_requested() or fallback_requested()
 
     # Stages that produced nothing, and why. Read by the failover pass after
     # the loop; see _retry_failed_stages().
@@ -3796,6 +3807,42 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             ui.err(note)
             emit("stage_error", {"stage": stage, "error": note, "url": ""})
 
+    def _hand_to_fallback(stage: str, agent_name: str, questions: list) -> None:
+        """"Use fallback", pressed while `agent_name` was being waited on.
+
+        The failover pass already knows how to give a stage to the next tool
+        in its category; it just runs after the loop, once the cap has run
+        out. This is the same pass, for this one stage, right now -- so the
+        stages after it get its answer instead of running on thinner context.
+        What the tool had on the page is deliberately not kept: the person
+        pressed the button because they could see it was not going to answer.
+        """
+        fallback_signal.clear()
+        ui.warn(f"   ↪  {stage}: handed to the fallback at your request — "
+                f"not waiting for {agent_name}")
+        try:
+            all_links[stage] = driver.current_url
+        except Exception:                                   # noqa: BLE001
+            pass
+        info = {"agent": agent_name, "questions": questions,
+                "reason": f"You handed this step to the fallback instead of "
+                          f"waiting for {agent_name}.",
+                "exhausted": False}
+        if not failover:
+            # A nested retry run never fails over again (one level only, see
+            # _retry_failed_stages). Report it and let the outer pass decide.
+            failures[stage] = info
+            emit("stage_error", {"stage": stage, "error": info["reason"],
+                                 "url": all_links.get(stage, "")})
+            return
+        _retry_failed_stages(
+            {stage: info}, cfg, all_responses, all_links,
+            attachments=attachments, query=query, emit=emit,
+            should_stop=should_stop, stages=None,
+            pipeline_files=pipeline_files, brand=studio_brand,
+            skip_signal=skip_signal, image_stages=image_stages,
+            fallback_signal=fallback_signal)
+
     for stage_idx, (stage, agent_name, questions) in enumerate(stages):
         if stopped():
             ui.warn("Stopped at your request — keeping everything finished so far.")
@@ -3805,6 +3852,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # A skip pressed in the dying moments of the previous stage must
             # not eat this one.
             skip_signal.clear()
+        if fallback_requested():
+            fallback_signal.clear()          # same rule for "use fallback"
 
         agent_cfg = A.resolve_agent(stage, agent_name)
         if not agent_cfg:
@@ -4317,6 +4366,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                   "to the next step."})
                     first_tab = False
                     continue
+                if fallback_requested() and not stopped():
+                    _hand_to_fallback(stage, agent_name, questions)
+                    first_tab = False
+                    continue
                 if stopped():
                     # Scrape before leaving: the tool has been generating for
                     # however long the user waited before pressing Stop, and
@@ -4388,6 +4441,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         ui.warn("   no images appeared — the reel will be "
                                 "type and colour only")
 
+                if fallback_requested() and not stopped():
+                    # Pressed while the pictures were being waited on.
+                    _hand_to_fallback(stage, agent_name, questions)
+                    first_tab = False
+                    continue
                 texts = _capture(driver, agent_cfg)
                 if not texts:
                     stage_responses = []
@@ -4822,7 +4880,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                          all_links: dict, *, attachments, query, emit,
                          should_stop, stages=None, pipeline_files=None,
-                         brand=None, skip_signal=None, image_stages=None) -> None:
+                         brand=None, skip_signal=None, image_stages=None,
+                         fallback_signal=None) -> None:
     """Give each empty stage to a different tool.
 
     The failure this exists for: forty minutes into a run, the free tier on
@@ -4861,8 +4920,13 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
     def skipped() -> bool:
         return bool(skip_signal is not None and skip_signal.is_set())
 
+    def fallback_pressed() -> bool:
+        # "Use fallback" during a retry means "not this one either -- the
+        # next tool, now". The nested run's waits break on it like a stop.
+        return bool(fallback_signal is not None and fallback_signal.is_set())
+
     def halt() -> bool:
-        return bool(should_stop and should_stop()) or skipped()
+        return bool(should_stop and should_stop()) or skipped() or fallback_pressed()
 
     def give_up(stage: str, info: dict, texts: list) -> None:
         skip_signal.clear()
@@ -4932,6 +4996,11 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
             if skipped():
                 give_up(stage, info, texts)
                 break
+            if fallback_pressed():
+                fallback_signal.clear()
+                ui.warn(f"   ↪  {alternative} abandoned at your request — "
+                        "trying the next tool")
+                continue
             if texts:
                 all_responses[stage] = texts
                 if links.get(stage):

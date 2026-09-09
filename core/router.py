@@ -929,6 +929,161 @@ def title_for(query: str, brief: str, api_key: str, model: str) -> str:
     return title or C.fallback_title(query)
 
 
+def planned_steps(routing: dict, agents: dict) -> list[tuple[str, str]]:
+    """(stage, tool) for every step the router's plan would run, in order --
+    the same reading automation._needed_stages makes, before the person
+    has touched anything."""
+    out = []
+    for stage in A.PIPELINE_ORDER:
+        data = (routing or {}).get(stage) or {}
+        if not data.get("needed"):
+            continue
+        if not [q for q in (data.get("questions") or []) if q and str(q).strip()]:
+            continue
+        name = (A.summary_agent_name(agents) if stage == "summary"
+                else data.get("agent_override") or agents.get(stage))
+        if name:
+            out.append((stage, name))
+    return out
+
+
+def plan_changed(planned: list, confirmed: list) -> bool:
+    """Did the person change the plan before pressing Start?
+
+    Two lists of (stage, tool). Any difference in membership, order or tool
+    counts -- the prompts were written for the plan as routed, and a prompt
+    written for Gamma names Gamma even when the step now runs on Canva
+    (the owner's deck run of 2026-09-10). A step with no prompt at all
+    counts as changed too; it has nothing to send.
+    """
+    def key(steps):
+        return [(str(s[0]), str(s[1])) for s in steps]
+    if key(planned) != key(confirmed):
+        return True
+    return any(len(s) > 2 and not [q for q in (s[2] or []) if q and str(q).strip()]
+               for s in confirmed)
+
+
+def passthrough_prompt(query: str, stage: str, brief: str = "") -> str:
+    """The floor under a step with no prompt: the person's own words,
+    scoped to that step's job. Never a great prompt, always a real one."""
+    meta = A.CATEGORIES.get(stage) or {}
+    job = meta.get("desc") or meta.get("label") or stage
+    text = (f"Your ONLY task is: {job[0].lower() + job[1:]}, for the request "
+            "below. Do that part of the job and nothing else — other steps "
+            "handle the rest.\n\n"
+            f"The request:\n{query.strip()}\n")
+    if (brief or "").strip():
+        text += f"\nWhat the job is about, in more detail:\n{brief.strip()}\n"
+    return text + ("\nDeliver the finished result for this step, ready to "
+                   "use, and do not ask questions back.")
+
+
+def brief_confirmed_plan(query: str, cfg: dict, steps: list,
+                         routing: dict | None = None) -> list:
+    """Write the prompts for the plan AS THE PERSON CONFIRMED IT.
+
+    `steps` is the ordered [(stage, tool, draft questions)] the Plan screen
+    is about to run. The router wrote its prompts before anyone looked at
+    the plan; if a step was dropped, added, moved, or given a different tool,
+    those prompts are wrong -- they name the old tool, hand off to a step
+    that no longer follows, or do not exist. One Groq call rewrites them for
+    exactly these steps, in this order, on these tools: the drafts are the
+    substance to keep, the tools and the order are the truth.
+
+    Returns the same list with the questions replaced. Never raises: on a
+    failure the drafts stand, and a step with no draft gets the floor
+    (passthrough_prompt), so the run always has something real to send.
+    """
+    steps = [(str(s[0]), str(s[1]), [q for q in (s[2] if len(s) > 2 else [])
+                                     if q and str(q).strip()]) for s in steps]
+    brief = ((routing or {}).get("_brief") or "").strip()
+    api_key = cfg.get("api_key")
+    model = cfg.get("model", "llama-3.3-70b-versatile")
+
+    def floor(step):
+        stage, tool, qs = step
+        return (stage, tool, qs or [passthrough_prompt(query, stage, brief)])
+
+    if not api_key or not steps:
+        return [floor(s) for s in steps]
+
+    profile = cfg.get("profile", "")
+    profile_line = (f"The user describes themselves / their work as: "
+                    f"\"{profile}\". Tailor every prompt to that context.\n\n"
+                    if profile else "")
+    lines = []
+    for i, (stage, tool, qs) in enumerate(steps, 1):
+        meta = A.CATEGORIES.get(stage) or {}
+        entry = A.AGENT_REGISTRY.get(tool) or {}
+        makes = entry.get("makes", "")
+        draft = " ".join(" ".join(qs).split())[:1200] if qs else "(no draft — write it)"
+        lines.append(
+            f"STEP {i} — {stage.upper()} on {tool}"
+            f"{' (last step)' if i == len(steps) else ''}\n"
+            f"  what this tool is: {entry.get('specialty', 'general-purpose AI')}\n"
+            + (f"  MAKES: {makes} — brief it to BUILD that, never to write "
+               f"text about it\n" if makes else "")
+            + f"  the step's job: {meta.get('desc', meta.get('label', stage))}\n"
+            f"  draft prompt: {draft}")
+    agents = {stage: tool for stage, tool, _ in steps}
+    maker_block = _maker_rule(agents)
+    brief_block = f"The task brief the drafts were written from:\n{brief}\n\n" if brief else ""
+    prompt = f"""You are the routing brain of Prism — a multi-agent AI pipeline.
+The person has looked at the plan and CONFIRMED these steps, in this order,
+on these tools. Write the final prompt for every step, for this plan exactly.
+
+{profile_line}{brief_block}User's raw request (authoritative on scope):
+{query}
+
+THE CONFIRMED PLAN:
+{chr(10).join(lines)}
+
+═══ RULES ═══
+- One prompt per step, in the order above. The drafts hold the substance —
+  keep every fact, constraint and deliverable in them — but the TOOL and the
+  ORDER above are the truth: name the tool the step actually runs on, never
+  another one, and hand off to the step that actually follows.
+- HAND-OFF: every step except the last says its answer is not for the user —
+  it goes to the next step as that step's working brief — and ends with a
+  section titled 'HANDOFF FOR <NEXT TOOL IN CAPITALS>' summarising every
+  fact, decision and constraint the next step needs.
+- FINAL STEP: the last step says the opposite — it is the last step, deliver
+  the finished result for the person, no hand-off.
+{maker_block}- PROMPT CRAFT: after the opener "Your ONLY task is:", each prompt has
+  ROLE (a specific senior expert), CONTEXT (every relevant fact and
+  constraint), DELIVERABLE SPEC (the exact output; for a maker, the built
+  thing), QUALITY BAR (2–3 concrete criteria) and NON-GOALS. 120–250 words.
+- Each prompt is COMPLETE and self-contained.
+
+Return ONLY this JSON (no markdown, no commentary):
+{{"steps": [{{"stage": "<stage>", "questions": ["<prompt>"]}}, ...]}}"""
+    try:
+        try:
+            text = groq_chat(api_key, model, prompt, timeout=60, json_mode=True)
+        except RuntimeError:
+            text = groq_chat(api_key, model, prompt, timeout=60)
+    except Exception as e:                                  # noqa: BLE001
+        ui.warn(f"could not rewrite the prompts for the confirmed plan ({e}) "
+                "— running with the drafts")
+        return [floor(s) for s in steps]
+    got, _why = _parse_plan(text)
+    raw = got.get("steps") if isinstance(got, dict) else None
+    if not isinstance(raw, list) or len(raw) != len(steps):
+        ui.warn("the rewritten prompts did not match the plan — running with "
+                "the drafts")
+        return [floor(s) for s in steps]
+    out = []
+    for step, item in zip(steps, raw):
+        qs = (item or {}).get("questions") if isinstance(item, dict) else None
+        if isinstance(qs, str):
+            qs = [qs]
+        qs = [str(q).strip() for q in (qs or []) if q and str(q).strip()]
+        out.append((step[0], step[1], qs) if qs else floor(step))
+    ui.info("✍️  prompts written for the plan as you confirmed it")
+    return out
+
+
 def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     """Call Groq and return the routing dict (stage -> {questions, needed})."""
     agents = {k: v for k, v in (cfg.get("agents") or {}).items() if v}

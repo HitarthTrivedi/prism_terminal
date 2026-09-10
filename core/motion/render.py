@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 from typing import Any, Callable, Dict, Optional, Union
 
-from .schema import validate_motion_spec
+from .schema import validate_motion_spec, MotionValidationError
 from .resolver import resolve_motion_spec
 
 
@@ -325,6 +325,35 @@ def _render_via_electron(
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
+def audio_faults(spec: Dict[str, Any]) -> list:
+    """The spec's production audio files that are not on disk."""
+    audio = spec.get("audio") if isinstance(spec, dict) else None
+    if not isinstance(audio, dict):
+        return []
+    faults = []
+    for key in ("music", "voiceover"):
+        path = audio.get(key)
+        if isinstance(path, str) and path and not os.path.isfile(path):
+            faults.append(f"audio: the {key} file is not on this machine ({path})")
+    return faults
+
+
+def _mux_production_audio(resolved_spec: Dict[str, Any], video_path: str) -> str:
+    """Attach the spec's production music/voice to the finished film, in
+    place. No audio named means the silent file is the deliverable."""
+    audio = resolved_spec.get("audio") if isinstance(resolved_spec, dict) else None
+    if not isinstance(audio, dict) or not (audio.get("music") or audio.get("voiceover")):
+        return video_path
+    from .audio import mux_audio_and_video
+    root, ext = os.path.splitext(video_path)
+    muxed = mux_audio_and_video(video_path, audio.get("voiceover"), root + ".audio" + ext,
+                                bgm_path=audio.get("music"),
+                                bgm_volume=float(audio.get("music_volume", 0.25)))
+    if muxed != video_path and os.path.isfile(muxed):
+        os.replace(muxed, video_path)
+    return video_path
+
+
 def render(
     spec: Union[str, Dict[str, Any]],
     output_path: str,
@@ -337,8 +366,33 @@ def render(
 
     Uses Playwright (preferred) or Electron (fallback) as the headless renderer.
     """
+    # Studio edits saved on the spec (core.motion.studio) are folded in
+    # first — the same function the editor's preview goes through, so the
+    # film cannot differ from what the editor showed.
+    if isinstance(spec, str):
+        import json as _json
+        spec = _json.loads(spec)
+    if isinstance(spec, dict) and spec.get("_motion_edits"):
+        from .studio import apply_edits as _apply_edits
+        spec = _apply_edits(spec, spec.get("_motion_edits"))
     valid_spec    = validate_motion_spec(spec)
     resolved_spec = resolve_motion_spec(valid_spec)
+
+    # A handoff the continuity compiler could not bridge keeps its ordinary
+    # transition and is reported on the resolved spec (`_continuity_compiled
+    # ["errors"]`) for Studio, the review sheet and the promotion gate. Only
+    # a caller that asks for strictness (`_strict_continuity`: the gate and
+    # its tests) has the render refused — a production run's finished plan
+    # is never thrown away over a key the writer forgot.
+    broken = (resolved_spec.get("_continuity_compiled") or {}).get("errors") or []
+    if broken and resolved_spec.get("_strict_continuity"):
+        raise MotionValidationError(
+            "continuity broken — " + " | ".join(e["message"] for e in broken[:4]))
+
+    # Production audio named by the spec must exist before a minute of
+    # frames is spent — a missing track is a spec problem, not FFmpeg's.
+    for problem in audio_faults(resolved_spec):
+        raise MotionValidationError(problem)
 
     p            = resolved_spec["project"]
     width        = p["width"]
@@ -361,7 +415,7 @@ def render(
         )
         if on_progress:
             on_progress(total_frames, total_frames)
-        return result
+        return _mux_production_audio(resolved_spec, result)
 
     # ── Electron fallback ─────────────────────────────────────────────────────
     electron_bin = _find_electron_binary()
@@ -372,7 +426,7 @@ def render(
         )
         if on_progress:
             on_progress(total_frames, total_frames)
-        return result
+        return _mux_production_audio(resolved_spec, result)
 
     raise MotionRenderError(
         "No headless browser available. "

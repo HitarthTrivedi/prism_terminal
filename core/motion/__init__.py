@@ -15,6 +15,10 @@ from __future__ import annotations
 
 from .schema import MotionProject, validate_motion_spec, MotionValidationError
 from .resolver import resolve_motion_spec
+from . import continuity
+from . import camera, fixtures
+from . import studio
+from . import beats, review
 from .render import render, is_available, MotionRenderError
 from .audio import mux_audio_and_video, AudioError
 
@@ -23,6 +27,12 @@ __all__ = [
     "validate_motion_spec",
     "MotionValidationError",
     "resolve_motion_spec",
+    "continuity",
+    "camera",
+    "fixtures",
+    "studio",
+    "beats",
+    "review",
     "render",
     "is_available",
     "MotionRenderError",

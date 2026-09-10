@@ -254,7 +254,8 @@ _ARTEFACT_STAGES = {
                "thumbnail", "sticker", "mockup"],
     "media": ["video", "animation", "animate", "voiceover", "voice over",
               "voice-over", "narration", "music", "song", "jingle", "soundtrack",
-              "audio", "podcast", "tts", "avatar"],
+              "audio", "podcast", "tts", "avatar", "reel", "short video",
+              "short-form"],
     # NOTE: no bare "prototype" here — it's usually the SUBJECT of a task
     # ("pitch the prototype"), not a request to build software.
     "development": ["web app", "webapp", "website", "web site", "web page",
@@ -393,6 +394,38 @@ def apply_studio_guardrail(query: str, routing: dict, agents: dict) -> str:
     return ("this brief needs real photography in the reel, which Prism "
             "Reel's code-drawn house style can't display — using Prism "
             "Studio instead for this run")
+
+
+def apply_studio_imagery_guardrail(query: str, routing: dict,
+                                   agents: dict) -> bool:
+    """Keep Studio reels visual by default when an image maker is available.
+
+    The planner often selected ``media`` but omitted ``visual`` because it
+    interpreted artwork as optional. Studio then correctly followed the plan
+    and produced a type-only reel, even though its intended art-directed mode
+    includes generated scene imagery. The user can still untick the visual
+    row after planning; this only fixes an ambiguous planner omission.
+    """
+    if agents.get("media") != "Prism Studio" or not agents.get("visual"):
+        return False
+    q = query.lower()
+    if not _mentions(q, _ARTEFACT_STAGES["media"]):
+        return False
+    explicit_type_only = (
+        "without image" in q or "no image" in q or "no artwork" in q or
+        "type only" in q or "typography only" in q or "text only" in q or
+        "type and colour only" in q or "type and color only" in q)
+    if explicit_type_only:
+        return False
+    visual = routing.get("visual") or {}
+    if visual.get("needed") and visual.get("questions"):
+        return False
+    routing["visual"] = {"needed": True, "questions": [
+        "Generate separate, reusable visual assets for the Prism Studio reel. "
+        "Inspect the brief and make individual images only; never a storyboard, "
+        "collage, poster, or image containing baked-in scene text."
+    ]}
+    return True
 
 
 # One-line description of what each stage is FOR, injected into the prompt only
@@ -1147,6 +1180,9 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     studio_swap = apply_studio_guardrail(query, routing, agents)
     if studio_swap:
         ui.info(f"🛡️  guardrail: {studio_swap}")
+    if apply_studio_imagery_guardrail(query, routing, agents):
+        ui.info("🛡️  Studio reel imagery enabled — the planner omitted the "
+                "visual stage, so individual scene assets will be generated")
     # Surface the enrichment brief so the UI can show the full transformation
     # chain (raw words → brief → stage prompts). Consumers iterate
     # PIPELINE_ORDER, so this extra key is invisible to them.

@@ -11,6 +11,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from .camera import normalize_shot
+
 
 class MotionValidationError(Exception):
     """Raised when a motion spec violates schema or structural rules."""
@@ -71,8 +73,12 @@ TWEEN_CHANNELS = {
 # light_leak). A curated set, not free-text, for the same reason the
 # easing fallback rotation is curated rather than open: a bounded, varied
 # menu beats an unconstrained surface for consistency across scenes.
+# `morph` is the one the continuity compiler (continuity.py) stamps onto
+# any cut a `continuity_key` crosses: a plain container crossfade, so the
+# pose-matched subject bridge is the only thing that moves.
 TRANSITION_NAMES = {
     "push", "push_up", "squeeze", "zoom", "blur_swoosh", "light_leak",
+    "morph",
 }
 
 # Keyed by the keyword with every space/hyphen/underscore stripped and
@@ -93,6 +99,37 @@ _LAYER_Z_DEFAULT = {
     "accent": 30,
     "finish": 40,
 }
+
+# Numeric material/depth props: (min, max, default-or-None). A value out of
+# range is clamped, not rejected (same tolerance as camera zoom); a
+# default is only written where Python-side tooling must agree with the
+# runtime (depth, so parallax planning and inspect see the same number).
+_MATERIAL_PROPS = {
+    "glass_panel": {"blur": (0.0, 40.0, None), "transmission": (0.0, 1.0, None),
+                    "border_light": (0.0, 1.0, None), "inner_shadow": (0.0, 1.0, None),
+                    "specular": (0.0, 1.0, None), "light_angle": (-360.0, 360.0, None)},
+    "light_field": {"intensity": (0.0, 1.0, None), "spread": (0.2, 2.0, None),
+                    "drift": (0.0, 200.0, None)},
+    "depth_layer": {"depth": (0.2, 2.5, 1.0)},
+}
+
+
+def _clamp_material_props(node: dict) -> None:
+    table = _MATERIAL_PROPS.get(node.get("type"))
+    if not table:
+        return
+    for key, (lo, hi, default) in table.items():
+        if key in node:
+            try:
+                node[key] = max(lo, min(hi, float(node[key])))
+            except (TypeError, ValueError):
+                if default is None:
+                    del node[key]
+                else:
+                    node[key] = default
+        elif default is not None:
+            node[key] = default
+
 
 _ANCHOR_KEYWORDS = {
     "center": (0.5, 0.5), "middle": (0.5, 0.5),
@@ -265,6 +302,30 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     if duration <= 0.5 or duration > 300.0:
         raise MotionValidationError(f"Invalid duration {duration}s. Must be between 0.5s and 300s.")
 
+    # ── 1b. Production audio ─────────────────────────────────────────────────
+    # Files to mux at export (render.py) and the tempo the timing grid
+    # (beats.py) lays beats on. Nothing here generates sound; a temporary
+    # score never enters the design contract. Paths are checked at render.
+    audio = spec.get("audio")
+    if audio is not None and not isinstance(audio, dict):
+        del spec["audio"]
+    elif isinstance(audio, dict):
+        clean: Dict[str, Any] = {}
+        for key in ("music", "voiceover"):
+            if isinstance(audio.get(key), str) and audio[key].strip():
+                clean[key] = audio[key].strip()
+        for key, lo, hi in (("bpm", 40.0, 240.0), ("offset", -60.0, 60.0),
+                            ("music_volume", 0.0, 1.0)):
+            if audio.get(key) is not None:
+                try:
+                    clean[key] = max(lo, min(hi, float(audio[key])))
+                except (TypeError, ValueError):
+                    pass
+        if clean:
+            spec["audio"] = clean
+        else:
+            del spec["audio"]
+
     # ── 2. Camera validation ──────────────────────────────────────────────────
     camera = spec.get("camera")
     if camera is not None and not isinstance(camera, dict):
@@ -320,8 +381,22 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
             node["id"] = node_id
         node_ids.add(node_id)
 
+        # Editor-facing IDs stay unique. A continuity key separately pairs
+        # scene-local instances of one visual subject (particles -> core ->
+        # orb) so the cinematic compiler and Studio can preserve its motion.
+        if "continuity_key" in node:
+            key = node.get("continuity_key")
+            if isinstance(key, str):
+                key = key.strip()
+            if isinstance(key, str) and key and len(key) <= 80:
+                node["continuity_key"] = key
+            else:
+                del node["continuity_key"]
+
         node_type = str(node.get("type", "group"))
         node["type"] = node_type
+
+        _clamp_material_props(node)
 
         node.setdefault("position", [0, 0])
         node.setdefault("scale",    [1.0, 1.0])
@@ -403,6 +478,24 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         t_in = scene.get("transition_in")
         if s_idx == 0 or t_in not in TRANSITION_NAMES:
             scene.pop("transition_in", None)
+        # The easing of the continuity bridge across the cut INTO this
+        # scene (Studio's handoff handle) — dropped unless it is a GSAP ease.
+        if "handoff_easing" in scene:
+            if s_idx == 0 or not _valid_easing(scene.get("handoff_easing")):
+                del scene["handoff_easing"]
+            else:
+                scene["handoff_easing"] = str(scene["handoff_easing"]).strip()
+        # The scene's camera intent (see camera.py) — a bare intent string
+        # or {intent, target, zoom, easing}. Unusable means dropped, so the
+        # compiled camera curve simply carries the previous shot through.
+        if "shot" in scene:
+            shot = normalize_shot(scene.get("shot"))
+            if shot is None:
+                del scene["shot"]
+            else:
+                if "easing" in shot and not _valid_easing(shot["easing"]):
+                    del shot["easing"]
+                scene["shot"] = shot
         nodes = scene.get("nodes", [])
         if not isinstance(nodes, list):
             raise MotionValidationError(f"scenes[{s_idx}].nodes must be a list.")

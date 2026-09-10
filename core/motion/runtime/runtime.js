@@ -46,10 +46,15 @@ class Matrix2D {
 // the ONE place in the whole runtime any CSS value is computed by hand
 // rather than left to GSAP — deliberately, so behavior never depends on
 // unverified same-shape CSS string interpolation.
-function proxyTween(masterTl, apply, from, to, duration, ease, at, delay) {
+// `immediate` (default true) writes the from-value right away, which is
+// what an ENTER wants (the node rests hidden until it enters). An EXIT
+// passes false: its from-value is the settled state the enter already
+// produced, and writing it at creation would overwrite the enter's
+// hidden state — the node would show at full opacity before it entered.
+function proxyTween(masterTl, apply, from, to, duration, ease, at, delay, immediate) {
   const proxy = { v: from };
-  apply(from);
-  masterTl.fromTo(proxy, { v: from }, { v: to, duration, ease: ease || "power2.out", onUpdate: () => apply(proxy.v) }, at + (delay || 0));
+  if (immediate !== false) apply(from);
+  masterTl.fromTo(proxy, { v: from }, { v: to, duration, ease: ease || "power2.out", immediateRender: immediate !== false, onUpdate: () => apply(proxy.v) }, at + (delay || 0));
 }
 window.proxyTween = proxyTween;
 
@@ -202,6 +207,7 @@ class Node {
     host.style.zIndex = String(this.zIndex);
     host.style.mixBlendMode = this.blendMode === "source-over" ? "normal" : this.blendMode;
     if (!this.visible) host.style.display = "none";
+    host.dataset.motionId = this.id; // the studio's selection handle (studio.js)
 
     const box = document.createElement("div");
     box.style.position = "absolute";
@@ -247,14 +253,21 @@ class Node {
         for (const tw of block.tweens) {
           const ease = tw.easing || "power2.out";
           const at = blockStart + (tw.delay || 0);
+          // A fromTo renders its from-value at creation (immediateRender).
+          // For an enter that is the point: the node rests hidden/offset
+          // until its enter begins. For an exit, created AFTER the enter,
+          // it would overwrite that hidden state with the settled one and
+          // the node would flash at full opacity before entering — so an
+          // exit never renders early.
+          const immediate = blockName === "enter";
           if (HOST_CHANNELS.has(tw.channel)) {
             const base = _baseValueFor(this, tw.channel);
             const fromV = tw.channel === "opacity" ? tw.from : base + tw.from;
             const toV = tw.channel === "opacity" ? tw.to : base + tw.to;
-            masterTl.fromTo(host, { [tw.channel]: fromV }, { [tw.channel]: toV, duration, ease }, at);
+            masterTl.fromTo(host, { [tw.channel]: fromV }, { [tw.channel]: toV, duration, ease, immediateRender: immediate }, at);
           } else if (BOX_PROXY_CHANNELS.has(tw.channel)) {
             const target = tw.channel === "strokeDashoffset" && this._strokeTarget ? this._strokeTarget : box;
-            proxyTween(masterTl, v => _applyBoxChannel(tw.channel, target, v), tw.from, tw.to, duration, ease, at);
+            proxyTween(masterTl, v => _applyBoxChannel(tw.channel, target, v), tw.from, tw.to, duration, ease, at, 0, immediate);
           }
         }
       }
@@ -327,6 +340,7 @@ class MotionRuntime {
     this.effects = window.MotionEffects ? new window.MotionEffects(this.width, this.height) : null;
     this.rootNodes = [];
     this.sceneWindows = [];
+    this.depthLayers = [];
     this.masterTl = null;
     this.spec = null;
   }
@@ -360,6 +374,7 @@ class MotionRuntime {
     this.stageEl.innerHTML = "";
     this.rootNodes = [];
     this.sceneWindows = [];
+    this.depthLayers = [];
     this.masterTl = gsap.timeline({ paused: true });
 
     const scenes = spec.scenes || [];
@@ -376,7 +391,7 @@ class MotionRuntime {
       const sceneRoots = [];
       for (const nodeData of scene.nodes || []) {
         const node = createNodeFromSpec(nodeData);
-        if (node) { sceneRoots.push(node); this.rootNodes.push(node); }
+        if (node) { sceneRoots.push(node); this.rootNodes.push(node); this._collectDepthLayers(node); }
       }
       sceneRoots.sort((a, b) => a.zIndex - b.zIndex);
       for (const root of sceneRoots) root.mount(sceneEl);
@@ -395,6 +410,14 @@ class MotionRuntime {
     if (window.MotionTransitions) {
       window.MotionTransitions.registerAll(this.masterTl, scenes, this.sceneWindows, this.width, this.height, this.stageEl);
     }
+  }
+
+  // Depth layers (primitives.js DepthLayerNode) anywhere in the tree —
+  // each gets its parallax transform refreshed on every seek, after the
+  // camera is evaluated, since it depends on the camera's current state.
+  _collectDepthLayers(node) {
+    if (window.DepthLayerNode && node instanceof window.DepthLayerNode) this.depthLayers.push(node);
+    for (const child of node.children) this._collectDepthLayers(child);
   }
 
   _setupTheme(project) {
@@ -455,6 +478,7 @@ class MotionRuntime {
     }
 
     this.stageEl.style.transform = this.camera.getViewMatrix().toCSSMatrix();
+    for (const layer of this.depthLayers || []) layer.applyParallax(this.camera, this.width, this.height);
 
     const visual = Object.assign({ background: this.background },
       (this.spec && this.spec.visual) ? this.spec.visual : {});

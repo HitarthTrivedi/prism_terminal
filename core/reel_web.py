@@ -39,7 +39,6 @@ import subprocess
 W, H = 1080, 1920
 SAFE_X, SAFE_Y = 90, 130
 DEFAULT_FPS = 30
-_CONTACT_PANEL_CACHE: dict[str, list[str]] = {}
 
 # Minimum type sizes for a 1080-wide frame, unchanged from the Pillow
 # renderer: a phone is watched at arm's length for under a second a scene.
@@ -266,6 +265,7 @@ window.__check = function () {
   const seen = new Set();
   const scenes = document.querySelectorAll('.scene.on');
   for (const scene of scenes) {
+    let visibleContent = 0;
     const texts = [];
     for (const el of scene.querySelectorAll('*')) {
       const txt = (el.textContent || '').trim();
@@ -283,6 +283,7 @@ window.__check = function () {
             parseFloat(pc.opacity) < 0.05) { faded = true; break; }
       }
       if (faded) continue;
+      visibleContent++;
       const label = txt.slice(0, 34);
       const key = label + '|';
       texts.push({ el: el, r: r, label: label });
@@ -362,6 +363,14 @@ window.__check = function () {
       if (r.width < 2 || r.height < 2) continue;
       const cs = getComputedStyle(el);
       if (cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) continue;
+      visibleContent++;
+      if (el.tagName.toLowerCase() === 'img' && el.complete && el.naturalWidth === 0) {
+        const key = 'broken|' + (el.getAttribute('alt') || 'image');
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push('an image failed to load — replace the missing asset or remove the image slot');
+        }
+      }
       if (r.left < -2 || r.right > %d + 2 || r.top < -2 || r.bottom > %d + 2) {
         const what = el.getAttribute('alt') || el.tagName.toLowerCase();
         const key = 'img|' + what + Math.round(r.left);
@@ -370,6 +379,36 @@ window.__check = function () {
           out.push('an image (' + what + ', ' + Math.round(r.width) + 'x' +
                    Math.round(r.height) + ') runs off the frame');
         }
+      }
+    }
+
+    // CSS animations are the motion contract. A missing fill mode causes a
+    // visible snap at scene boundaries when the renderer seeks frame by
+    // frame; transitions and JS timers are not filmable either.
+    for (const el of scene.querySelectorAll('*')) {
+      const cs = getComputedStyle(el);
+      if (cs.visibility !== 'hidden' && parseFloat(cs.opacity) >= .05 &&
+          (cs.backgroundColor !== 'rgba(0, 0, 0, 0)' ||
+           cs.borderTopStyle !== 'none' || cs.borderRightStyle !== 'none' ||
+           cs.borderBottomStyle !== 'none' || cs.borderLeftStyle !== 'none')) {
+        visibleContent++;
+      }
+      const names = cs.animationName.split(',').map(x => x.trim());
+      const fills = cs.animationFillMode.split(',').map(x => x.trim());
+      if (names.some((name, i) => name !== 'none' &&
+          fills[i %%%% fills.length] !== 'both')) {
+        const key = 'anim|' + cs.animationName;
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push('animation ' + cs.animationName + ' is missing fill-mode: both — motion may snap');
+        }
+      }
+    }
+    if (visibleContent === 0) {
+      const key = 'empty|' + (scene.id || 'scene');
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push('scene ' + (scene.id || '') + ' has no visible content');
       }
     }
   }
@@ -447,50 +486,19 @@ def _asset_uris(table: dict, scene_index: int | None = None) -> dict:
         # image in the final video; the design prompt receives the rejection
         # and can fall back to type/CSS or request individual art.
         if isinstance(a, dict) and a.get("composite"):
-            if a.get("kind") == "logo":
-                # A contact sheet is never a logo.  Leaving the image
-                # unresolved lets _drop_missing remove the tag while the
-                # designed wordmark/kicker remains intact.
-                continue
-            # Storyboard boards are useful only as individual tiles.  Asset
-            # collection records the deterministic 4+3 panel crops; choose a
-            # tile per scene so a board can never appear as a giant card.
-            panels = a.get("panels") or []
-            if not panels and a.get("path"):
-                try:
-                    from .assets import split_contact_sheet
-                    key = str(a["path"])
-                    panels = _CONTACT_PANEL_CACHE.get(key)
-                    if panels is None:
-                        panels = split_contact_sheet(key)
-                        _CONTACT_PANEL_CACHE[key] = panels
-                except Exception:
-                    panels = []
-            if panels and scene_index is not None:
-                path = panels[scene_index % len(panels)]
-            else:
-                continue
+            # A board is reference material, not a production image. Guessed
+            # 4+3 crops selected by scene index were unrelated to the copy.
+            # Deliberate single-image crops must be collected as new assets.
+            continue
         else:
             path = a.get("path") if isinstance(a, dict) else a
         # Specs written before the contact-sheet metadata existed are still
         # safe: inspect the source file lazily when they are re-rendered.
         if isinstance(a, dict) and path:
             try:
-                from .assets import looks_like_contact_sheet, split_contact_sheet
+                from .assets import looks_like_contact_sheet
                 if looks_like_contact_sheet(path):
-                    # Specs saved before composite metadata was introduced
-                    # still need scene-aware panel extraction.
-                    if isinstance(a, dict) and a.get("kind") == "logo":
-                        continue
-                    key = str(path)
-                    panels = _CONTACT_PANEL_CACHE.get(key)
-                    if panels is None:
-                        panels = split_contact_sheet(key)
-                        _CONTACT_PANEL_CACHE[key] = panels
-                    if panels and scene_index is not None:
-                        path = panels[scene_index % len(panels)]
-                    else:
-                        continue
+                    continue
             except Exception:
                 pass
         try:
@@ -518,8 +526,9 @@ def _place_assets(text: str, uris: dict) -> str:
 def missing_assets(spec: dict) -> list[str]:
     """Asset names the design asks for that were never made."""
     import re
-    have = {name for name, asset in (spec.get("_assets") or {}).items()
-            if not (isinstance(asset, dict) and asset.get("composite"))}
+    # The same resolver as preview/export: a stale path or rejected board is
+    # not available merely because its name is present in the manifest.
+    have = set(_asset_uris(spec.get("_assets") or {})) - _blocked_assets(spec.get("design") or {})
     used = set()
     blobs = [(spec.get("design") or {}).get("css", "")]
     for sc in (spec.get("scenes") or []):
@@ -529,12 +538,26 @@ def missing_assets(spec: dict) -> list[str]:
     return sorted(used - have)
 
 
+def _blocked_assets(design: dict) -> set[str]:
+    """Honor the visual review in the saved project, not only in prose."""
+    flags = design.get("asset_flags") or []
+    if not isinstance(flags, list):
+        return set()
+    return {str(flag.get("asset") or flag.get("name") or "").removeprefix("asset:")
+            for flag in flags if isinstance(flag, dict)
+            and str(flag.get("status", "")).lower() in
+            {"unusable", "reference-only", "reference_only"}}
+
+
 def _asset_names(listing: str) -> list[str]:
     """The names on an asset list, in order. Only lines that START with a
     name count, so the NO_ARTWORK instruction — which mentions
     `asset:anything` mid-sentence to forbid it — yields none."""
     return list(dict.fromkeys(
-        re.findall(r"^\s*asset:([A-Za-z0-9_-]+)", listing or "", re.M)))
+        match.group(1)
+        for line in (listing or "").splitlines()
+        if not re.search(r"REJECTED|REFERENCE[- ]ONLY|UNUSABLE", line, re.I)
+        for match in [re.match(r"\s*asset:([A-Za-z0-9_-]+)", line)] if match))
 
 
 def planned_assets(row: dict, listing: str) -> list[str]:
@@ -595,6 +618,29 @@ def brand_faults(spec: dict) -> list[str]:
     return [f"the client's accent colour {accent} appears nowhere in the "
             "design — use var(--accent) for the element the eye goes to first "
             "in each scene, or the reel is not in their colours"]
+
+
+def structural_faults(spec: dict) -> list[str]:
+    """Checks that do not require a browser: timing, identity and content."""
+    faults = []
+    scenes = spec.get("scenes") or []
+    ids = set()
+    for i, scene in enumerate(scenes, 1):
+        if not isinstance(scene, dict) or not str(scene.get("html", "")).strip():
+            faults.append(f"scene {i} has no HTML content")
+            continue
+        sid = str(scene.get("studio_id", f"scene-{i}"))
+        if sid in ids:
+            faults.append(f"scene {i} reuses studio id {sid} — selection and edits are ambiguous")
+        ids.add(sid)
+        try:
+            seconds = float(scene.get("seconds", 4))
+        except (TypeError, ValueError):
+            faults.append(f"scene {i} has an invalid duration")
+            continue
+        if not 1.5 <= seconds <= 12:
+            faults.append(f"scene {i} duration {seconds:g}s is outside the supported 1.5–12s range")
+    return faults
 
 
 def _drop_missing(text: str) -> str:
@@ -811,6 +857,8 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     reel_edit.ensure_stable_ids(spec)
     design = spec.get("design") or {}
     scenes = spec.get("scenes") or []
+    asset_table = {name: value for name, value in (spec.get("_assets") or {}).items()
+                   if name not in _blocked_assets(design)}
     plan, _ = _plan(spec, fps)
 
     fonts = ""
@@ -826,10 +874,9 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
 
     body, scene_css = [], []
     for i, sc in enumerate(scenes):
-        # Resolve generated storyboard panels against the scene that uses
-        # them.  A single global URI table was the source of full-board
-        # images and, after rejection, blank image slots.
-        uris = _asset_uris(spec.get("_assets") or {}, scene_index=i)
+        # Resolve only usable assets; boards remain references, never tiles
+        # picked implicitly by scene number.
+        uris = _asset_uris(asset_table, scene_index=i)
         html = _drop_missing(_place_assets(sc.get("html") or "", uris))
         # A scene may name the cut it wants ("push", "squeeze", "zoom") and
         # get it from the library in the harness. Sanitised rather than
@@ -849,7 +896,7 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         if own:
             scene_css.append(own)
 
-    design_uris = _asset_uris(spec.get("_assets") or {})
+    design_uris = _asset_uris(asset_table)
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"{fonts}"
@@ -857,6 +904,15 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         f"<style>:root{{{root_vars}}}</style>"
         f"<style>{_drop_missing(_place_assets(design.get('css', ''), design_uris))}</style>"
         f"<style>{''.join(scene_css)}</style>"
+        # A scene's own CSS commonly includes `.scene{position:relative}`.
+        # Because scoping intentionally allows that selector to target the
+        # scene root, it can override the harness's absolute stage layer and
+        # make later scenes flow below the 1920px frame. Keep the film layers
+        # pinned after all designer CSS while leaving inner composition rules
+        # untouched.
+        "<style>#stage > .scene{position:absolute!important;inset:0!important;"
+        "width:1080px!important;height:1920px!important;overflow:hidden!important;}"
+        "</style>"
         "</head><body>"
         f"<div id='stage'>{''.join(body)}</div>"
         f"<script>{_HARNESS_JS % json.dumps(plan)}</script>"
@@ -864,11 +920,25 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     )
 
 
+def _seek_page(page, milliseconds: float) -> None:
+    """Wait for paint after a discontinuous animation seek.
+
+    SVG stroke rasterization can lag behind computed animation styles by a
+    frame. Two animation frames allow style invalidation and paint to settle
+    without advancing the paused scene clock or relying on a fixed sleep.
+    """
+    page.evaluate("""async t => {
+        window.__seek(t);
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }""", milliseconds)
+
+
 def render(spec: dict, out_path: str, on_progress=None,
-           check: bool = True) -> str:
+           check: bool = True, *, capture_quality: int = 95,
+           crf: int = 19) -> str:
     """Draw the reel in a browser and encode it.
 
-    PNG frames are piped straight into FFmpeg — no temp directory of a
+    JPEG frames are piped straight into FFmpeg — no temp directory of a
     thousand images, and no re-encode of anything.
     """
     ok, why = available()
@@ -891,6 +961,7 @@ def render(spec: dict, out_path: str, on_progress=None,
     filmed = spec
     if spec.get("edits"):
         from . import reel_edit
+        reel_edit.ensure_stable_ids(spec)
         edits = reel_edit.clean_edits(spec["edits"])
         filmed = reel_edit.with_timing(spec, edits)
     plan, total = _plan(filmed, fps)
@@ -905,9 +976,11 @@ def render(spec: dict, out_path: str, on_progress=None,
     # quality 95 costs 41. PNG was ~85% of the total render time, spent
     # losslessly compressing a frame that is about to be thrown through H.264
     # anyway — where the difference is invisible.
+    capture_quality = max(1, min(100, int(capture_quality)))
+    crf = max(0, min(51, int(crf)))
     cmd = [exe, "-y", "-loglevel", "error",
            "-f", "image2pipe", "-c:v", "mjpeg", "-framerate", str(fps), "-i", "-",
-           "-c:v", "libx264", "-preset", "medium", "-crf", "19",
+           "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
            "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
 
     faults: list[str] = []
@@ -933,9 +1006,12 @@ def render(spec: dict, out_path: str, on_progress=None,
                 # Look at a settled frame of every scene BEFORE encoding
                 # anything: a reel that fails the check is worth catching in
                 # seconds rather than after a minute of rendering.
+                faults.extend(structural_faults(filmed))
+                faults.extend(brand_faults(filmed))
+                for name in missing_assets(filmed):
+                    faults.append(f'asset:{name} is referenced but unavailable')
                 for s in plan:
-                    page.evaluate("t => window.__seek(t)",
-                                  s["start"] + s["dur"] * 0.75)
+                    _seek_page(page, s["start"] + s["dur"] * 0.75)
                     for fault in page.evaluate("() => window.__check()") or []:
                         if fault not in faults:
                             faults.append(fault)
@@ -955,8 +1031,8 @@ def render(spec: dict, out_path: str, on_progress=None,
                                     stderr=subprocess.PIPE)
             try:
                 for f in range(total):
-                    page.evaluate("t => window.__seek(t)", f * 1000.0 / fps)
-                    proc.stdin.write(page.screenshot(type="jpeg", quality=95))
+                    _seek_page(page, f * 1000.0 / fps)
+                    proc.stdin.write(page.screenshot(type="jpeg", quality=capture_quality))
                     if on_progress and (f + 1) % fps == 0:
                         on_progress(f + 1, total)
                 proc.stdin.close()
@@ -985,7 +1061,16 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
     from playwright.sync_api import sync_playwright
     from . import browser as _browser
     fps = int(spec.get("fps", DEFAULT_FPS))
+    edits = []
+    if spec.get("edits"):
+        from . import reel_edit
+        reel_edit.ensure_stable_ids(spec)
+        edits = reel_edit.clean_edits(spec["edits"])
+        spec = reel_edit.with_timing(spec, edits)
     plan, _ = _plan(spec, fps)
+    html = build_html(spec, fps)
+    if edits:
+        html = reel_edit.apply_edits(html, edits)
     faults: list[str] = []
     with sync_playwright() as p:
         browser = _browser.launch_chromium(p, args=["--hide-scrollbars",
@@ -993,14 +1078,14 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
         page = browser.new_page(viewport={"width": W, "height": H},
                                 device_scale_factor=1)
         try:
-            page.set_content(build_html(spec, fps), wait_until="load")
+            page.set_content(html, wait_until="load")
             try:
                 page.wait_for_function("document.fonts.ready.then(()=>true)",
                                        timeout=8000)
             except Exception:
                 pass
             for s in plan:
-                page.evaluate("t => window.__seek(t)", s["start"] + s["dur"] * at)
+                _seek_page(page, s["start"] + s["dur"] * at)
                 for fault in page.evaluate("() => window.__check()") or []:
                     if fault not in faults:
                         faults.append(fault)
@@ -1014,6 +1099,7 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
         have = ", ".join((spec.get("_assets") or {}).keys()) or "none at all"
         faults.insert(0, f'the design uses "asset:{name}", which does not '
                           f'exist — the artwork available is: {have}')
+    faults[:0] = structural_faults(spec)
     faults[:0] = brand_faults(spec)
     return faults
 
@@ -1379,6 +1465,23 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "a narrow image strip, or a picture beside an oversized headline. Keep "
         "all copy live HTML/CSS: generated images are visual ingredients only, "
         "never a finished poster or text-bearing storyboard."
+        "\nSHAPE DIRECTION — geometric elements must feel authored, not like "
+        "placeholders. Define one shape vocabulary for the whole reel (for "
+        "example: clipped editorial corners, a single orbital construction, "
+        "or a measured rule/grid system) and reuse it with variation. Every "
+        "shape needs a job in the story or hierarchy. Use optical alignment, "
+        "a small stroke scale (1px/2px/4px), intentional proportions, and "
+        "controlled opacity. Avoid random circles, generic pills, arbitrary "
+        "solid rectangles, equal-weight decorations, and shapes that merely "
+        "fill empty space. Prefer one hero construction plus two quiet support "
+        "details per scene; keep the headline as the visual priority."
+        "\nCOMPOSITION SYSTEM — use a consistent 12-column grid and an 8px rhythm. "
+        "Align type, rules, and shape edges to shared guides; vary the span and "
+        "offset, not the underlying grid. Keep essential copy inside x=130..950 "
+        "and y=180..1580 so captions and platform controls do not cover it. "
+        "Use at most three typographic roles (display, support, micro-label) and "
+        "no more than two families. Let negative space carry as much weight as "
+        "the geometric mark."
         f"{swatch}"
         f"{(chr(10) + chr(10) + 'What the client asked for: ' + request) if request else ''}"
         "\n\nYou are writing a real web page. It is rendered in Chromium at "
@@ -1395,16 +1498,9 @@ def design_instructions(brand: dict | None = None, request: str = "",
             "decide which scene uses it and record that name in the storyboard "
             "row's `assets` list. If an image is unreadable, irrelevant, the "
             "wrong orientation, or cannot be used safely, do not force it into "
-            "a frame: add an `asset_flags` entry with its asset name, status "
-            "(`limited` or `unusable`) and a short reason. Never invent a "
+            "a frame: add a `design.asset_flags` entry with its asset name, status "
+            "(`limited`, `reference-only` or `unusable`) and a short reason. Never invent a "
             "replacement filename.\n"
-            "· VISUAL REFERENCE REVIEW: inspect every attached image in the "
-            "conversation before choosing a scene. Map each usable asset to "
-            "the storyboard row's `assets` list. If an image is unreadable, "
-            "irrelevant, the wrong orientation, or unsafe to use, do not "
-            "force it into a frame: add an `asset_flags` entry with its name, "
-            "status (`limited` or `unusable`) and a short reason. Never invent "
-            "a replacement filename.\n"
             "· THOSE NAMES ARE THE ONLY ONES THAT EXIST. Referring to any "
             "other — asset:art2 when only asset:art1 is listed, asset:photo, "
             "asset:bg — leaves a hole in the frame. Count the list above and "
@@ -1431,7 +1527,9 @@ def design_instructions(brand: dict | None = None, request: str = "",
         '{\n'
         '  "design": {\n'
         '    "name": "one line describing the look you chose",\n'
-        '    "google_fonts": ["Fraunces:opsz,wght@9..144,700", "Inter:wght@400;600"],\n'
+        '    "google_fonts": ["chosen family with only the required weights"],\n'
+        '    "direction": "reference observations, one visual idea, type roles, '
+        'shape purpose, motion rhythm and what to leave out",\n'
         '    "cut_ms": 500,\n'
         '    "css": "…the SHARED stylesheet: :root variables, the background, '
         'the type scale, and any helper class more than one scene will use…"\n'
@@ -1443,6 +1541,7 @@ def design_instructions(brand: dict | None = None, request: str = "",
         'a field of colour",\n'
         '     "motion": "what moves, in what order, from where — and what '
         'stays still so the moving thing reads",\n'
+        '     "shape_language": "the recurring geometric vocabulary and why it belongs here",\n'
         '     "cut": "push",\n'
         '     "assets": ["logo"]}\n'
         '  ]\n'
@@ -1459,9 +1558,9 @@ def design_instructions(brand: dict | None = None, request: str = "",
         # picture had gone missing, because nothing had said where it went.
         + (("THE ASSET PLAN: `assets` on a row names the artwork that scene "
             "carries, by the names on the list above and nothing else. Every "
-            "name on that list must be on at least one row — a picture that "
-            "was made and never placed is a scene that could have been "
-            "stronger — and the logo is on the last row at the very least. "
+            "usable name should have an intentional placement. Assets flagged "
+            "unusable or reference-only must not be forced into a scene. "
+            "Use a valid supplied logo on the last row when available. "
             "The scene prompts that follow hold you to this, row by row.\n\n")
            if _asset_names(assets) else "")
         + "HOW MOTION WORKS — read this, it is the one unusual part:\n"
@@ -1473,10 +1572,9 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "snap when the frame is seeked.\n"
         "· Animation time restarts at 0 for each scene. Stagger with "
         "`animation-delay`.\n"
-        "· A curve is not neutral — one easing reused for everything that "
-        "moves is the fastest way to look like a slide deck, however many "
-        "elements are on screen. Reach for at least three of these across a "
-        f"scene, by what the thing is doing, not by habit: {_ease_menu_text()}.\n"
+        "· Choose a coherent motion rhythm. Reuse easing for related elements; "
+        "change it only when the action or emphasis calls for it. Stillness "
+        f"and readable holds are valid. Available curves: {_ease_menu_text()}.\n"
         "· Never use transitions, JavaScript, `:hover`, or anything that "
         "depends on real time — none of it will be filmed.\n"
         "· Each scene element gets `--p` (0→1 through the scene) and `--ms` "
@@ -1596,7 +1694,9 @@ def parse_design(text: str) -> tuple[dict, list[dict]]:
     for got in _json_objects(text):
         d = got.get("design")
         if isinstance(d, dict) and not design:
-            design = d
+            design = dict(d)
+            if "asset_flags" not in design and isinstance(got.get("asset_flags"), list):
+                design["asset_flags"] = got["asset_flags"]
         rows = got.get("storyboard")
         if isinstance(rows, list) and not board:
             board = [r for r in rows if isinstance(r, dict)]
@@ -1693,7 +1793,7 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
     role = str(script_scene.get("role", "")).strip()
 
     plan = []
-    for key in ("job", "look", "motion"):
+    for key in ("job", "look", "motion", "shape_language"):
         val = str(line.get(key, "")).strip()
         if val:
             plan.append(f"  {key.upper()}: {val}")
@@ -1727,17 +1827,13 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
            "This scene carries no text of its own — it is made of shape, "
            "colour and movement.\n\n")
 
-        # This paragraph is the entire point of the rewrite. The old stage
-        # asked for every scene in one reply and got 278 characters each,
-        # which is a headline and a subhead — a slide, with nothing in it to
-        # move. A number is given because "be more detailed" is not
-        # actionable and "12 to 30 elements" is.
-        + "THIS WHOLE REPLY IS ONE SCENE. Spend it. A designed scene at this "
-        "size is 12 to 30 elements and four or more separate movements — a "
-        "field or gradient behind, a rule or a frame, the type broken into "
-        "parts that can arrive at different moments, a number that counts or "
-        "a bar that draws, something small that keeps time in a corner. One "
-        "headline fading up is a slide; this is a film.\n"
+        # Give each scene a full turn without rewarding DOM/CSS volume.
+        # Element and movement quotas produced decorative clutter.
+        + "THIS WHOLE REPLY IS ONE SCENE. Resolve its composition completely. "
+        "There is no minimum element count or animation count. A single "
+        "well-spaced phrase with a purposeful reveal can carry a beat. Remove "
+        "decorative counters, corner marks, rings and bars unless the brief "
+        "gives them a role. Establish a compelling settled frame first.\n"
 
         # What actually separated a scene that worked from one that did not,
         # on a reel this stage was rebuilt for. Both had the same words. The
@@ -1755,15 +1851,30 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         "part they hold. If the scene names a count, consider DRAWING that "
         "many things rather than only printing the number.\n"
 
-        "LAYERS ARE HOW A FLAT FRAME STOPS LOOKING FLAT. Something behind "
-        "(a field, a gradient, a rule system, a drawn line), the thing the "
-        "scene is about in the middle, and something small and quiet at an "
-        "edge that grounds it — a source, a unit, a count, a label. Three "
-        "depths, not one centred block. Use an explicit z-index for each "
+        "LAYER ORDER — add depth only when it clarifies the subject. A strong "
+        "typographic frame does not need a background illustration or a "
+        "running label. When layers are needed, use an explicit z-index for each "
         "depth: background 0, artwork 20, panels 30, required copy 50, "
         "labels 60. Required copy must be the top readable layer. Never let "
         "a panel or image cover it; if text crosses artwork, add a solid or "
         "translucent backing and verify contrast.\n\n"
+
+        "SHAPE CRAFT — use the storyboard's shape_language as a constraint. "
+        "Geometry is optional, not a requirement. If used, give it one clear "
+        "meaning connected to the message. Refine edges with consistent stroke weights, optical offsets, "
+        "intentional corner treatment and restrained opacity. Do not add a raw "
+        "rectangle, circle, bar or ring unless its relation to the copy is clear; "
+        "a shape that only fills space is a placeholder and must be removed.\n\n"
+
+        "GRID AND SAFE AREA — use shared alignment anchors and consistent "
+        "spacing, with optical corrections where needed. Default essential copy "
+        "to x=130..950 and y=180..1580; these are conservative working margins, "
+        "not a guarantee for every platform overlay. Use no more than three type roles and leave a readable "
+        "hold after each major entrance before the next beat.\n\n"
+
+        "VISUAL CONTINUITY — carry one meaningful visual idea through the reel. "
+        "Let its transformation explain the next beat. Do not choose an arbitrary "
+        "new ring, panel or graphic system for every scene.\n\n"
 
         "MOTION — the part that makes it move rather than appear:\n"
         "· Ordinary CSS @keyframes. The renderer pauses the page and sets "
@@ -1774,14 +1885,16 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         "· Time restarts at 0 for this scene. Stagger arrivals with "
         "`animation-delay` — things that arrive together read as one block, "
         "things that arrive 80-120ms apart read as choreography.\n"
-        "· One curve for everything that moves is a slide deck no matter how "
-        "much is on screen. Pick by what the thing is doing, not by habit, "
-        f"and use at least three of these in this scene: {_ease_menu_text()}.\n"
-        "· Something should still be moving when the scene hands over. A "
-        "scene that finishes its motion and then sits there for two seconds "
-        "is where 'slide deck' comes from — let a slow drift, a scale, or a "
-        "counter run the full "
-        f"{seconds:g} seconds.\n"
+        "· Give related elements the same easing. Use a second curve only "
+        f"for a different action or emphasis. Available: {_ease_menu_text()}.\n"
+        "· Choreograph motion in phases: a short anticipation, the primary move, "
+        "a restrained settle, then a readable hold. Do not animate every object "
+        "at once; stagger related elements by 80–120ms and keep the hero type "
+        "legible for a beat before the handoff.\n"
+        "· Finish essential copy entrances early enough for reading: aim for "
+        "the first 30 percent of the scene, then hold the complete message "
+        "for at least one second before exit. A slow secondary motion is "
+        "optional; do not move the headline merely to keep pixels moving.\n"
         "· No transitions, no JavaScript, no :hover — none of it is filmed.\n"
         "· `--p` (0→1 through the scene) and `--ms` are set on the scene "
         "element every frame if you would rather drive something directly.\n\n"
@@ -1987,20 +2100,26 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
         #
         # The storyboard's asset plan is checked in the same breath, without
         # a browser: a picture the plan put in this scene has to be in it.
-        planned = planned_assets(board[i], assets)
+        planned = [name for name in planned_assets(board[i], assets)
+                   if name not in _blocked_assets(design)]
+        check_state = "not run"
 
         def _faults(sc, _i=i):
+            nonlocal check_state
             found = []
             if check:
                 try:
                     found = list(check({"design": design, "scenes": [sc],
                                         "_assets": assets_table or {}}) or [])
+                    check_state = "passed" if not found else f"{len(found)} unresolved problem(s)"
                 except Exception as e:
+                    check_state = "unavailable — export preflight still required"
                     say(f"couldn't lay scene {_i + 1} out ({e})")
             return missing_planned(sc, planned) + found
 
         if check or planned:
             faults = _faults(scene)
+            original_check_state = check_state
             if faults:
                 say(f"scene {i + 1} has {len(faults)} layout problem(s) — "
                     "sending them back")
@@ -2019,15 +2138,17 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
                     # Kept only if genuinely cleaner. A "fix" that trades four
                     # faults for five is not a fix, and the first attempt at
                     # least had the composition the storyboard asked for.
-                    if len(left) < len(faults):
+                    if len(left) < len(faults) and not check_state.startswith("unavailable"):
                         scene = fixed
                         say(f"   fixed — {len(faults)} down to {len(left)}")
                     else:
+                        check_state = original_check_state
                         say("   the correction was no better — keeping the "
                             "first")
         scenes.append(scene)
+        status = f"; layout preflight {check_state}"
         say(f"scene {i + 1}/{total} written — {len(scene.get('html', ''))} "
-            f"chars of markup, {len(scene.get('css', ''))} of CSS")
+            f"chars of markup, {len(scene.get('css', ''))} of CSS{status}")
 
     if not scenes:
         raise ReelError("No scenes were written.")
@@ -2138,10 +2259,13 @@ def followup_instructions(change: str, spec: dict, new_assets: str = "",
     total = len(spec.get("scenes") or [])
     have = ", ".join(f"asset:{n}" for n in (spec.get("_assets") or {}))
     return (
-        "The reel you designed in this conversation has been filmed and the "
-        "owner has watched it. They want this change:\n\n"
+        "Continue the saved Studio project from this design conversation. "
+        "Its previous export may have failed. The owner wants this change:\n\n"
         f"  “{change.strip()}”\n\n"
         f"THE REEL AS FILMED — {total} scene(s):\n{_scene_index_lines(spec)}\n\n"
+        + ("CURRENT ART DIRECTION (keep unless the change asks to replace it):\n"
+           + str((spec.get("design") or {}).get("direction"))[:3000] + "\n\n"
+           if (spec.get("design") or {}).get("direction") else "")
         + ((f"WHAT CHANGED UPSTREAM — a step before this one was redone for "
             f"this change, and this is its new output. Update the scenes "
             f"whose words or facts it changes; leave the rest as filmed:\n\n"
@@ -2182,6 +2306,11 @@ def followup_instructions(change: str, spec: dict, new_assets: str = "",
         "· Preserve the existing visual system unless the owner explicitly "
         "asks for a whole-reel redesign. A follow-up should improve the named "
         "scene, not invent a new layout language for the film.\n"
+        "· Shape refinement is intentional: reuse the reel's established "
+        "geometric vocabulary, keep one hero construction and at most two "
+        "supporting details in the changed scene, and remove generic filler "
+        "circles, bars, rings, pills, or rectangles. Align edges and stroke "
+        "weights to the existing grid.\n"
         "· HTML attributes in single quotes — the markup lives inside a JSON "
         "string.\n"
         "· No explanation, no description of the change — the JSON is the "
@@ -2193,6 +2322,10 @@ def parse_followup(text: str, total: int) -> dict | None:
     """The change out of the reply: {"scenes": {index0: scene}, "remove":
     [index0…], "design_css": str|None}, or None if nothing usable came."""
     for got in _json_objects(text or ""):
+        # A new storyboard is a plan, not an executable scene replacement.
+        # Accepting its design.css alone silently left every old scene intact.
+        if got.get("storyboard") and not got.get("scenes"):
+            continue
         scenes, remove, design_css = {}, [], None
         rows = got.get("scenes")
         if isinstance(rows, list):
@@ -2303,7 +2436,9 @@ def refine_spec(spec: dict, change: str, ask, check=None, log=None,
               SCENE_EXPECT) or ""
     patch = parse_followup(raw, total)
     if patch is None:
-        raw = ask("Send the change again as JSON only — first character '{', "
+        raw = ask("A storyboard or description cannot be rendered. Send complete "
+                  "HTML and CSS for each changed scene. Send the change again "
+                  "as JSON only — first character '{', "
                   'last \'}\', keys "scenes" (each with "scene", "seconds", '
                   '"cut", "css", "html"), optional "design_css" and "remove", '
                   "in a ```json fenced block. Nothing before or after.",
@@ -2452,6 +2587,15 @@ def still(spec: dict, at_frame: int, out_path: str) -> str:
     from playwright.sync_api import sync_playwright
     from . import browser as _browser
     fps = int(spec.get("fps", DEFAULT_FPS))
+    edits = []
+    if spec.get("edits"):
+        from . import reel_edit
+        reel_edit.ensure_stable_ids(spec)
+        edits = reel_edit.clean_edits(spec["edits"])
+        spec = reel_edit.with_timing(spec, edits)
+    html = build_html(spec, fps)
+    if edits:
+        html = reel_edit.apply_edits(html, edits)
     with sync_playwright() as p:
         browser = _browser.launch_chromium(p, args=["--hide-scrollbars",
                                                     "--font-render-hinting=none",
@@ -2459,13 +2603,13 @@ def still(spec: dict, at_frame: int, out_path: str) -> str:
         page = browser.new_page(viewport={"width": W, "height": H},
                                 device_scale_factor=1)
         try:
-            page.set_content(build_html(spec, fps), wait_until="load")
+            page.set_content(html, wait_until="load")
             try:
                 page.wait_for_function("document.fonts.ready.then(()=>true)",
                                        timeout=8000)
             except Exception:
                 pass
-            page.evaluate("t => window.__seek(t)", at_frame * 1000.0 / fps)
+            _seek_page(page, at_frame * 1000.0 / fps)
             page.screenshot(path=out_path, type="png")
         finally:
             browser.close()

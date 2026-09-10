@@ -503,11 +503,10 @@ def collect(images: list, out_dir: str | None = None,
         except Exception:
             continue
         composite = looks_like_contact_sheet(use)
-        panels = split_contact_sheet(use, out_dir) if composite else []
         prepared.append({"path": use, "w": w, "h": h, "alpha": prep["alpha"],
                          "how": prep["how"],
                          "ink": _ink_ratio(use) if prep["alpha"] else 1.0,
-                         "composite": composite, "panels": panels,
+                         "composite": composite,
                          "source": p, "made": p in (generated or ())})
 
     if not prepared:
@@ -593,14 +592,18 @@ def manifest(table: dict) -> str:
         else:
             what = ("the client's own mark, taken from their artwork"
                     if a["kind"] == "logo" else "artwork the client supplied")
+        if a.get("composite"):
+            lines.append(f'  asset:{name} — {a["w"]}x{a["h"]}, '
+                         'REJECTED CONTACT SHEET / REFERENCE-ONLY — '
+                         'do not place this board or guess panel crops; '
+                         'request separate images for production.')
+            continue
         if a["alpha"]:
             cut = "transparent PNG, soft edges"
             clear.append(f"asset:{name}")
         else:
             cut = "OPAQUE — a photograph with its own background"
             opaque.append(f"asset:{name}")
-        if a.get("composite"):
-            cut += "; REJECTED CONTACT SHEET — not a single usable image"
         lines.append(f'  asset:{name} — {a["w"]}x{a["h"]}, {cut} — {what}')
         # A LANDSCAPE picture in a PORTRAIT frame. Made to be flagged because
         # the customer types "make a reel, here are two screenshots" and

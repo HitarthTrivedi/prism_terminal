@@ -98,22 +98,62 @@ def ensure_stable_ids(spec: dict) -> None:
     which is what lets parse_spec() and editable_html() both call it."""
     if not isinstance(spec, dict):
         return
+    scenes = [sc for sc in spec.get("scenes") or [] if isinstance(sc, dict)]
+    # Reserve IDs before assigning any: a newly inserted sibling must never
+    # take the identity of an existing element later in the document.
+    reserved_scenes = {str(sc.get("studio_id") or "").strip() for sc in scenes}
+    reserved_ids = set()
+    for sc in scenes:
+        source = sc.get("html")
+        if not isinstance(source, str):
+            continue
+        for tag in _OPEN_TAG.finditer(source):
+            reserved_ids.update(re.findall(
+                r'data-prism-id\s*=\s*["\']([^"\']+)["\']', tag.group(2) or ""))
+    used_scene_ids = set()
+    used_ids = set()
     for scene_no, scene in enumerate(spec.get("scenes") or []):
         if not isinstance(scene, dict):
             continue
-        scene.setdefault("studio_id", f"scene-{scene_no + 1}")
+        sid = str(scene.get("studio_id") or "").strip()
+        if not sid or sid in used_scene_ids:
+            sid = f"scene-{scene_no + 1}"
+            while sid in used_scene_ids or sid in reserved_scenes:
+                sid += "-x"
+            scene["studio_id"] = sid
+        used_scene_ids.add(sid)
         html = scene.get("html")
         if not isinstance(html, str):
             continue
         counter = 0
+        local_ids, remapped = set(), {}
         def tagged(match):
             nonlocal counter
             tag, attrs, slash = match.group(1), match.group(2) or "", match.group(3)
-            if "data-prism-id=" in attrs:
+            existing = re.search(r'data-prism-id\s*=\s*["\']([^"\']+)["\']', attrs)
+            if existing and existing.group(1) not in used_ids:
+                used_ids.add(existing.group(1))
+                local_ids.add(existing.group(1))
                 return match.group(0)
             counter += 1
-            return f'<{tag}{attrs} data-prism-id="el-{scene_no + 1}-{counter}"{slash}>'
+            new_id = f"el-{scene_no + 1}-{counter}"
+            while new_id in used_ids or new_id in reserved_ids:
+                counter += 1
+                new_id = f"el-{scene_no + 1}-{counter}"
+            attrs = re.sub(r'\sdata-prism-id\s*=\s*["\'][^"\']+["\']',
+                           "", attrs)
+            used_ids.add(new_id)
+            if existing and existing.group(1) not in local_ids:
+                remapped[existing.group(1)] = new_id
+                local_ids.add(existing.group(1))
+            return f'<{tag}{attrs} data-prism-id="{new_id}"{slash}>'
         scene["html"] = _OPEN_TAG.sub(tagged, html)
+        # Old per-scene inspection assigned the same IDs to different scenes.
+        # Preserve edits on those later scenes when migrating their identities.
+        for record in spec.get("edits") or []:
+            if (isinstance(record, dict) and record.get("scene") == scene_no
+                    and record.get("element_id") in remapped):
+                record["element_id"] = remapped[record["element_id"]]
 
 # The style an edit may carry: CSS property name → how its value is checked.
 # Numbers are stored as numbers (the apply script adds the unit), so a value

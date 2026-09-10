@@ -1989,7 +1989,8 @@ def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
             except Exception:
                 pass
 
-    prompt = motion_generate.storyboard_instructions(request, brand)
+    prompt = motion_generate.storyboard_instructions(
+        request, brand, skeleton="cinematic_glass")
 
     # ── Multi-agent fallback routing ───────────────────────────────────────────
     # Build a prioritized provider chain from the agents the user actually
@@ -2029,6 +2030,7 @@ def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
                 {}, cfg, attachments=attachments, chatgpt_analysis=False,
                 custom_stages=[("storyboard", agent, [prompt])],
                 motion_design_stage="storyboard",
+                motion_skeleton="cinematic_glass",
                 query=f"motion graphic — {request}")
 
             texts = [t for t in (responses.get("storyboard") or []) if t.strip()]

@@ -58,11 +58,57 @@ _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
   domain_chart     — chart_type (bar|line|ring|area|sparkline|metric), data, accent_color
   domain_ui_mockup — position, width, height, title, elements, cursor_actions
   domain_diagram   — nodes (id/label/position/shape/color), edges (from/to/pulse)
+  glass_panel      — position, width, height, radius, tint (a colour; a hex tint is
+                      applied at the panel's transmission), blur (px, 0-40),
+                      transmission 0-1 (how much of the scene shows through),
+                      border_light 0-1 (edge highlight), inner_shadow 0-1,
+                      specular 0-1 (a diagonal highlight), contrast_guard
+                      "dark" | "light" | false (a scrim so the panel's text stays
+                      readable over a bright light as well as a dark wash). Put
+                      the panel's own text/images in its "children" (positions
+                      relative to the panel's centre). ONE main panel per shot —
+                      depth comes from depth_layer hierarchy, not repeated cards.
+  light_field      — position, width, height, color, color2, intensity 0-1,
+                      spread 0.2-2, drift (px). A soft drifting light behind the
+                      subject (screen-blended). Use it as the background layer in
+                      place of a flat wash; it may bleed past the frame.
+  depth_layer      — depth (0.4 far … 1 = the subject plane … 1.6 near) and
+                      "children". A group that moves with the camera by its depth:
+                      further layers drift and zoom less, nearer ones more. Compose
+                      a shot as far light_field → mid glass_panel → near accents,
+                      each in its own depth_layer.
+  particle_field   — count, size, palette, seed, flicker, and "phases": a list of
+                      {"at", "layout", "duration", "stagger"}; the field holds the
+                      first layout and travels to each next one at its "at" (scene-
+                      local). Layouts: {"kind":"scatter","box":[x0,y0,x1,y1]},
+                      {"kind":"band","y","rows","cell","x0","x1"}, {"kind":"column",
+                      "x","spread","y0","y1"}, {"kind":"ring","center","radius"},
+                      {"kind":"points","points":[[x,y],...],"jitter"}, {"kind":"hidden"}.
+                      Many small tiles of light — a signal, data, a crowd of sources —
+                      that gathers, streams and converges. Give it the continuity_key
+                      when it IS the carried subject; declare it again in the next
+                      scene starting from the layout this scene ended on.
+  icon             — name (chat|phone|mail|whatsapp|book|dial|spark|check), size,
+                      color, tile (true = on a dark glass tile), tile_color, radius.
+  orb              — radius, core (colour), tint, rim, glow_color, glow_blur, highlight
+                      0-1, icon (an icon name drawn at its centre), ring_radius +
+                      ring_color (a faint great circle around it). A sphere — a dark
+                      hub, a glowing product orb.
+  spline_tree      — hub [x,y], leaves [[x,y],...] (relative to position), color,
+                      stroke_width, glow_blur, bend 0-1, draw_start, draw_duration,
+                      stagger, dots. Thin curved lines drawn on from one hub to many
+                      leaves — channels converging, a knowledge graph.
   image            — position, width, height, radius (corner rounding), anchor;
                       "src" is `asset:<name>` for one of the client's own images
                       below (never write a real URL or invent a name) — a logo,
                       a product photo, a screenshot. Drawn clipped to a rounded
                       rect; SVG marks work the same way as photos.
+
+  continuity_key  — optional stable name for the visual subject that survives
+                    across scene boundaries (for example "signal", "product",
+                    or "orb"). Node ids remain unique per scene; reuse this
+                    key when the same subject returns so Prism can track its
+                    handoff and Studio can select the whole visual thread.
 
 "anchor" (on any node) is ALWAYS a two-number [x, y] fraction of the node's
 own box, e.g. [0.5, 0.5] for its centre, [0, 0] for its top-left corner —
@@ -107,6 +153,20 @@ ANIMATION, on any node via "animation" (all times are LOCAL to this scene, start
            recent motion instead of moving in rigid lockstep. (Not yet
            supported by the current runtime — avoid relying on it.)
 
+SHOT, on a SCENE (next to "nodes") — what the camera does for this beat. The
+shots of all scenes are compiled into ONE continuous camera curve for the
+whole film; a shot only says where the camera ends up, so it always starts
+wherever the previous shot left it (there is no per-scene camera reset):
+  "shot": {"intent": "push", "target": "<node id>" or [x, y], "zoom": 1.2}
+  hold     — stay where the camera is.
+  reveal   — settle out onto the target (an opening).
+  push     — move in on the target (zoom ×1.15 unless "zoom" is given).
+  pull     — ease back out.
+  orbit    — a slow tilt around the target.
+  parallax — a lateral drift, zoom unchanged (depth_layers separate).
+  macro    — close on a detail (zoom 1.6 unless given).
+  resolve  — return to the centre at 1.0 for the ending.
+
 TRANSITIONS, on a SCENE (not a node) via "transition_in" — how this scene
 cuts in from the one before it. Omit it and one is still picked for you
 (never a silent hard cut), but naming one on purpose usually reads better:
@@ -116,6 +176,7 @@ cuts in from the one before it. Omit it and one is still picked for you
   zoom        — the old scene rushes past and blurs, the new one rises from behind it. Reserve it — it reads as pushing deeper into the same thought.
   blur_swoosh — both scenes blur/skew past each other, directional. Editorial, motion-forward.
   light_leak  — a warm light wash bridges the cut. Editorial, warm, premium — good between two beats of the same argument rather than a hard scene change.
+  morph       — a plain crossfade. Any cut where a node's "continuity_key" carries over from the previous scene becomes a morph automatically: both instances of that subject are tweened along one matched path between their two poses, so only the subject moves and everything else dissolves.
 
 EASING VALUES (GSAP's own — the runtime hands these straight to the tween engine):
   power1.in/out/inOut, power2.in/out/inOut, power3.in/out/inOut, power4.in/out/inOut,
@@ -160,6 +221,37 @@ Not every layer needs a node every scene, but background and foreground
 are required — a scene with no background layer has no depth, and a
 scene with no foreground has no subject."""
 
+_CINEMATIC_GLASS_DOCTRINE = """CONTINUOUS CINEMATIC PROFILE — this is a motion film, not a stack of unrelated slides.
+  · Choose one recognisable visual spine (a signal, ribbon, orb, product card,
+    line or light field) and carry it through the whole piece. Give its hero
+    node a stable "continuity_key" and reuse that key whenever the subject
+    returns in another scene.
+  · The outgoing final pose and incoming first pose must agree: position,
+    scale, rotation, dominant colour and opacity should feel like the same
+    object crossing the handoff. Do not reset the subject to the centre at
+    every cut.
+  · Keep the subject alive during the transition. Use a directional
+    blur_swoosh, light_leak or push when appropriate; avoid a full-scene fade
+    to empty followed by a cold rebuild.
+  · Give every scene a "shot" (see SHOT above) and let the compiled camera
+    curve carry the film: reveal → push/orbit/parallax → resolve. Never
+    reset the camera to the same zoom and centre at every scene.
+  · Glass is layered depth: ONE main glass_panel (the material primitive, not
+    a plain rect) carrying the copy, a light_field behind it, small accents in
+    front — each in its own depth_layer (far ≈ 0.55, subject 1.0, near ≈ 1.45).
+    Restrained border light and specular beat many identical cards. Preserve
+    generous negative space and a clear typographic hierarchy.
+  · Keep headlines and logos inside the safe area: on a 9:16 frame nothing
+    that must be read sits in the top 11% or the bottom 20%.
+  · The reference grammar in one line: a particle_field of scattered tiles
+    gathers into a band, streams into a column, converges on icons and a
+    hub orb over a spline_tree; a light_field sweeps in for a conversation
+    in bubbles; a knowledge tree with small glass cards; the Knowledge Base
+    card over a glowing tree; a great arc; the glowing orb; the logo. Use
+    those primitives for those jobs instead of rebuilding them from rects.
+  · The final scene resolves the carried subject into the logo, answer or CTA;
+    it should feel like a destination, not a new template."""
+
 
 def _scene_role(idx: int) -> str:
     return SCENE_ROLES[idx] if 0 <= idx < len(SCENE_ROLES) else "SCENE"
@@ -190,10 +282,18 @@ def _scene_handoff(scene: dict) -> dict | None:
             continue
         anim = node.get("animation")
         exit_ = anim.get("exit") if isinstance(anim, dict) else None
-        if isinstance(exit_, dict):
+        # A keyed subject is handed off even without an authored exit — the
+        # continuity compiler writes its bridge — so the next scene learns
+        # where to pick it up. An unkeyed foreground still needs an exit
+        # to have anything worth continuing.
+        if isinstance(exit_, dict) or node.get("continuity_key"):
             best = {
-                "type": exit_.get("type", "fade_in"),
+                "type": exit_.get("type", "fade_in") if isinstance(exit_, dict) else "morph",
                 "fill": node.get("fill") or node.get("accent_color"),
+                "continuity_key": node.get("continuity_key", ""),
+                "node": str(node.get("id", "")),
+                "position": list(node.get("position") or [0, 0]),
+                "scale": list(node.get("scale") or [1, 1]),
             }
     return best
 
@@ -254,7 +354,8 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         'is still moving when the scene hands over"}\n'
         "  ]\n"
         "}\n\n"
-        + (_brand_launch_storyboard_close() if skeleton == "brand_launch"
+        + (_cinematic_glass_storyboard_close() if skeleton == "cinematic_glass"
+           else _brand_launch_storyboard_close() if skeleton == "brand_launch"
            else
         "3-6 scenes, 6-15 seconds total. ONE STORYBOARD ROW PER SCENE. Give "
         "each one a different job and a different composition — several "
@@ -276,6 +377,18 @@ def _brand_launch_storyboard_close() -> str:
     )
 
 
+def _cinematic_glass_storyboard_close() -> str:
+    return (
+        "5-8 scenes, 16-30 seconds total. Design one continuous visual "
+        "transformation rather than a sequence of poster frames: name the "
+        "visual spine in the motion field, keep it recognisable, and state "
+        "how each scene's final pose hands into the next scene's first pose. "
+        "Use scene changes to reveal, transform or focus the same idea; "
+        "reserve the final scene for a resolved logo/answer/CTA. `camera.tracks` "
+        "is for the WHOLE graphic and should also feel continuous."
+    )
+
+
 def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
                        skeleton: str | None = None,
                        handoff: dict | None = None) -> str:
@@ -285,6 +398,8 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
     `skeleton="brand_launch"` swaps the freeform node catalogue for the
     layer doctrine (background/midground/foreground/accent/finish) and
     pins this scene to its fixed HOOK/REVEAL/PROOF/SIGNOFF role.
+    `skeleton="cinematic_glass"` uses the same layer contract but adds a
+    persistent visual spine, continuity keys and explicit handoff guidance.
     `handoff` is what core.motion.generate._scene_handoff() read off the
     PREVIOUS scene — how it exited — so this one can continue that motion
     or colour instead of cutting cold; None for the first scene.
@@ -338,23 +453,55 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
         "supposed to share a position.\n\n"
     )
     role_header = ""
-    if skeleton == "brand_launch":
+    if skeleton in ("brand_launch", "cinematic_glass"):
         role = _scene_role(idx)
         catalogue = _NODE_CATALOGUE + "\n\n" + _LAYER_DOCTRINE
+        if skeleton == "cinematic_glass":
+            catalogue += "\n\n" + _CINEMATIC_GLASS_DOCTRINE
+            rules = rules + (
+                '10. Put a stable "continuity_key" on the hero/subject node; '
+                "reuse the same key in later scenes when that subject returns.\n"
+                "11. At least one camera or secondary motion must continue across "
+                "the handoff; the incoming pose must visibly pick up the outgoing one.\n"
+            )
         rules = rules + (
             '7. Give every node a "layer" (see LAYERS above) — background '
             "and foreground are both required this scene.\n"
         )
-        role_header = f"ROLE: {role} — {_ROLE_BRIEF[role]}\n\n"
+        role_header = ("PROFILE: CINEMATIC GLASS — one continuous visual spine.\n\n"
+                       if skeleton == "cinematic_glass"
+                       else f"ROLE: {role} — {_ROLE_BRIEF[role]}\n\n")
         if handoff:
             role_header += (
                 f'CONTINUING FROM THE LAST SCENE: it exited with a '
                 f'"{handoff["type"]}"'
                 + (f' in {handoff["fill"]}' if handoff.get("fill") else "")
+                + (f' on continuity_key "{handoff["continuity_key"]}"'
+                   if handoff.get("continuity_key") else "")
                 + ". Open THIS scene picking that motion or colour up — "
                 "reverse the exit direction, or carry the colour into "
-                "this scene's foreground — rather than starting cold.\n\n"
+                "this scene's foreground — rather than starting cold.\n"
+                + ((f'That subject settled at position {handoff.get("position")} '
+                    f'and scale {handoff.get("scale")}. Give this scene\'s node '
+                    f'with continuity_key "{handoff["continuity_key"]}" a '
+                    "settled position and scale within reach of that — the "
+                    "cut will morph between the two poses; a pose across the "
+                    "frame or many times larger cannot be bridged and will "
+                    "be sent back.\n")
+                   if handoff.get("continuity_key") else "")
+                + "\n"
             )
+    # The catalogue and doctrines are sent in full with scene 1 and only
+    # named afterwards: every later turn lands in the same browser tab,
+    # and a run on 10 Sep 2026 grew that page until the kernel killed
+    # Chrome for memory. The rules block below stays on every turn.
+    if idx > 0:
+        catalogue = (
+            "NODE TYPES, TEXT MODES, ANIMATION, SHOT, TRANSITIONS, EASINGS"
+            + (", LAYERS and the CINEMATIC GLASS profile" if skeleton == "cinematic_glass"
+               else ", LAYERS" if skeleton == "brand_launch" else "")
+            + " are exactly as written in the scene 1 message above — reuse "
+            "them; they are not repeated here.")
     return (
         f"SCENE {idx + 1} of {total}.\n\n"
         + role_header
@@ -368,7 +515,8 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
         + (f"ARTWORK YOU MAY USE:\n{assets}\n\n" if assets else "")
         + "Reply with ONLY this JSON object, in a ```json fenced code "
         "block, nothing before or after it:\n"
-        '{\n  "nodes": [ /* 3-7 node objects, as above */ ]\n}'
+        '{\n  "shot": {"intent": "...", "target": "<node id>"},\n'
+        '  "nodes": [ /* 3-7 node objects, as above */ ]\n}'
     )
 
 
@@ -405,7 +553,10 @@ def parse_storyboard(text: str) -> tuple[dict, dict, list[dict]]:
 
 
 def parse_scene(text: str) -> dict | None:
-    """One scene's reply: {"nodes": [...]}, or None if unusable."""
+    """One scene's reply: {"nodes": [...]} plus, when the reply carried
+    them, the scene-level "shot" and "transition_in" (schema.py validates
+    both; anything else on the scene is the loop's to set). None if
+    unusable."""
     for got in _web._json_objects(text):
         if isinstance(got.get("scenes"), list) and got["scenes"]:
             inner = got["scenes"][0]
@@ -413,7 +564,11 @@ def parse_scene(text: str) -> dict | None:
                 got = inner
         nodes = got.get("nodes")
         if isinstance(nodes, list) and nodes:
-            return {"nodes": [n for n in nodes if isinstance(n, dict)]}
+            scene = {"nodes": [n for n in nodes if isinstance(n, dict)]}
+            for key in ("shot", "transition_in"):
+                if got.get(key) is not None:
+                    scene[key] = got[key]
+            return scene
     return None
 
 
@@ -445,6 +600,110 @@ def fallback_scene(row: dict) -> dict:
     }
 
 
+def _pose_lines(scene: dict, label: str) -> list[str]:
+    """One line per keyed node in `scene`, for a repair prompt."""
+    out = []
+    for node in scene.get("nodes", []) or []:
+        if isinstance(node, dict) and node.get("continuity_key"):
+            out.append(
+                f'{label} carries continuity_key "{node["continuity_key"]}" on '
+                f'node "{node.get("id", "")}" at position '
+                f'{list(node.get("position") or [0, 0])}, scale '
+                f'{list(node.get("scale") or [1, 1])}.')
+    return out
+
+
+def _repair_continuity(scenes: list[dict], project: dict, camera: dict,
+                       ask: Callable[..., str], say, check=None) -> None:
+    """Whole-piece check the per-scene `check` cannot do: every handoff
+    is planned by core.motion.continuity and each scene that breaks the
+    contract is sent back ONCE with the exact fault and the neighbouring
+    poses it must meet. A returned scene is kept only if the piece as a
+    whole has fewer continuity issues afterwards and the scene itself is
+    no worse on the per-scene check — same "a fix must actually be a fix"
+    rule build_spec() applies per scene.
+
+    In place on `scenes`. Never raises: the resolver compiles whatever is
+    left and render.py refuses only what still cannot be bridged.
+    """
+    from . import continuity as _continuity
+
+    def probe(rows: list[dict]) -> list[dict]:
+        rep = _continuity.report({"project": project, "camera": camera,
+                                  "scenes": rows,
+                                  "_motion_profile": "cinematic_glass"})
+        return ([dict(e, severity="error") for e in rep["errors"]]
+                + [dict(w, severity="warning") for w in rep["warnings"]])
+
+    issues = probe(scenes)
+    if not issues:
+        return
+    # Only what would stop the render goes back to the model. Warnings
+    # (a scene without a keyed node, an opening subject the ending does
+    # not resolve) are logged and left: each extra turn in the same tab is
+    # minutes of the writer's time on an already long page, and a run
+    # measured on 10 Sep 2026 lost its browser session after the seventh
+    # such turn. At most three scenes are sent back, worst first.
+    errors = [it for it in issues if it.get("severity", "error") == "error"]
+    for it in issues:
+        if it not in errors:
+            say(f"continuity note: {it['message']}")
+    if not errors:
+        return
+    by_scene: dict[int, list[str]] = {}
+    for it in errors:
+        by_scene.setdefault(int(it["scene_index"]), []).append(it["message"])
+    say(f"continuity: {len(errors)} problem(s) across "
+        f"{len(by_scene)} scene(s) — sending them back")
+    order = sorted(by_scene, key=lambda i: -len(by_scene[i]))[:3]
+    for idx in sorted(order):
+        if idx < 0 or idx >= len(scenes):
+            continue
+        msgs = by_scene[idx]
+        context = []
+        if idx > 0:
+            context += _pose_lines(scenes[idx - 1], f"The scene before (scene {idx})")
+        if idx + 1 < len(scenes):
+            context += _pose_lines(scenes[idx + 1], f"The scene after (scene {idx + 2})")
+        fixed = parse_scene(ask(
+            f"Scene {idx + 1} was checked against its neighbours and breaks "
+            "the continuity contract:\n\n"
+            + "\n".join(f"{n}. {x}" for n, x in enumerate(msgs[:6], 1))
+            + ("\n\n" + "\n".join(context) if context else "")
+            + f"\n\nSend the corrected scene {idx + 1}: ONLY the JSON object, "
+              "same shape, in a ```json fenced block. Keep everything that "
+              "was not mentioned.",
+            SCENE_EXPECT) or "")
+        if not fixed:
+            # No JSON back usually means the tab is struggling; do not
+            # spend more turns on it.
+            say(f"   scene {idx + 1} never came back — keeping the first "
+                "and stopping the continuity pass")
+            break
+        fixed["id"] = scenes[idx]["id"]
+        fixed["duration"] = scenes[idx]["duration"]
+        trial = list(scenes)
+        trial[idx] = fixed
+        after = probe(trial)
+        worse_alone = False
+        if check:
+            try:
+                before_n = len(check({"project": project, "camera": camera,
+                                      "scenes": [scenes[idx]]}))
+                after_n = len(check({"project": project, "camera": camera,
+                                     "scenes": [fixed]}))
+                worse_alone = after_n > before_n
+            except Exception:
+                worse_alone = False
+        after_errors = [it for it in after if it.get("severity", "error") == "error"]
+        if len(after_errors) < len(errors) and not worse_alone:
+            scenes[idx] = fixed
+            say(f"   scene {idx + 1} fixed — {len(errors)} down to {len(after_errors)}")
+            errors = after_errors
+        else:
+            say(f"   scene {idx + 1}'s correction was no better — keeping the first")
+
+
 def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
                assets_table: dict | None = None,
                check=None, log=None, should_stop=None, on_scene=None,
@@ -466,11 +725,12 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
     convention core.reel_web uses) so resolve_motion_spec() can swap each
     `asset:name` for the real file before anything tries to render it.
 
-    `skeleton="brand_launch"` must match what storyboard_instructions() was
+    `skeleton="brand_launch"` or `skeleton="cinematic_glass"` must match what storyboard_instructions() was
     called with for `first_reply` — it switches each scene's prompt to the
-    layer doctrine and pins the fixed HOOK/REVEAL/PROOF/SIGNOFF roles, and
-    threads each finished scene's exit into the next scene's prompt as a
-    handoff so consecutive cuts continue a motion instead of resetting.
+    layer doctrine and threads each finished scene's exit into the next
+    scene's prompt as a handoff so consecutive cuts continue a motion instead
+    of resetting. The cinematic profile also records `_motion_profile` on the
+    assembled spec.
     """
     def say(msg):
         if log:
@@ -561,16 +821,20 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
                         say("   the correction was no better — keeping the "
                             "first")
         scenes.append(scene)
-        if skeleton == "brand_launch":
+        if skeleton in ("brand_launch", "cinematic_glass"):
             handoff = _scene_handoff(scene) or handoff
         say(f"scene {i + 1}/{total} written — "
             f"{len(scene.get('nodes', []))} node(s)")
 
     if not scenes:
         raise MotionValidationError("No scenes were written.")
+    if skeleton == "cinematic_glass" and len(scenes) > 1:
+        _repair_continuity(scenes, project, camera, ask, say, check)
     spec: dict[str, Any] = {"project": project, "scenes": scenes}
     if camera:
         spec["camera"] = camera
     if assets_table:
         spec["_assets"] = assets_table
+    if skeleton:
+        spec["_motion_profile"] = skeleton
     return spec

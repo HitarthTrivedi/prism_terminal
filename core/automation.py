@@ -3642,7 +3642,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         reel_design_stage: str = "", pipeline_files_out: list | None = None,
         motion_design_stage: str = "", resume_urls: dict | None = None,
         skip_signal=None, skip_stages: list | None = None,
-        min_wait: int = 0, image_stages=None, fallback_signal=None):
+        min_wait: int = 0, image_stages=None, fallback_signal=None,
+        motion_skeleton: str = ""):
     """Execute the pipeline. Returns (responses, links).
 
     fallback_signal: a threading.Event the screen sets for "Use fallback" —
@@ -3688,6 +3689,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                  core.agents' catalogue), so every caller names this stage
                  itself — there is no "a routed run finds this on its own"
                  case the way there is for reel_design_stage.
+    motion_skeleton: optional core.motion prompt profile. ``cinematic_glass``
+                 keeps one visual subject moving through the film and adds
+                 continuity metadata; ``brand_launch`` retains the legacy
+                 four-role treatment. If omitted, Motion uses cinematic_glass.
     on_event(kind, payload) is an optional callback for live UI updates.
     should_stop() is an optional predicate polled between and during stages.
 
@@ -3871,7 +3876,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         "pictures will be generated; the reel is built from "
                         "type and colour"
                         + (" and the artwork attached" if asset_list else "")
-                        + ".")
+                        + ". This is an asset choice, not a layout check.")
             if (not left_out and cfg.get("reel_imagery", True)
                     and A.resolve_agent("visual", maker)):
                 stages.insert(studio_at, ("artwork", maker, [
@@ -3995,7 +4000,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         else:
             from .motion import generate as _motion_gen
             stages.insert(motion_at, ("motion_plan", planner,
-                                      [_motion_gen.storyboard_instructions(query)]))
+                                      [_motion_gen.storyboard_instructions(
+                                          query,
+                                          skeleton=motion_skeleton or
+                                          "cinematic_glass")]))
             motion_at += 1
             motion_feeder = motion_at - 1
             machine_stages[motion_feeder] = (
@@ -4903,6 +4911,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             texts[-1], _ask,
                             assets=motion_assets_listing,
                             assets_table=motion_assets_table,
+                            skeleton=motion_skeleton or "cinematic_glass",
                             check=_motion_inspect.inspect,
                             log=lambda m: ui.info(f"   {m}"),
                             should_stop=stage_halt,

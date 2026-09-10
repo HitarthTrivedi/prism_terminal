@@ -108,6 +108,20 @@
     masterTl.set(inEl, { opacity: 0 }, start);
   }
 
+  // Morph — the continuity compiler's cut (core/motion/continuity.py).
+  // The two scene containers only crossfade, linearly so their opacities
+  // always sum to one; the subject carrying a continuity_key is tweened
+  // along one matched path by both its instances, so it reads as a
+  // single object transforming while everything around it dissolves.
+  // Covers the whole window the resolver gave the two scenes
+  // (transitionInStart .. transitionOutEnd = overlap * 1.4).
+  function morph(masterTl, outEl, inEl, cutAt, overlap) {
+    const start = cutAt - overlap;
+    const duration = overlap * 1.4;
+    masterTl.fromTo(outEl, { opacity: 1 }, { opacity: 0, duration, ease: "none" }, start);
+    masterTl.fromTo(inEl, { opacity: 0 }, { opacity: 1, duration, ease: "none" }, start);
+  }
+
   const HANDLERS = {
     push: (tl, out, inn, at, ov, w, h) => push(tl, out, inn, at, ov, w, h, false),
     push_up: (tl, out, inn, at, ov, w, h) => push(tl, out, inn, at, ov, w, h, true),
@@ -115,6 +129,7 @@
     zoom: (tl, out, inn, at, ov) => zoom(tl, out, inn, at, ov),
     blur_swoosh: (tl, out, inn, at, ov) => blurSwoosh(tl, out, inn, at, ov),
     light_leak: (tl, out, inn, at, ov, w, h, stageEl) => lightLeak(tl, out, inn, at, ov, stageEl, w, h),
+    morph: (tl, out, inn, at, ov) => morph(tl, out, inn, at, ov),
   };
 
   function registerAll(masterTl, scenes, sceneWindows, width, height, stageEl) {

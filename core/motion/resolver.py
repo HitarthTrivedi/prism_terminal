@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import continuity as _continuity
+from . import camera as _camera
+
 # Same curated set schema.py validates transition_in against. Rotation
 # (hash of the scene's own id, not Math.random/an incrementing counter) so
 # a scene missing transition_in still gets a real one deterministically —
@@ -123,11 +126,75 @@ def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
                                 kf["time"] = float(kf["time"]) + offset
                             except (TypeError, ValueError):
                                 pass
+    # A primitive's OWN content animation (a text mode's reveal, an
+    # arrow's or tree's draw-on, a particle field's phases) is registered
+    # on the same global timeline by registerContentAnimation() and was
+    # never offset — so every scene after the first showed its text
+    # already revealed and its lines already drawn. These are scene-local
+    # in the spec like enter/exit, and shift here the same way.
+    node_type = node.get("type")
+    if node_type in _CONTENT_TIME_TYPES:
+        for key in ("reveal_start", "draw_start"):
+            if key in node or key in _CONTENT_TIME_TYPES[node_type]:
+                try:
+                    node[key] = float(node.get(key, 0.0) or 0.0) + offset
+                except (TypeError, ValueError):
+                    node[key] = offset
+    phases = node.get("phases")
+    if node_type == "particle_field" and isinstance(phases, list):
+        for phase in phases:
+            if isinstance(phase, dict):
+                try:
+                    phase["at"] = float(phase.get("at", 0.0) or 0.0) + offset
+                except (TypeError, ValueError):
+                    phase["at"] = offset
     children = node.get("children")
     if isinstance(children, list):
         for child in children:
             if isinstance(child, dict):
                 _offset_node_times(child, offset)
+
+
+# Which content-time keys each primitive reads (runtime/primitives.js and
+# runtime/domains/*.js), and so which must be written even when absent —
+# an absent reveal_start means "at this scene's start", not "at t=0".
+_CONTENT_TIME_TYPES = {
+    "text": ("reveal_start",),
+    "domain_chart": ("reveal_start",), "chart": ("reveal_start",),
+    "domain_diagram": ("reveal_start",), "diagram": ("reveal_start",), "workflow": ("reveal_start",),
+    "shape_arrow": ("draw_start",), "arrow": ("draw_start",),
+    "spline_tree": ("draw_start",),
+    "particle_field": (),
+}
+
+
+def _continuity_manifest(scenes: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Index visual subjects that continue across scene boundaries.
+
+    Node IDs remain unique for Studio edits; ``continuity_key`` pairs the
+    scene-local instances that represent one subject over time.
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+
+    def visit(node: Dict[str, Any], scene_id: str) -> None:
+        key = node.get("continuity_key")
+        if isinstance(key, str) and key:
+            groups.setdefault(key, []).append({
+                "scene": scene_id,
+                "node": str(node.get("id", "")),
+                "position": list(node.get("position", [0, 0])),
+                "scale": list(node.get("scale", [1, 1])),
+            })
+        for child in node.get("children", []) or []:
+            if isinstance(child, dict):
+                visit(child, scene_id)
+
+    for scene in scenes:
+        scene_id = str(scene.get("id", ""))
+        for node in scene.get("nodes", []) or []:
+            if isinstance(node, dict):
+                visit(node, scene_id)
+    return groups
 
 
 def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -148,6 +215,13 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
       or bare filename against, and inlining means a saved spec is the
       whole motion graphic — re-render it later with no AI or filesystem
       dependency).
+    - Compiles the scenes' shots into one continuous camera curve (see
+      core.motion.camera) when any scene names one.
+    - Emits `_continuity`, a scene/node manifest grouped by each validated
+      node's `continuity_key`, for Studio selection and follow-up edits.
+    - Compiles continuity bridges (see core.motion.continuity) and records
+      the result on `_continuity_compiled` (threads, bridges, errors,
+      warnings).
     """
     spec = dict(spec)
     scenes = spec.get("scenes", [])
@@ -192,6 +266,16 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
             cursor += duration
         spec["_scene_times_resolved"] = True
 
+    # Continuity compiler (core.motion.continuity): every subject that
+    # carries a `continuity_key` across a cut gets a pose-matched bridge
+    # written onto its two instances, and that cut becomes a "morph". Runs
+    # once, after scene starts are final and before transitions are
+    # stamped (it decides some of them). What could not be bridged is kept
+    # on `_continuity_compiled["errors"]` for render.py to refuse.
+    if not spec.get("_continuity_resolved"):
+        spec["_continuity_compiled"] = _continuity.compile(spec)
+        spec["_continuity_resolved"] = True
+
     # Cross-scene transitions: each scene (after the first) that names a
     # transition_in — or, absent one, gets a deterministic default so every
     # cut is a real transition rather than silently defaulting to a hard
@@ -209,7 +293,7 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                 this_dur = float(this_scene.get("duration", 0.0) or 0.0)
             except (TypeError, ValueError):
                 continue
-            overlap = min(0.5, prev_dur / 3, this_dur / 3)
+            overlap = _continuity.handoff_overlap(prev_dur, this_dur)
             if overlap <= 0.02:
                 continue  # a scene too short to safely overlap keeps a hard cut
             t_in = this_scene.get("transition_in")
@@ -239,6 +323,31 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     for scene in scenes:
         _index(scene.get("nodes", []))
+
+    # Expose the continuity graph to Studio and follow-up prompting. It is
+    # metadata only; rendering still uses the validated node graph and tracks.
+    spec["_continuity"] = _continuity_manifest(scenes)
+
+    # Shots → one continuous camera curve (core.motion.camera). Only when
+    # a scene names a shot; an explicitly authored camera is left alone.
+    # The authored tracks are kept on `_authored_tracks` (their first entry
+    # seeds the opening state) so the decision is visible in a saved spec.
+    if not spec.get("_camera_resolved"):
+        world = {nid: entry["world_pos"] for nid, entry in node_registry.items()}
+        authored = camera.get("tracks") if isinstance(camera, dict) else None
+        width = int((spec.get("project") or {}).get("width", 1080) or 1080)
+        height = int((spec.get("project") or {}).get("height", 1920) or 1920)
+        compiled = _camera.compile_tracks(
+            scenes, width, height, world,
+            authored if isinstance(authored, list) else None)
+        if compiled is not None:
+            if not isinstance(camera, dict):
+                camera = {}
+            if isinstance(authored, list) and authored:
+                camera["_authored_tracks"] = authored
+            camera["tracks"] = compiled
+            spec["camera"] = camera
+        spec["_camera_resolved"] = True
 
     if camera and "tracks" in camera and isinstance(camera["tracks"], list):
         for track in camera["tracks"]:

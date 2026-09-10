@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .camera import safe_area
+
 
 def _node_bounds(node: dict, canvas_w: int, canvas_h: int) -> tuple[float, float, float, float] | None:
     """Approximate (left, top, right, bottom) for one node's AUTHORED
@@ -41,6 +43,11 @@ def _node_bounds(node: dict, canvas_w: int, canvas_h: int) -> tuple[float, float
         ax, ay = 0.5, 0.5
 
     node_type = node.get("type", "")
+    if node_type in ("light_field", "depth_layer", "particle_field", "spline_tree"):
+        # A light field is meant to bleed past the frame; a depth layer is
+        # a positioning group with no paint of its own. Neither has a box
+        # worth checking — their children are checked on their own.
+        return None
     if node_type == "text":
         content = str(node.get("content", ""))
         font_size = float(node.get("font_size", 48) or 48)
@@ -68,8 +75,15 @@ def _node_bounds(node: dict, canvas_w: int, canvas_h: int) -> tuple[float, float
         # carry explicit width/height in the spec (defaults match
         # runtime/primitives.js's own JS defaults, so a check here means
         # the same thing the renderer would actually draw).
-        w = float(node.get("width", 200) or 200)
-        h = float(node.get("height", 200) or 200)
+        dw, dh = (640, 400) if node_type == "glass_panel" else (200, 200)
+        if node_type == "icon":
+            dw = dh = float(node.get("size", 96) or 96)
+        elif node_type == "orb":
+            dw = dh = 2 * float(node.get("radius", 120) or 120)
+        elif node_type in ("shape_circle", "circle"):
+            dw = dh = 2 * float(node.get("radius", 50) or 50)
+        w = float(node.get("width", dw) or dw)
+        h = float(node.get("height", dh) or dh)
 
     left = x - w * ax
     top = y - h * ay
@@ -233,6 +247,61 @@ def _layer_faults(scene: dict) -> list[str]:
     return faults
 
 
+def _safe_area_faults(scene: dict, canvas_w: int, canvas_h: int) -> list[str]:
+    """Text and images that sit where a vertical platform's own chrome
+    (username, caption, buttons, progress bar) covers the frame. A
+    factual geometry check against core.motion.camera.safe_area(); a
+    landscape or square project has no such bands and returns nothing.
+    Only top-level nodes and the children of a depth_layer/glass_panel
+    are walked — that is where headlines and logos live.
+    """
+    zone = safe_area(canvas_w, canvas_h)
+    if not zone.get("vertical"):
+        return []
+    faults: list[str] = []
+
+    def visit(node: dict, offset: tuple[float, float]) -> None:
+        if node.get("type") in ("text", "image"):
+            shifted = dict(node)
+            pos = node.get("position") or [0, 0]
+            try:
+                shifted["position"] = [float(pos[0]) + offset[0], float(pos[1]) + offset[1]]
+            except (TypeError, ValueError, IndexError):
+                return
+            b = _node_bounds(shifted, canvas_w, canvas_h)
+            if not b:
+                return
+            _, top, _, bottom = b
+            if bottom <= 0 or top >= canvas_h:
+                return  # entirely outside: the off-frame check owns that
+            if top < zone["top"]:
+                faults.append(
+                    f'node "{node.get("id", "?")}" ({node.get("type")}) reaches '
+                    f"y={top:.0f}, inside the top {zone['top']}px of a "
+                    f"{canvas_w}x{canvas_h} frame where the platform's own UI "
+                    f"covers it — keep text and logos below y={zone['top']}")
+            elif bottom > zone["bottom"]:
+                faults.append(
+                    f'node "{node.get("id", "?")}" ({node.get("type")}) reaches '
+                    f"y={bottom:.0f}, inside the bottom band of a "
+                    f"{canvas_w}x{canvas_h} frame where captions and buttons "
+                    f"cover it — keep text and logos above y={zone['bottom']}")
+        if node.get("type") in ("depth_layer", "glass_panel", "group"):
+            pos = node.get("position") or [0, 0]
+            try:
+                inner = (offset[0] + float(pos[0]), offset[1] + float(pos[1]))
+            except (TypeError, ValueError, IndexError):
+                return
+            for child in node.get("children", []) or []:
+                if isinstance(child, dict):
+                    visit(child, inner)
+
+    for node in scene.get("nodes", []) or []:
+        if isinstance(node, dict):
+            visit(node, (0.0, 0.0))
+    return faults
+
+
 def inspect(spec: dict[str, Any]) -> list[str]:
     """Check one scene (spec["scenes"] has exactly one, the shape
     core.motion.generate.build_spec() checks with) and report concrete,
@@ -254,6 +323,7 @@ def inspect(spec: dict[str, Any]) -> list[str]:
             duration = 0.0
         faults.extend(_layer_faults(scene))
         faults.extend(_overlap_faults(scene, canvas_w, canvas_h))
+        faults.extend(_safe_area_faults(scene, canvas_w, canvas_h))
         for node in scene.get("nodes", []) or []:
             if not isinstance(node, dict):
                 continue

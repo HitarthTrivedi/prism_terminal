@@ -509,6 +509,470 @@ class ImageNode extends Node {
   }
 }
 
+// ── Material primitives (Phase 2 of the inspo benchmark) ─────────────────────
+// A colour the spec wrote as #rrggbb (or #rgb) becomes rgba() at `alpha`;
+// anything else (an rgba()/hsla()/named colour) is returned as written, so
+// an author who already chose their own alpha keeps it.
+function _withAlpha(color, alpha) {
+  if (typeof color !== "string") return color;
+  const m = color.trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (!m) return color;
+  let hex = m[1];
+  if (hex.length === 3) hex = hex.split("").map(c => c + c).join("");
+  const r = parseInt(hex.slice(0, 2), 16), g = parseInt(hex.slice(2, 4), 16), b = parseInt(hex.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${Math.max(0, Math.min(1, alpha)).toFixed(3)})`;
+}
+function _unit(v, dflt) { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : dflt; }
+
+// GlassPanelNode — the one reusable glass material: backdrop blur +
+// transmission (how much of the scene shows through the tint), an edge
+// light (border + top inset highlight), an inner shadow for thickness, a
+// diagonal specular, and a contrast guard (a gentle scrim in the text's
+// favour, so copy on the panel stays legible over a bright light_field
+// as well as over a dark wash). Children mount on the host and so sit
+// ABOVE the panel's own layers — the panel is the surface, its children
+// are the content on it.
+class GlassPanelNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.width        = props.width        || 640;
+    this.height       = props.height       || 400;
+    this.radius       = props.radius       !== undefined ? props.radius : 28;
+    this.tint         = props.tint         || props.fill || "#1A2140";
+    this.blur         = Number.isFinite(Number(props.blur)) ? Math.max(0, Math.min(40, Number(props.blur))) : 18;
+    this.transmission = _unit(props.transmission, 0.55);
+    this.borderLight  = _unit(props.border_light, 0.6);
+    this.innerShadow  = _unit(props.inner_shadow, 0.4);
+    this.specular     = _unit(props.specular, 0.5);
+    this.lightAngle   = Number.isFinite(Number(props.light_angle)) ? Number(props.light_angle) : 135;
+    const guard = props.contrast_guard;
+    this.contrastGuard = guard === false || guard === "none" ? null : (guard === "light" ? "light" : "dark");
+  }
+
+  initDOM(box) {
+    const w = this.width, h = this.height;
+    box.style.transform = "";
+    box.style.left   = `${-w * this.anchor[0]}px`;
+    box.style.top    = `${-h * this.anchor[1]}px`;
+    box.style.width  = `${w}px`;
+    box.style.height = `${h}px`;
+    const r = Math.min(this.radius, w / 2, h / 2);
+    box.style.borderRadius = `${r}px`;
+    box.style.overflow = "hidden";
+    box.style.boxSizing = "border-box";
+
+    const saturate = (1 + 0.5 * (1 - this.transmission)).toFixed(2);
+    box.style.backdropFilter = `blur(${this.blur}px) saturate(${saturate})`;
+    box.style.webkitBackdropFilter = `blur(${this.blur}px) saturate(${saturate})`;
+    box.style.background = _withAlpha(this.tint, (1 - this.transmission) * 0.85);
+    box.style.border = `1px solid rgba(255,255,255,${(0.08 + 0.32 * this.borderLight).toFixed(3)})`;
+    box.style.boxShadow = [
+      `inset 0 1px 0 rgba(255,255,255,${(0.10 + 0.45 * this.borderLight).toFixed(3)})`,
+      `inset 0 -1px 0 rgba(0,0,0,${(0.35 * this.innerShadow).toFixed(3)})`,
+      `inset 0 0 ${Math.round(28 * this.innerShadow)}px rgba(0,0,0,${(0.28 * this.innerShadow).toFixed(3)})`,
+      `0 24px 48px rgba(0,0,0,0.35)`,
+    ].join(", ");
+
+    if (this.contrastGuard) {
+      const scrim = document.createElement("div");
+      const dark = this.contrastGuard === "dark";
+      scrim.style.cssText = `position:absolute;inset:0;pointer-events:none;border-radius:inherit;` +
+        (dark
+          ? "background:linear-gradient(180deg, rgba(6,9,20,0.14) 0%, rgba(6,9,20,0.30) 100%);"
+          : "background:linear-gradient(180deg, rgba(255,255,255,0.22) 0%, rgba(255,255,255,0.34) 100%);");
+      box.appendChild(scrim);
+    }
+    if (this.specular > 0) {
+      const spec = document.createElement("div");
+      spec.style.cssText = `position:absolute;inset:0;pointer-events:none;border-radius:inherit;` +
+        `background:linear-gradient(${this.lightAngle}deg, rgba(255,255,255,${(0.34 * this.specular).toFixed(3)}) 0%, ` +
+        `rgba(255,255,255,0) 36%, rgba(255,255,255,0) 68%, rgba(255,255,255,${(0.09 * this.specular).toFixed(3)}) 100%);`;
+      box.appendChild(spec);
+    }
+  }
+}
+
+// LightFieldNode — a soft, drifting light behind the subject: two radial
+// lobes, screen-blended, blurred, each drifting on its own seeded phase so
+// the field never reads as one mechanical pulse. Meant as the background
+// layer of a shot in place of a flat wash.
+class LightFieldNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.blendMode = props.blend_mode || "screen";
+    this.width     = props.width  || 900;
+    this.height    = props.height || 900;
+    this.color     = props.color  || "rgba(120,160,255,0.55)";
+    this.color2    = props.color2 || this.color;
+    this.intensity = _unit(props.intensity, 0.6);
+    this.spread    = Number.isFinite(Number(props.spread)) ? Math.max(0.2, Math.min(2.0, Number(props.spread))) : 1.0;
+    this.drift     = Number.isFinite(Number(props.drift)) ? Math.max(0, Math.min(200, Number(props.drift))) : 40;
+    this._lobes = [];
+  }
+
+  initDOM(box) {
+    const w = this.width, h = this.height;
+    box.style.transform = "";
+    box.style.left   = `${-w * this.anchor[0]}px`;
+    box.style.top    = `${-h * this.anchor[1]}px`;
+    box.style.width  = `${w}px`;
+    box.style.height = `${h}px`;
+    box.style.overflow = "visible";
+    box.style.pointerEvents = "none";
+    box.style.filter = `blur(${Math.round(Math.min(w, h) * 0.04)}px)`;
+    const stop = Math.round(58 * this.spread);
+    const lobe = (color, size, left, top, opacity) => {
+      const el = document.createElement("div");
+      el.style.cssText = `position:absolute;width:${size}px;height:${size}px;left:${left}px;top:${top}px;` +
+        `border-radius:50%;opacity:${opacity.toFixed(3)};` +
+        `background:radial-gradient(circle at 50% 50%, ${color} 0%, rgba(0,0,0,0) ${stop}%);`;
+      box.appendChild(el);
+      this._lobes.push(el);
+      return el;
+    };
+    lobe(this.color, Math.max(w, h), (w - Math.max(w, h)) / 2, (h - Math.max(w, h)) / 2, this.intensity);
+    const small = Math.max(w, h) * 0.62;
+    lobe(this.color2, small, w * 0.55 - small / 2, h * 0.38 - small / 2, this.intensity * 0.8);
+  }
+
+  registerContentAnimation(masterTl) {
+    if (!this.drift || !this._lobes.length) return;
+    const seed = _hashSeed(this.id);
+    const at = this.animation && this.animation.enter ? (this.animation.enter.time || 0) : 0;
+    const d = this.drift;
+    this._lobes.forEach((el, i) => {
+      const period = 5.5 + ((seed >> (i * 3)) % 7) * 0.35;
+      const phase = ((seed >> (i * 5)) % 1000) / 1000 * period;
+      const sx = i === 0 ? 1 : -1;
+      masterTl.fromTo(el, { x: -d * sx, y: -d * 0.45 }, {
+        x: d * sx, y: d * 0.45, duration: period, ease: "sine.inOut", repeat: -1, yoyo: true,
+      }, Math.max(0, at - phase));
+    });
+  }
+}
+
+// DepthLayerNode — a group that moves with the camera by its depth, the
+// hierarchy that gives a shot depth without repeating cards. depth 1 is
+// the subject plane (identical to a plain group); < 1 sits further back
+// (drifts and zooms less than the camera), > 1 nearer (more). The runtime
+// calls applyParallax() on every seek, after the camera is evaluated.
+class DepthLayerNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    const d = Number(props.depth);
+    this.depth = Number.isFinite(d) ? Math.max(0.2, Math.min(2.5, d)) : 1.0;
+    this._parallax = null;
+  }
+
+  mount(parentEl) {
+    super.mount(parentEl);
+    const wrap = document.createElement("div");
+    wrap.style.position = "absolute";
+    wrap.style.left = "0";
+    wrap.style.top = "0";
+    wrap.style.transformOrigin = "0 0";
+    const sorted = [...this.children].sort((a, b) => a.zIndex - b.zIndex);
+    for (const child of sorted) if (child._host) wrap.appendChild(child._host);
+    this._host.appendChild(wrap);
+    this._parallax = wrap;
+  }
+
+  // World point p at depth d appears where the camera at depth d (its pan
+  // and zoom scaled by d) would put it. The stage already applies the full
+  // camera, so this pre-transforms p so the stage lands it there.
+  applyParallax(camera, w, h) {
+    if (!this._parallax) return;
+    const d = this.depth;
+    if (Math.abs(d - 1) < 1e-6) { this._parallax.style.transform = ""; return; }
+    const cx = w / 2, cy = h / 2;
+    const zoom = Math.max(0.05, camera.zoom || 1);
+    const zoomD = 1 + (zoom - 1) * d;
+    const k = zoomD / zoom;
+    const camDX = cx + (camera.x - cx) * d;
+    const camDY = cy + (camera.y - cy) * d;
+    // conjugate by the layer's own resting translation (usually 0,0)
+    const px = this.position[0], py = this.position[1];
+    const tx = camera.x - k * camDX + (k - 1) * px;
+    const ty = camera.y - k * camDY + (k - 1) * py;
+    this._parallax.style.transform = `matrix(${k.toFixed(5)},0,0,${k.toFixed(5)},${tx.toFixed(2)},${ty.toFixed(2)})`;
+  }
+}
+
+// ── Reference-film primitives (the inspo benchmark) ──────────────────────────
+// A small library of SVG paths (24x24 boxes) for IconNode / OrbNode.
+const ICON_PATHS = {
+  chat: "M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-5 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z",
+  phone: "M6.6 2.5a1.6 1.6 0 0 1 1.6.2l2.4 2.1c.6.5.7 1.4.2 2l-1.5 1.8a13 13 0 0 0 6.1 6.1l1.8-1.5c.6-.5 1.5-.4 2 .2l2.1 2.4c.4.5.5 1.2.2 1.7l-1 1.7a2.6 2.6 0 0 1-2.6 1.3C11.1 19.9 4.1 12.9 3.5 6.1A2.6 2.6 0 0 1 4.8 3.5z",
+  mail: "M3 5h18a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zm1.5 2.2v.9l7.5 5 7.5-5v-.9L12 12.1z",
+  whatsapp: "M12 2.5a9.5 9.5 0 0 0-8.2 14.3L2.5 21.5l4.9-1.3A9.5 9.5 0 1 0 12 2.5zm0 2a7.5 7.5 0 1 1-3.9 13.9l-.4-.2-2.4.6.7-2.3-.3-.4A7.5 7.5 0 0 1 12 4.5zm-3 3.6c-.3 0-.7.1-1 .5-.3.4-1 1-1 2.4s1 2.8 1.2 3c.2.2 2 3.2 5 4.4 2.5 1 3 .8 3.5.7.5-.1 1.7-.7 2-1.4.2-.7.2-1.3.1-1.4l-.5-.3-2-1c-.3-.1-.5-.1-.7.1l-.9 1.1c-.2.2-.3.2-.6.1a6.4 6.4 0 0 1-3.2-2.8c-.2-.4.2-.5.5-1.1l.3-.5-.1-.5-.9-2.1c-.2-.6-.5-.5-.7-.5z",
+  book: "M4 3h7a3 3 0 0 1 3 3v15a2 2 0 0 0-2-2H4zM20 3h-7a3 3 0 0 0-3 3v15a2 2 0 0 1 2-2h8z",
+  dial: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm0 3.5a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zM8 10.5a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zm8 0a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zM12 14.5a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3z",
+  spark: "M12 2l2.2 6.3L20.5 10l-6.3 2.2L12 18.5l-2.2-6.3L3.5 10l6.3-1.7z",
+  check: "M4 12.5l5 5L20 6.5l-2-2-9 9-3-3z",
+};
+function _iconSvg(name, size, color) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", size); svg.setAttribute("height", size);
+  svg.style.display = "block";
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", ICON_PATHS[name] || ICON_PATHS.spark);
+  path.setAttribute("fill", color);
+  svg.appendChild(path);
+  return svg;
+}
+
+// IconNode — a glyph from the library, optionally on a dark glass tile
+// (the reference's chat / phone / mail tiles).
+class IconNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.name  = props.name  || "spark";
+    this.size  = props.size  || 96;
+    this.color = props.color || "#FFFFFF";
+    this.tile  = props.tile !== undefined ? props.tile : true;
+    this.tileColor = props.tile_color || "rgba(20,22,30,0.82)";
+    this.radius = props.radius !== undefined ? props.radius : Math.round(this.size * 0.26);
+    this.glyph = props.glyph || 0.46; // glyph size as a fraction of the tile
+  }
+  initDOM(box) {
+    const s = this.size;
+    box.style.transform = "";
+    box.style.left = `${-s * this.anchor[0]}px`; box.style.top = `${-s * this.anchor[1]}px`;
+    box.style.width = `${s}px`; box.style.height = `${s}px`;
+    box.style.display = "flex"; box.style.alignItems = "center"; box.style.justifyContent = "center";
+    if (this.tile) {
+      box.style.borderRadius = `${this.radius}px`;
+      box.style.background = this.tileColor;
+      box.style.border = "1px solid rgba(255,255,255,0.14)";
+      box.style.boxShadow = "inset 0 1px 0 rgba(255,255,255,0.10), 0 18px 40px rgba(0,0,0,0.45)";
+      box.style.backdropFilter = "blur(14px)"; box.style.webkitBackdropFilter = "blur(14px)";
+    }
+    box.appendChild(_iconSvg(this.name, Math.round(s * this.glyph), this.color));
+  }
+}
+
+// OrbNode — a sphere: a lit core gradient, a rim, a specular, an outer
+// glow, and an optional large faint ring around it (the reference's
+// dark hub sphere and its glowing green/blue orb).
+class OrbNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.radius = props.radius || 120;
+    this.core   = props.core   || "#0c1018";
+    this.tint   = props.tint   || "rgba(255,255,255,0.10)";
+    this.rim    = props.rim    || "rgba(255,255,255,0.22)";
+    this.glowColor = props.glow_color || null;
+    this.glowBlur  = props.glow_blur  || 0;
+    this.highlight = props.highlight !== undefined ? props.highlight : 0.55;
+    this.ringRadius = props.ring_radius || 0;
+    this.ringColor  = props.ring_color  || "rgba(255,255,255,0.12)";
+    this.icon = props.icon || null;
+    this.iconColor = props.icon_color || "#FFFFFF";
+  }
+  initDOM(box) {
+    const d = this.radius * 2;
+    box.style.transform = "";
+    box.style.left = `${-d * this.anchor[0]}px`; box.style.top = `${-d * this.anchor[1]}px`;
+    box.style.width = `${d}px`; box.style.height = `${d}px`;
+    box.style.overflow = "visible";
+    if (this.ringRadius > 0) {
+      const ring = document.createElement("div");
+      const rd = this.ringRadius * 2;
+      ring.style.cssText = `position:absolute;left:${d / 2 - this.ringRadius}px;top:${d / 2 - this.ringRadius}px;width:${rd}px;height:${rd}px;border-radius:50%;border:1px solid ${this.ringColor};pointer-events:none;`;
+      box.appendChild(ring);
+    }
+    const sphere = document.createElement("div");
+    sphere.style.cssText = `position:absolute;inset:0;border-radius:50%;` +
+      `background:radial-gradient(circle at 32% 28%, ${this.tint} 0%, rgba(255,255,255,0) 42%), ` +
+      `radial-gradient(circle at 50% 55%, ${this.core} 55%, ${_withAlpha(this.core, 0.85)} 100%);` +
+      `box-shadow: inset 0 0 ${Math.round(d * 0.12)}px rgba(0,0,0,0.55), inset 0 -${Math.round(d * 0.04)}px ${Math.round(d * 0.1)}px rgba(0,0,0,0.35), inset 0 1px 0 ${this.rim}` +
+      (this.glowColor && this.glowBlur > 0 ? `, 0 0 ${this.glowBlur}px ${this.glowColor}, 0 0 ${Math.round(this.glowBlur * 2.2)}px ${_withAlpha(this.glowColor, 0.35)}` : "") + ";";
+    box.appendChild(sphere);
+    if (this.highlight > 0) {
+      const spec = document.createElement("div");
+      spec.style.cssText = `position:absolute;left:${d * 0.2}px;top:${d * 0.12}px;width:${d * 0.34}px;height:${d * 0.2}px;border-radius:50%;` +
+        `background:radial-gradient(ellipse at 50% 50%, rgba(255,255,255,${(0.5 * this.highlight).toFixed(3)}) 0%, rgba(255,255,255,0) 70%);pointer-events:none;`;
+      box.appendChild(spec);
+    }
+    if (this.icon) {
+      const holder = document.createElement("div");
+      holder.style.cssText = "position:absolute;inset:0;display:flex;align-items:center;justify-content:center;";
+      holder.appendChild(_iconSvg(this.icon, Math.round(d * 0.22), this.iconColor));
+      box.appendChild(holder);
+    }
+  }
+}
+
+// SplineTreeNode — thin curved lines from one hub to many leaves, drawn
+// on with a stagger (the reference's icon-to-hub tree and its knowledge
+// graph). Coordinates are relative to the node's own position.
+class SplineTreeNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.hub = props.hub || [0, 0];
+    this.leaves = Array.isArray(props.leaves) ? props.leaves : [];
+    this.color = props.color || "rgba(255,255,255,0.55)";
+    this.strokeWidth = props.stroke_width || 1.5;
+    this.glowBlur = props.glow_blur || 0;
+    this.bend = props.bend !== undefined ? props.bend : 0.5;
+    this.drawStart = props.draw_start || 0;
+    this.drawDuration = props.draw_duration || 0.9;
+    this.stagger = props.stagger !== undefined ? props.stagger : 0.08;
+    this.dots = props.dots !== undefined ? props.dots : true;
+    this._paths = [];
+  }
+  initDOM(box) {
+    const pts = [this.hub].concat(this.leaves);
+    const minX = Math.min(...pts.map(p => p[0])) - 20, minY = Math.min(...pts.map(p => p[1])) - 20;
+    const maxX = Math.max(...pts.map(p => p[0])) + 20, maxY = Math.max(...pts.map(p => p[1])) + 20;
+    const w = maxX - minX, h = maxY - minY;
+    box.style.transform = ""; box.style.left = `${minX}px`; box.style.top = `${minY}px`;
+    box.style.width = `${w}px`; box.style.height = `${h}px`;
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", w); svg.setAttribute("height", h); svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    svg.style.overflow = "visible";
+    const [hx, hy] = [this.hub[0] - minX, this.hub[1] - minY];
+    for (const leaf of this.leaves) {
+      const lx = leaf[0] - minX, ly = leaf[1] - minY;
+      const dy = (ly - hy) * this.bend;
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", `M ${hx} ${hy} C ${hx} ${hy + dy}, ${lx} ${ly - dy}, ${lx} ${ly}`);
+      path.setAttribute("fill", "none"); path.setAttribute("stroke", this.color);
+      path.setAttribute("stroke-width", String(this.strokeWidth)); path.setAttribute("stroke-linecap", "round");
+      if (this.glowBlur > 0) path.style.filter = `drop-shadow(0 0 ${this.glowBlur}px ${this.color})`;
+      svg.appendChild(path);
+      const len = path.getTotalLength();
+      path.style.strokeDasharray = String(len); path.style.strokeDashoffset = String(len);
+      let dot = null;
+      if (this.dots) {
+        dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        dot.setAttribute("cx", lx); dot.setAttribute("cy", ly); dot.setAttribute("r", String(this.strokeWidth * 1.6));
+        dot.setAttribute("fill", this.color); dot.style.opacity = "0";
+        svg.appendChild(dot);
+      }
+      this._paths.push({ path, len, dot });
+    }
+    box.appendChild(svg);
+    this._strokeTarget = this._paths.length ? this._paths[0].path : null;
+  }
+  registerContentAnimation(masterTl) {
+    const dur = Math.max(0.05, this.drawDuration);
+    this._paths.forEach((p, i) => {
+      const at = this.drawStart + i * this.stagger;
+      proxyTween(masterTl, v => { p.path.style.strokeDashoffset = String(v); }, p.len, 0, dur, "power2.out", at);
+      if (p.dot) masterTl.fromTo(p.dot, { opacity: 0 }, { opacity: 1, duration: 0.25 }, at + dur * 0.8);
+    });
+  }
+}
+
+// ParticleFieldNode — the reference's signal: many small coloured tiles
+// that hold one layout and travel to the next at each phase. Every tile's
+// place in every layout is a pure function of (seed, index), so the same
+// field declared in two scenes with the same layout sits on the same
+// pixels — the continuity the morph needs.
+const _FIELD_PALETTE = ["#5b7cff", "#ff6bb5", "#b58cff", "#e8f0ff", "#2dd4bf", "#8fb3ff"];
+function _rand(seed, i, salt) {
+  // XOR on a JS number yields a SIGNED 32-bit int, so every step is
+  // forced back to unsigned — a negative here once threw half of a
+  // particle field off the top-left of the frame.
+  let h = (_hashSeed(seed) ^ Math.imul(i + 1, 2654435761) ^ Math.imul(salt + 7, 40503)) >>> 0;
+  h = (h ^ (h >>> 13)) >>> 0; h = Math.imul(h, 0x5bd1e995) >>> 0; h = (h ^ (h >>> 15)) >>> 0;
+  return (h % 100000) / 100000;
+}
+function _layoutPoint(layout, i, count, seed) {
+  const kind = (layout && layout.kind) || "scatter";
+  const r = k => _rand(seed, i, k);
+  if (kind === "band") {
+    const rows = layout.rows || 6, cell = layout.cell || 26, x0 = layout.x0 !== undefined ? layout.x0 : 40;
+    const x1 = layout.x1 !== undefined ? layout.x1 : 1040, y = layout.y !== undefined ? layout.y : 900;
+    const cols = Math.max(1, Math.floor((x1 - x0) / cell));
+    const idx = i % (rows * cols);
+    return [x0 + (idx % cols) * cell + (r(1) - 0.5) * 3, y + Math.floor(idx / cols) * cell - (rows * cell) / 2 + (r(2) - 0.5) * 3];
+  }
+  if (kind === "column") {
+    const x = layout.x !== undefined ? layout.x : 540, spread = layout.spread || 90;
+    const y0 = layout.y0 !== undefined ? layout.y0 : -200, y1 = layout.y1 !== undefined ? layout.y1 : 2100;
+    return [x + (r(3) - 0.5) * 2 * spread * (0.4 + 0.6 * r(6)), y0 + (y1 - y0) * ((i / count + r(4) * 0.05) % 1)];
+  }
+  if (kind === "ring") {
+    const c = layout.center || [540, 960], rad = layout.radius || 200, t = (i / count) * Math.PI * 2 + r(5) * 0.4;
+    const rr = rad * (0.75 + 0.5 * r(6));
+    return [c[0] + Math.cos(t) * rr, c[1] + Math.sin(t) * rr];
+  }
+  if (kind === "points") {
+    const pts = layout.points || [[540, 960]], p = pts[i % pts.length], jitter = layout.jitter || 40;
+    return [p[0] + (r(7) - 0.5) * 2 * jitter, p[1] + (r(8) - 0.5) * 2 * jitter];
+  }
+  if (kind === "hidden") {
+    return [540, 960];
+  }
+  // scatter: small clusters of adjacent cells (the reference's tiles sit
+  // in twos and threes, never evenly sprinkled), `cluster` tiles per group
+  const box = layout.box || [40, 200, 1040, 1700];
+  const per = Math.max(1, layout.cluster || 3), cell = layout.cell || 26;
+  const g = Math.floor(i / per), k = i % per;
+  const gx = box[0] + (box[2] - box[0]) * _rand(seed, g, 9);
+  const gy = box[1] + (box[3] - box[1]) * _rand(seed, g, 10);
+  return [gx + (k % 2) * cell + (Math.floor(k / 2) ? cell * (_rand(seed, g, 14) > 0.5 ? 1 : -1) : 0),
+          gy + Math.floor(k / 2) * cell * (k >= 2 && _rand(seed, g, 15) > 0.5 ? 1 : 0)];
+}
+class ParticleFieldNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.count = Math.max(1, Math.min(600, props.count || 120));
+    this.size = props.size || 14;
+    this.palette = Array.isArray(props.palette) && props.palette.length ? props.palette : _FIELD_PALETTE;
+    this.seed = props.seed !== undefined ? props.seed : this.id;
+    this.phases = Array.isArray(props.phases) && props.phases.length ? props.phases : [{ at: 0, layout: { kind: "scatter" } }];
+    this.flicker = props.flicker !== undefined ? props.flicker : 0.35;
+    this.blend = props.blend_mode || "normal";
+    this._tiles = [];
+  }
+  initDOM(box) {
+    box.style.transform = ""; box.style.left = "0"; box.style.top = "0";
+    box.style.width = "0"; box.style.height = "0"; box.style.overflow = "visible";
+    const first = this.phases[0].layout;
+    const hidden = first && first.kind === "hidden";
+    for (let i = 0; i < this.count; i++) {
+      const el = document.createElement("i");
+      const s = this.size * (0.88 + 0.24 * _rand(this.seed, i, 11));
+      const depth = _rand(this.seed, i, 12);
+      const colour = this.palette[Math.floor(_rand(this.seed, i, 13) * this.palette.length) % this.palette.length];
+      const [x, y] = _layoutPoint(first, i, this.count, this.seed);
+      const alpha = 0.55 + 0.45 * depth;
+      el.style.cssText = `position:absolute;left:${-s / 2}px;top:${-s / 2}px;width:${s}px;height:${s}px;border-radius:2px;` +
+        `background:${colour};opacity:${hidden ? 0 : alpha.toFixed(3)};mix-blend-mode:${this.blend};will-change:transform;`;
+      box.appendChild(el);
+      this._tiles.push({ el, x, y, depth, alpha: hidden ? 0 : alpha });
+      gsap.set(el, { x, y });
+    }
+  }
+  registerContentAnimation(masterTl) {
+    const total = this.count;
+    for (let k = 1; k < this.phases.length; k++) {
+      const ph = this.phases[k], layout = ph.layout || {};
+      const dur = Math.max(0.05, ph.duration || 1.0), ease = ph.easing || "power2.inOut";
+      const hidden = layout.kind === "hidden";
+      this._tiles.forEach((t, i) => {
+        const [x, y] = _layoutPoint(layout, i, total, this.seed);
+        const at = (ph.at || 0) + _rand(this.seed, i, 20 + k) * (ph.stagger || 0.35);
+        masterTl.to(t.el, { x, y, duration: dur, ease }, at);
+        const wasHidden = (this.phases[k - 1].layout || {}).kind === "hidden";
+        if (hidden || wasHidden) masterTl.to(t.el, { opacity: hidden ? 0 : t.alpha, duration: dur * 0.6, ease: "power2.out" }, at);
+      });
+    }
+    if (this.flicker > 0) {
+      this._tiles.forEach((t, i) => {
+        if (t.alpha <= 0) return;
+        const period = 0.9 + _rand(this.seed, i, 30) * 1.6;
+        masterTl.to(t.el, { opacity: Math.max(0.05, t.alpha * (1 - this.flicker)), duration: period, ease: "sine.inOut", repeat: -1, yoyo: true },
+          _rand(this.seed, i, 31) * period);
+      });
+    }
+  }
+}
+
 // ── Node Factory ──────────────────────────────────────────────────────────────
 function createNodeFromSpec(nodeData) {
   if (!nodeData) return null;
@@ -519,6 +983,13 @@ function createNodeFromSpec(nodeData) {
   else if (type === "shape_arrow" || type === "arrow")       node = new ShapeArrowNode(nodeData);
   else if (type === "text")                                  node = new TextNode(nodeData);
   else if (type === "image")                                 node = new ImageNode(nodeData);
+  else if (type === "glass_panel" || type === "glass")       node = new GlassPanelNode(nodeData);
+  else if (type === "light_field")                           node = new LightFieldNode(nodeData);
+  else if (type === "depth_layer")                           node = new DepthLayerNode(nodeData);
+  else if (type === "icon")                                  node = new IconNode(nodeData);
+  else if (type === "orb")                                   node = new OrbNode(nodeData);
+  else if (type === "spline_tree")                           node = new SplineTreeNode(nodeData);
+  else if (type === "particle_field")                        node = new ParticleFieldNode(nodeData);
   else if ((type === "domain_chart" || type === "chart") && window.DomainChartNode)
     node = new window.DomainChartNode(nodeData);
   else if ((type === "domain_diagram" || type === "diagram" || type === "workflow") && window.DomainDiagramNode)
@@ -540,4 +1011,11 @@ window.ShapeCircleNode  = ShapeCircleNode;
 window.ShapeArrowNode   = ShapeArrowNode;
 window.TextNode         = TextNode;
 window.ImageNode        = ImageNode;
+window.GlassPanelNode   = GlassPanelNode;
+window.LightFieldNode   = LightFieldNode;
+window.DepthLayerNode   = DepthLayerNode;
+window.IconNode         = IconNode;
+window.OrbNode          = OrbNode;
+window.SplineTreeNode   = SplineTreeNode;
+window.ParticleFieldNode = ParticleFieldNode;
 window.createNodeFromSpec = createNodeFromSpec;

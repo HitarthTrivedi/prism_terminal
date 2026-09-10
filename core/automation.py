@@ -1641,7 +1641,47 @@ def _download_attr(anchor) -> str | None:
         return None
 
 
-def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
+def _anchor_text(anchor) -> str:
+    try:
+        return (getattr(anchor, "text", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _filename_in_text(text: str) -> str:
+    """The filename an anchor SHOWS, when its href gives nothing away.
+
+    ChatGPT's generated-file chip is `<a href="…/backend-api/…/content?id=
+    file-…&sig=…">report.docx</a>`: an extension-less signed URL with no
+    `download` attribute, and the only place the file's name and type
+    appear is the link text. The old candidate test (extension in the
+    href, a `download` attribute, or a blob: URL) let every one of those
+    through as "an ordinary navigational link" -- so the document a tool
+    had plainly produced was skipped, the click fallback found no button
+    labelled "Download" (the chip is labelled with the filename), and the
+    step was reported as "Prism couldn't read the response"."""
+    text = (text or "").strip()
+    if not text or len(text) > 160:
+        return ""
+    low = text.lower()
+    if any(low.endswith(ext) for ext in _HARVESTABLE_EXTS):
+        return text
+    for token in text.split():
+        t = token.strip("()[],;:\"'")
+        if any(t.lower().endswith(ext) for ext in _HARVESTABLE_EXTS) and len(t) > len(
+                os.path.splitext(t)[1]):
+            return t
+    return ""
+
+
+def _safe_filename(name: str) -> str:
+    """A site's suggested filename, made safe for this machine."""
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", name or "").strip(" .")
+    return name[:120]
+
+
+def _harvest_files(driver, agent_cfg, stage: str, ignore_names=(),
+                   click_fallback: bool = True) -> list[dict]:
     """Non-image sibling of _harvest_images. A code, presentation or format
     stage's real deliverable is a DOCUMENT, DECK, CODE file or ARCHIVE, not a
     picture — that can't travel in a text handoff either, only the file
@@ -1678,7 +1718,7 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
     from . import files as F
 
     sel = agent_cfg.get("response_selector", "")
-    candidates: list[tuple[str, str | None]] = []
+    candidates: list[tuple[str, str | None, str]] = []
     try:
         links = (driver.find_elements(By.CSS_SELECTOR, _within(sel, "a[href]"))
                  if sel else [])
@@ -1687,7 +1727,7 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
         for a in links:
             try:
                 candidates.append((a.get_attribute("href") or "",
-                                   _download_attr(a)))
+                                   _download_attr(a), _anchor_text(a)))
             except Exception:
                 continue
     except Exception:
@@ -1698,27 +1738,39 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
             srcs = driver.execute_script(
                 "return [...document.querySelectorAll('audio')]"
                 ".map(a => a.currentSrc || a.src).filter(Boolean);") or []
-            candidates.extend((src, None) for src in srcs)
+            candidates.extend((src, None, "") for src in srcs)
         except Exception:
             pass
+
+    # The customer's own attachments come back as chips in THEIR turn of the
+    # conversation, with the same download anchors a generated file has.
+    # Harvesting the whole page (the fallback when the reply itself holds no
+    # link) would otherwise re-save the drawing they uploaded as something
+    # the tool made.
+    ignore_lower = {os.path.basename(n).lower() for n in (ignore_names or ()) if n}
 
     out, seen = [], set()
     try:
         driver.set_script_timeout(20)
     except Exception:
         pass
-    for href, download_attr in candidates:
+    for href, download_attr, text in candidates:
         if not href or href in seen:
             continue
         clean = href.split("?")[0].split("#")[0]
         href_ext = os.path.splitext(clean)[1].lower()
         # The `download` attribute is the site's own suggested filename and,
         # when present, a more reliable source for the real extension than
-        # the URL — a download endpoint's href is often extension-less.
-        ext = os.path.splitext(download_attr or "")[1].lower() or href_ext
+        # the URL — a download endpoint's href is often extension-less. The
+        # link's visible text is the next best thing (see _filename_in_text).
+        text_name = _filename_in_text(text)
+        site_name = _safe_filename(os.path.basename(download_attr or text_name or ""))
+        ext = os.path.splitext(site_name)[1].lower() or href_ext
         if not (href.startswith("blob:") or download_attr is not None
-                or href_ext in _HARVESTABLE_EXTS):
+                or href_ext in _HARVESTABLE_EXTS or text_name):
             continue   # an ordinary navigational link, not a deliverable
+        if site_name and site_name.lower() in ignore_lower:
+            continue   # the customer's own upload, shown back to them
         seen.add(href)
 
         raw = None
@@ -1746,8 +1798,15 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
         if not raw:
             continue
 
-        name = f"{stage}_file{len(out) + 1}{ext}"
-        path = os.path.join(tempfile.gettempdir(), f"prism_{name}")
+        # Keep the name the tool gave the file: "Quotation - JK Cement.xlsx"
+        # is what the customer asked for and what they will look for in
+        # Artifacts; "content_file1.xlsx" is what they used to get.
+        if site_name:
+            stem, site_ext = os.path.splitext(site_name)
+            name = stem + (site_ext or ext)
+        else:
+            name = f"{stage}_file{len(out) + 1}{ext}"
+        path = os.path.join(tempfile.gettempdir(), f"prism_{stage}_{name}")
         try:
             with open(path, "wb") as f:
                 f.write(raw)
@@ -1759,6 +1818,7 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
         # Marked so a later stage can tell a file a model produced from one
         # the client actually supplied — same convention _harvest_images uses.
         att["_generated"] = True
+        att["_site_name"] = site_name
         out.append(att)
         if len(out) >= 4:
             break
@@ -1767,9 +1827,85 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
     # and ChatGPT's canvas serve a generated file through a Download BUTTON
     # that runs JS to save it, with no <a href> whose bytes we can fetch; the
     # reply says "Download the … PDF" and the artifact folder stayed empty.
-    if not out:
+    # Only when the caller has a reason to believe a file exists: this path
+    # clicks the first download-ish control it finds and then waits up to
+    # 45 s, which is the wrong thing to do on a plain-text step.
+    if not out and click_fallback:
         out = _harvest_via_download(driver, agent_cfg, stage)
     return out
+
+
+# Stages whose deliverable is usually a file. Every OTHER stage is looked at
+# too (see _harvest_stage_files), but these get the patient wait.
+_FILE_STAGES = ("development", "presentation", "format", "content", "write", "audio")
+
+# A reply that says a file is coming, even when no link is on the page yet.
+_FILE_HINT_RE = re.compile(
+    r"\b(?:download|attached|attachment|here(?:'s| is) (?:the|your) (?:file|"
+    r"document|report|spreadsheet|deck|presentation|workbook|pdf))\b"
+    r"|\.(?:pdf|docx?|pptx?|xlsx?|csv|zip|md|json|py|ipynb)\b", re.I)
+
+
+def _harvest_stage_files(driver, agent_cfg, stage: str, texts,
+                         attachments=None) -> list[dict]:
+    """Every file a stage produced, on ANY stage.
+
+    Harvesting used to run only on the six _FILE_STAGES. A tool asked on a
+    research or summary step for "an Excel of the results" produced it, and
+    Prism walked past: the file was never saved, and when the reply was the
+    file alone the step read as "Prism couldn't read the response". Now the
+    file stages keep their patient wait, and every other stage gets a free
+    look -- one probe of the page, no sleep -- and a real wait only when the
+    page already shows a file link or the reply's own words say one is
+    coming. A plain-text step costs nothing extra."""
+    ignore = set()
+    for a in attachments or []:
+        if isinstance(a, dict):
+            ignore.add(os.path.basename(a.get("name") or a.get("path") or ""))
+    ignore.discard("")
+    if stage in _FILE_STAGES:
+        ui.info("   ⏳  waiting for the file to finish rendering (up to 60s)…")
+        _wait_for_files(driver, stage=stage)
+        return _harvest_files(driver, agent_cfg, stage, ignore_names=ignore,
+                              click_fallback=True)
+    n = _wait_for_files(driver, stage=stage, cap=0, grace=0)
+    hinted = any(_FILE_HINT_RE.search(t or "") for t in (texts or []))
+    if not n and not hinted:
+        return []
+    if not n:
+        ui.info("   ⏳  the reply mentions a file — giving it a moment to appear…")
+        n = _wait_for_files(driver, stage=stage, cap=30, grace=9)
+    return _harvest_files(driver, agent_cfg, stage, ignore_names=ignore,
+                          click_fallback=bool(n) or hinted)
+
+
+def _files_as_reply(items: list[dict]) -> str:
+    """What a step's result reads as when the tool answered with a file and
+    no prose. Kept as the stage's text so the run records a result, the
+    card shows one, and the next stage's context names the file it is also
+    being handed."""
+    from . import files as F
+    lines = ["The tool answered with a file rather than text:"]
+    for it in items:
+        name = it.get("_site_name") or it.get("name") or "file"
+        kind = it.get("kind") or "file"
+        try:
+            size = F._human_size(int(it.get("size") or 0))
+        except Exception:                                   # noqa: BLE001
+            size = ""
+        lines.append(f"- {name} ({kind}{', ' + size if size else ''})")
+    lines.append("The file is saved in Prism Artifacts and passed on to the "
+                 "next step as an attachment.")
+    return "\n".join(lines)
+
+
+def _file_summaries(items: list[dict]) -> list[dict]:
+    """The part of a harvested record the GUI can show: no text dump."""
+    return [{"name": it.get("_site_name") or it.get("name") or "",
+             "kind": it.get("kind") or "file",
+             "size": int(it.get("size") or 0),
+             "saved": it.get("_saved") or "",
+             "path": it.get("path") or ""} for it in items or []]
 
 
 def _click_download_control(driver, agent_cfg: dict) -> bool:
@@ -1949,9 +2085,17 @@ def _save_artifacts(items: list[dict], query: str, stage: str,
             # as `task` too means every stage's output (images, docs, video)
             # from one New Task lands in the same Artifacts subfolder.
             saved = config.save_artifact(path, query, kind=stage, link=link,
-                                         task=query)
-        except Exception:                               # noqa: BLE001
+                                         task=query,
+                                         name=item.get("_site_name") or "")
+        except Exception as e:                          # noqa: BLE001
+            # Silent for a long time, and that silence is what made "Studio
+            # makes artwork on Linux but not on my Mac" undiagnosable: the
+            # picture was made and harvested, the copy to the Desktop was
+            # refused (macOS folder permission), and nothing said so.
+            ui.warn(f"   couldn't save {os.path.basename(path)} to Prism "
+                    f"Artifacts: {e} — the file is still at {path}")
             continue
+        item["_saved"] = saved
         ui.info(f"   💾  saved to {saved}")
 
 
@@ -2237,19 +2381,37 @@ def _wait_for_files(driver, cap: int = 60, grace: int = 12,
     audio-specific note on why a synth/music player is unlikely to expose a
     plain download anchor the way a document tool does.
     """
+    import json as _json
     exts_sel = ", ".join(f"a[href$='{ext}']" for ext in _HARVESTABLE_EXTS)
     audio_sel = ", audio" if stage == "audio" else ""
-    js = f"""
-        return document.querySelectorAll(
-            "a[href^='blob:'], a[download], {exts_sel}{audio_sel}"
-        ).length;
-    """
-    start, last, steady = time.time(), 0, 0
+    # Two kinds of anchor: one whose href or attributes say "file", and one
+    # whose visible TEXT is a filename — ChatGPT's generated-file chip, an
+    # extension-less signed URL labelled "report.docx" (_filename_in_text).
+    js = (
+        "const exts = " + _json.dumps(list(_HARVESTABLE_EXTS)) + ";"
+        "const byHref = document.querySelectorAll(\"a[href^='blob:'], a[download], "
+        + exts_sel + audio_sel + "\");"
+        "const byText = [...document.querySelectorAll('a[href]')].filter(a => {"
+        "  const t = (a.textContent || '').trim().toLowerCase();"
+        "  return t.length < 160 && exts.some(e => t.endsWith(e)); });"
+        "return new Set([...byHref, ...byText]).size;")
+
+    def probe() -> int:
+        try:
+            return int(driver.execute_script(js) or 0)
+        except Exception:
+            return -1
+
+    # Look first, sleep after: a caller with cap=0 gets one honest answer
+    # and pays nothing for it (see _harvest_stage_files).
+    start, steady = time.time(), 0
+    last = max(probe(), 0)
+    if last:
+        ui.info(f"   📎  {last} file link(s) so far…")
     while time.time() - start < cap:
         time.sleep(3)
-        try:
-            n = int(driver.execute_script(js) or 0)
-        except Exception:
+        n = probe()
+        if n < 0:
             continue
         if n > last:
             last, steady = n, 0
@@ -5440,6 +5602,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # "generate me an image" task — one stage, no retry — never had
             # its output downloaded at all: only the tool's own hosted link
             # remained, gone the moment that browser tab or session closed.
+            made_here: list = []
             if stage in ("visual", "media", "artwork"):
                 made = _harvest_images(driver, agent_cfg, stage)
                 if stage == "artwork":
@@ -5454,37 +5617,44 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     ui.info(f"   🖼️   harvested {len(made)} generated image(s) "
                             "for the next stages")
                     _save_artifacts(made, query, stage, link=all_links.get(stage, ""))
-            # Same idea for the producer stages whose deliverable is a
-            # document, deck or code file rather than a picture — without
-            # this, only their scraped TEXT reply ever reached a later stage,
-            # and a genuinely generated PDF/DOCX/PPTX/code file/zip never did.
-            # "content" is here too: most turns on that stage are plain copy,
-            # but the ones that ask for an actual document deserve the same
-            # treatment "format" and "presentation" already get, and
-            # _wait_for_files gives up in `grace` seconds when nothing shows
-            # rather than taxing every plain-text reply. "write" is Gerber's
-            # custom-pipeline label for the same reason "format" is /boq's.
-            # "audio" (ElevenLabs/Suno) never had ANY harvesting before this —
-            # best-effort, unverified against a live account; see the notes
-            # on _harvest_files and _wait_for_files.
-            elif stage in ("development", "presentation", "format",
-                           "content", "write", "audio"):
-                ui.info("   ⏳  waiting for the file to finish rendering "
-                        "(up to 60s)…")
-                _wait_for_files(driver, stage=stage)
-                made_files = _harvest_files(driver, agent_cfg, stage)
+                    made_here = made
+            # Same idea for a document, deck, sheet or code file — and on
+            # EVERY other stage, not just the six producer stages it used to
+            # be limited to: a tool asked on a research or summary step for
+            # "an Excel of this" makes one, and Prism used to walk past it.
+            # The producer stages keep their patient wait; the rest get a
+            # free look and wait only when something says a file is coming
+            # (_harvest_stage_files). "write" is Gerber's custom-pipeline
+            # label for the same reason "format" is /boq's; "audio"
+            # (ElevenLabs/Suno) is best-effort, unverified against a live
+            # account; see _harvest_files and _wait_for_files.
+            else:
+                made_files = _harvest_stage_files(driver, agent_cfg, stage,
+                                                  stage_responses, attachments)
                 if made_files:
                     pipeline_files[:] = (pipeline_files + made_files)[-6:]
                     ui.info(f"   📎  harvested {len(made_files)} generated "
                             "file(s) for the next stages")
                     _save_artifacts(made_files, query, stage, link=all_links.get(stage, ""))
+                    made_here = made_files
+
+            # A tool that answered WITH A FILE and no prose has answered.
+            # This used to fall through to "it returned nothing": the card
+            # said "Prism couldn't read the response off the page", the run
+            # recorded a failure, and the DOCX sat in Artifacts unmentioned.
+            if not stage_responses and made_here:
+                stage_responses = [_files_as_reply(made_here)]
+                all_responses[stage] = stage_responses
+                ui.info("   📎  the reply is the file itself — kept as this "
+                        "step's result")
 
             if stage_responses:
                 ui.ok(f"captured {len(stage_responses)} response(s)")
                 emit("stage_done", {"stage": stage, "count": len(stage_responses),
                                     "snippet": stage_responses[0][:200],
                                     "texts": stage_responses, "url": driver.current_url,
-                                    "timed_out": timed_out})
+                                    "timed_out": timed_out,
+                                    "files": _file_summaries(made_here)})
                 if timed_out:
                     # Real output, kept in all_responses above — but the cap,
                     # not the tool, ended this wait, so what got captured may

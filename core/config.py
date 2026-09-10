@@ -18,7 +18,72 @@ RUNS_DIR = os.path.join(CONFIG_DIR, "runs")
 # document: all of it belongs somewhere a customer looks without being told
 # where — same idea as gerber_dialog.py's own "Prism Gerber" folder on the
 # Desktop, generalised past just Gerber's CSVs.
-ARTIFACTS_DIR = os.path.join(os.path.expanduser("~/Desktop"), "Prism Artifacts")
+
+
+def _desktop_dir() -> str:
+    """The folder the person sees as their Desktop.
+
+    `~/Desktop` is right on Linux and macOS. On Windows it is right only
+    until OneDrive's "Known Folder Move" redirects the Desktop to
+    `%USERPROFILE%\\OneDrive\\Desktop` -- the default on a fresh Windows 11
+    sign-in -- after which `C:\\Users\\x\\Desktop` may not exist at all.
+    Prism then created its own, invisible one and every "saved to the
+    Desktop" landed where nobody looks. The shell keeps the real answer in
+    the registry; ask it, and fall back to the plain path.
+    """
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
+            raw, _ = winreg.QueryValueEx(key, "Desktop")
+            path = os.path.expandvars(raw)
+            if path and os.path.isdir(path):
+                return path
+        except Exception:                                   # noqa: BLE001
+            pass
+    return os.path.join(home, "Desktop")
+
+
+ARTIFACTS_DIR = os.path.join(_desktop_dir(), "Prism Artifacts")
+
+# Where artifacts go when the Desktop folder cannot be written. macOS asks
+# the person's permission the first time an app touches ~/Desktop, and a
+# packaged Prism that was told "Don't Allow" got a PermissionError on every
+# save -- swallowed as best-effort, so the run said "saved" in the log and
+# the Artifacts screen stayed empty. The home folder itself needs no
+# permission and is still somewhere a person can find.
+FALLBACK_ARTIFACTS_DIR = os.path.join(os.path.expanduser("~"), "Prism Artifacts")
+_root_cache: dict = {"for": None, "root": None}
+
+
+def artifacts_root() -> str:
+    """The Artifacts folder that can actually be written on this machine:
+    ARTIFACTS_DIR when it can be created and written, otherwise
+    FALLBACK_ARTIFACTS_DIR -- decided once per process and said once."""
+    wanted = ARTIFACTS_DIR
+    if _root_cache["for"] == wanted and _root_cache["root"]:
+        return _root_cache["root"]
+    root = wanted
+    try:
+        os.makedirs(wanted, exist_ok=True)
+        probe = os.path.join(wanted, ".prism-write-test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+    except OSError as e:
+        root = FALLBACK_ARTIFACTS_DIR
+        os.makedirs(root, exist_ok=True)
+        try:
+            from . import ui
+            ui.warn(f"couldn't write to {wanted} ({e}); generated files go "
+                    f"to {root} instead")
+        except Exception:                                   # noqa: BLE001
+            pass
+    _root_cache.update({"for": wanted, "root": root})
+    return root
 
 DEFAULT = {
     "api_key": "",        # Groq key (gsk_...)
@@ -227,10 +292,9 @@ def begin_run(task: str, title: str = "") -> str:
     task = (task or "").strip()
     if not task:
         _run.update(task=None, dir=None, title=None)
-        os.makedirs(ARTIFACTS_DIR, exist_ok=True)
-        return ARTIFACTS_DIR
+        return artifacts_root()
     title = tidy_title(title) or fallback_title(task)
-    parent = os.path.join(ARTIFACTS_DIR, _clean_name(title, limit=80) or "Task")
+    parent = os.path.join(artifacts_root(), _clean_name(title, limit=80) or "Task")
     stamp = datetime.datetime.now().strftime(RUN_STAMP)
     folder, n = os.path.join(parent, stamp), 1
     while os.path.exists(folder):
@@ -274,15 +338,14 @@ def artifact_task_dir(task: str) -> str:
     caller passing nothing keeps working unchanged.
     """
     if not task:
-        os.makedirs(ARTIFACTS_DIR, exist_ok=True)
-        return ARTIFACTS_DIR
+        return artifacts_root()
     if _run.get("task") == task and current_run_dir():
         return _run["dir"]
     return begin_run(task)
 
 
 def save_artifact(src_path: str, prompt: str, kind: str = "artifact",
-                  link: str = "", task: str = "") -> str:
+                  link: str = "", task: str = "", name: str = "") -> str:
     """Copy a file an agent generated into the one folder a customer will
     actually look in again — see ARTIFACTS_DIR above for why this exists.
 
@@ -305,6 +368,14 @@ def save_artifact(src_path: str, prompt: str, kind: str = "artifact",
     dest_dir = artifact_task_dir(task)
     _, ext = os.path.splitext(src_path)
     stem = _artifact_stem(prompt, kind, dated=not task)
+    # `name` is the filename the TOOL gave the file ("Quotation - JK
+    # Cement.xlsx"). Kept after the run's own label, so the file still says
+    # which run it came from and also what the customer asked it to be
+    # called — the name they will look for.
+    if name:
+        clean = os.path.splitext(os.path.basename(name))[0].strip()
+        if clean:
+            stem = f"{stem} — {clean[:80]}"
     dest = os.path.join(dest_dir, f"{stem}{ext}")
     n = 1
     while os.path.exists(dest):

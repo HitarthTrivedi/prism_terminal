@@ -649,6 +649,105 @@ def _uc_cache_dir() -> str:
     return os.path.abspath(os.path.expanduser(d))
 
 
+# Mach-O CPU types, from <mach/machine.h>. Read directly rather than by
+# shelling out to `file`: a GUI app launched from the Finder has a minimal
+# PATH, `file` can be missing or answer in another language, and the
+# previous check swallowed every failure -- which is how an Intel driver
+# copied over from an old Mac by Migration Assistant survived the cleanup
+# on an M2 with no Rosetta, and Prism died with a bare "[Errno 86] Bad CPU
+# type in executable".
+_MACHO_X86_64 = 0x01000007
+_MACHO_ARM64 = 0x0100000C
+
+
+def _macho_arches(path: str) -> set:
+    """The CPU architectures a Mach-O file carries: {"x86_64"}, {"arm64"},
+    both for a universal binary, or an empty set for anything unreadable
+    or not Mach-O at all."""
+    import struct
+    names = {_MACHO_X86_64: "x86_64", _MACHO_ARM64: "arm64"}
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return set()
+    if len(head) < 8:
+        return set()
+    magic = head[:4]
+    out = set()
+    if magic == b"\xca\xfe\xba\xbe":                      # fat / universal
+        n = struct.unpack(">I", head[4:8])[0]
+        for i in range(min(n, 8)):
+            off = 8 + i * 20
+            if off + 4 > len(head):
+                break
+            cputype = struct.unpack(">I", head[off:off + 4])[0]
+            if cputype in names:
+                out.add(names[cputype])
+        return out
+    if magic in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):   # thin, little-endian
+        cputype = struct.unpack("<I", head[4:8])[0]
+    elif magic in (b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce"):  # thin, big-endian
+        cputype = struct.unpack(">I", head[4:8])[0]
+    else:
+        return set()
+    if cputype in names:
+        out.add(names[cputype])
+    return out
+
+
+def _driver_wrong_arch(path: str) -> str:
+    """Why this cached driver cannot run on this Mac, or "" when it can.
+    Apple Silicon only: an Intel driver there needs Rosetta, which a new
+    Mac does not have, and this is the one case a leftover file kills the
+    first run outright."""
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return ""
+    arches = _macho_arches(path)
+    if arches and "arm64" not in arches:
+        return "built for Intel Macs (" + "/".join(sorted(arches)) + ")"
+    return ""
+
+
+def _purge_uc_cache(why: str) -> None:
+    """Remove every cached driver so undetected-chromedriver downloads the
+    one for THIS machine. Loud on failure -- a silent pass here is exactly
+    what let the wrong driver survive before."""
+    d = _uc_cache_dir()
+    if not os.path.isdir(d):
+        return
+    for f in os.listdir(d):
+        fp = os.path.join(d, f)
+        try:
+            if os.path.isdir(fp):
+                shutil.rmtree(fp)
+            else:
+                os.remove(fp)
+        except OSError as e:
+            ui.warn(f"   couldn't remove the cached browser driver {fp}: {e}")
+    ui.info(f"   ♻️   replacing the cached driver — {why}")
+
+
+_INTEL_DRIVER_HELP = (
+    "The browser driver on this Mac was built for Intel Macs, and this Mac "
+    "has no Rosetta to run it. It was most likely copied over from an older "
+    "Mac by Migration Assistant.\n\n"
+    "  1. Prism has removed it and downloads the Apple silicon driver on the "
+    "next run — press Start again.\n"
+    "  2. If it comes back, delete the folder\n"
+    "     ~/Library/Application Support/undetected_chromedriver\n"
+    "     and try once more."
+)
+
+
+def _is_bad_arch_error(e: BaseException) -> bool:
+    """[Errno 86] Bad CPU type in executable, however Selenium wrapped it."""
+    if getattr(e, "errno", None) == 86:
+        return True
+    low = str(e).lower()
+    return "errno 86" in low or "bad cpu type" in low
+
+
 def _setup_chrome_driver(version_main=None, reseed: bool = False):
     """Launch undetected-chromedriver against Prism's own persistent profile,
     seeded from the user's real Chrome the first time so their logins carry
@@ -701,19 +800,11 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
             fp = os.path.join(uc_cache, f)
             if not os.path.isfile(fp):
                 continue
-            drop = None
-            # Apple Silicon only. uc can end up with an x86 driver under
-            # Rosetta there, which is what this catches. It must NOT run
-            # elsewhere: on Linux x86 `file` reports "x86-64" for a perfectly
-            # good native driver, and this would delete and re-download it on
-            # every single launch.
-            if platform.system() == "Darwin" and platform.machine() == "arm64":
-                try:
-                    r = subprocess.run(["file", fp], capture_output=True, text=True)
-                    if "x86" in r.stdout and "arm" not in r.stdout.lower():
-                        drop = "built for the wrong architecture"
-                except Exception:
-                    pass
+            # Apple Silicon only (_driver_wrong_arch answers "" elsewhere):
+            # an Intel driver -- left by Rosetta, or carried over from an
+            # old Mac -- cannot run on a Mac without Rosetta. Read from the
+            # Mach-O header, not from `file`, so it cannot fail quietly.
+            drop = _driver_wrong_arch(fp) or None
             if drop is None and version_main:
                 try:
                     # chromedriver, unlike chrome, is a console binary on
@@ -730,10 +821,10 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                 try:
                     os.remove(fp)
                     ui.info(f"   ♻️   replacing the cached driver — {drop}")
-                except OSError:
-                    # Windows refuses to unlink a running executable. Nothing
-                    # to do but let uc try it and report the real failure.
-                    pass
+                except OSError as e:
+                    # Windows refuses to unlink a running executable. Say so
+                    # and let uc try it and report the real failure.
+                    ui.warn(f"   couldn't replace the cached driver ({drop}): {e}")
 
     try:
         drv = uc.Chrome(options=_options(), user_data_dir=tmp,
@@ -755,12 +846,17 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
         #     Unpinned, uc takes the latest stable driver instead, which
         #     drives the new Chrome in every case the pin was going to fail.
         _release_profile()
-        if version_main is not None:
+        bad_arch = _is_bad_arch_error(e)
+        if bad_arch:
+            # The driver that was just executed is for the other CPU. Throw
+            # the cache away so the retry downloads the one for this Mac.
+            _purge_uc_cache("it was built for another kind of Mac")
+        elif version_main is not None:
             ui.warn(f"   couldn't start Chrome for v{version_main} — retrying "
                     "with whatever driver is current")
         try:
             drv = uc.Chrome(options=_options(), user_data_dir=tmp,
-                            version_main=None)
+                            version_main=version_main if bad_arch else None)
             _reset_to_blank_tab(drv)
             return drv
         except Exception as retry_error:
@@ -781,7 +877,9 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
         # Three different failures used to be reported as one, and the one
         # they were all reported as — "Chrome updated and the driver hasn't
         # caught up" — sent people to update a browser that was fine.
-        if "could not determine browser executable" in low:
+        if _is_bad_arch_error(e):
+            why = _INTEL_DRIVER_HELP
+        elif "could not determine browser executable" in low:
             why = ("Prism drives Google Chrome, and it isn't installed here.\n\n"
                    "  1. Install Google Chrome from google.com/chrome.\n"
                    "  2. Start it once, then try again.\n\n"

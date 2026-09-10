@@ -416,7 +416,18 @@ def _posix_chrome_pids(ps_output: str, marker: str) -> list[str]:
         parts = line.split(None, 1)
         if len(parts) != 2 or marker not in parts[1]:
             continue
-        program = os.path.basename(parts[1].split()[0]).lower()
+        # The program is everything before its first `--flag`, not the first
+        # whitespace-separated token. That token was `/Applications/Google`
+        # for a Mac's `/Applications/Google Chrome.app/Contents/MacOS/Google
+        # Chrome`, whose basename is "Google" -- so no Mac Chrome ever
+        # matched, and _release_profile() was a silent no-op on every Mac.
+        # The Chrome left running by Login tabs (closing its windows does
+        # not quit a Mac app), and the one uc leaves behind when its driver
+        # fails to start, were never closed; the next launch handed itself
+        # to them and chromedriver said "cannot connect to chrome". Found on
+        # a client's M2, 10 Sep 2026, where it also defeated the errno-86
+        # retry: the retry's Chrome handed off to the first attempt's orphan.
+        program = os.path.basename(parts[1].split(" --", 1)[0].strip()).lower()
         if "chrome" in program or "chromium" in program:
             out.append(parts[0])
     return out
@@ -748,12 +759,71 @@ def _purge_uc_cache(why: str) -> None:
 _INTEL_DRIVER_HELP = (
     "The browser driver that was run is built for Intel Macs, and this Mac "
     "has no Rosetta to run it.\n\n"
-    "  1. Press Start again: Prism now fetches its own Apple silicon driver "
-    "into ~/.prism/chromedriver and uses that.\n"
+    "  1. Check this Mac is online and press Start again: Prism fetches its "
+    "own Apple silicon driver into ~/.prism/chromedriver and uses that.\n"
     "  2. If it comes back, run this in Terminal and try once more:\n"
     "     rm -rf ~/Library/Application\\ Support/undetected_chromedriver\n"
     "  3. Still stuck? Settings → Export diagnostics and send the file."
 )
+
+_NO_ARM64_DRIVER_HELP = (
+    "Prism needs its Apple silicon browser driver on this Mac, and couldn't "
+    "fetch it.\n\n"
+    "  1. Check this Mac is online and press Start again. It is a one-time "
+    "download of about 10 MB from Google's Chrome for Testing site; after "
+    "that it is kept in ~/.prism/chromedriver.\n"
+    "  2. On a company network, ask IT to allow googlechromelabs.github.io "
+    "and storage.googleapis.com.\n"
+    "  3. Still stuck? Settings → Export diagnostics and send the file."
+)
+
+_MAC_QUIT_CHROME = (
+    "On a Mac, closing Chrome's windows leaves it running: quit it with ⌘Q "
+    "(Chrome menu → Quit Google Chrome), then try again.")
+
+
+def _is_apple_silicon() -> bool:
+    """Darwin on an arm64 process. False for the same Mac running an x86_64
+    Python under Rosetta -- there an Intel driver is the right one."""
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
+def _rosetta_installed() -> bool:
+    """Can this Apple silicon Mac run an Intel binary at all?
+
+    A new Mac ships without Rosetta; macOS offers to install it the first
+    time an Intel app is opened from the Finder, and never for a binary a
+    program executes -- that just fails with errno 86. Which is why every
+    Mac at Alphakore ran the Intel driver fine (Rosetta had been pulled in
+    by something else long ago) and the client's M2 did not. Two files that
+    exist once it is installed, then a real exec as the tie-breaker."""
+    if not _is_apple_silicon():
+        return False
+    for path in ("/Library/Apple/usr/share/rosetta/rosetta",
+                 "/Library/Apple/usr/libexec/oah/libRosettaRuntime"):
+        if os.path.exists(path):
+            return True
+    try:
+        return subprocess.run(["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+                              capture_output=True, timeout=10).returncode == 0
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def _refuse_intel_fallback(own_driver: str) -> None:
+    """Stop before launching a Chrome nothing will drive.
+
+    undetected-chromedriver 3.5.5 knows three driver builds -- win32,
+    linux64 and mac-x64 (patcher.py, _set_platform_name) -- so on ANY Mac
+    it downloads the Intel driver, and on Apple silicon without Rosetta
+    that is a certain errno 86. Letting it try anyway costs the customer a
+    Chrome window that opens and sits there, and a message about updating
+    Chrome. When Prism's own arm64 driver is not available, say the one
+    true thing instead: it needs to be fetched once, and this Mac is not
+    reaching the feed."""
+    if own_driver or not _is_apple_silicon() or _rosetta_installed():
+        return
+    raise RuntimeError("Prism couldn't start Chrome.\n\n" + _NO_ARM64_DRIVER_HELP)
 
 # ── Prism's own driver on Apple silicon ─────────────────────────────────────
 # undetected-chromedriver decides which chromedriver to fetch from
@@ -777,41 +847,123 @@ def _http_get(url: str, timeout: float = 60.0) -> bytes:
         return r.read()
 
 
-def _apple_silicon_driver(version_main=None) -> str:
-    """Path to an arm64 chromedriver for this Chrome, downloading it once
-    per Chrome major into ~/.prism/chromedriver/<major>/. "" anywhere but
-    Darwin/arm64, and "" (with a warning) when the download fails -- uc
-    then does what it always did."""
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
-        return ""
-    tag = str(int(version_main)) if version_main else "STABLE"
-    folder = os.path.join(_PRISM_DRIVER_DIR, tag)
-    path = os.path.join(folder, "chromedriver")
-    if os.path.isfile(path) and "arm64" in _macho_arches(path):
-        return path
+def _own_driver_path(tag: str) -> str:
+    return os.path.join(_PRISM_DRIVER_DIR, tag, "chromedriver")
+
+
+def _own_driver_ok(path: str) -> bool:
+    return os.path.isfile(path) and "arm64" in _macho_arches(path)
+
+
+def _fetch_arm64_driver(tag: str) -> str:
+    """Download the mac-arm64 chromedriver the Chrome-for-Testing feed names
+    for `tag` ("152" or "STABLE") into Prism's folder. Raises on any failure;
+    the caller decides what to try next."""
+    import io
+    import zipfile
+    path = _own_driver_path(tag)
+    version = _http_get(_CFT_LATEST.format(tag), timeout=30).decode().strip()
+    data = _http_get(_CFT_ZIP.format(version))
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        member = next(n for n in z.namelist()
+                      if n.endswith("/chromedriver") or n == "chromedriver")
+        blob = z.read(member)
+    if "arm64" not in _macho_arches_bytes(blob):
+        raise RuntimeError("the downloaded driver is not an arm64 build")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".part"
+    with open(tmp_path, "wb") as f:
+        f.write(blob)
+    os.chmod(tmp_path, 0o755)
+    os.replace(tmp_path, path)
+    ui.info(f"   ⬇️   fetched the Apple silicon chromedriver {version}")
+    return path
+
+
+def _cached_own_drivers() -> list[str]:
+    """Every arm64 driver already in Prism's folder, newest major first
+    (STABLE, having no number, sorts last)."""
     try:
-        import io
-        import zipfile
-        version = _http_get(_CFT_LATEST.format(tag), timeout=30).decode().strip()
-        data = _http_get(_CFT_ZIP.format(version))
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            member = next(n for n in z.namelist()
-                          if n.endswith("/chromedriver") or n == "chromedriver")
-            blob = z.read(member)
-        if "arm64" not in _macho_arches_bytes(blob):
-            raise RuntimeError("the downloaded driver is not an arm64 build")
-        os.makedirs(folder, exist_ok=True)
-        tmp_path = path + ".part"
-        with open(tmp_path, "wb") as f:
-            f.write(blob)
-        os.chmod(tmp_path, 0o755)
-        os.replace(tmp_path, path)
-        ui.info(f"   ⬇️   fetched the Apple silicon chromedriver {version}")
-        return path
-    except Exception as e:                                  # noqa: BLE001
-        ui.warn(f"   couldn't fetch the Apple silicon chromedriver ({e}); "
-                "letting undetected-chromedriver choose")
+        tags = os.listdir(_PRISM_DRIVER_DIR)
+    except OSError:
+        return []
+    found = [t for t in tags if _own_driver_ok(_own_driver_path(t))]
+    found.sort(key=lambda t: (not t.isdigit(), -int(t) if t.isdigit() else 0))
+    return [_own_driver_path(t) for t in found]
+
+
+def _apple_silicon_driver(version_main=None) -> str:
+    """Path to an arm64 chromedriver for this Chrome, downloaded once per
+    Chrome major into ~/.prism/chromedriver/<major>/. "" anywhere but
+    Darwin/arm64, and "" (with a warning) when nothing can be had.
+
+    In order: the exact major already on disk; the exact major from the
+    feed; STABLE on disk; STABLE from the feed; any arm64 driver already on
+    disk. The last three exist for the two days after a Chrome auto-update
+    when `LATEST_RELEASE_<new major>` is still a 404, and for a Mac that is
+    offline on a later run -- a driver one major behind usually still
+    drives the browser, and a wrong-version error names the real problem,
+    where a missing driver used to hand the launch to uc's Intel build."""
+    if not _is_apple_silicon():
         return ""
+    tags = ([str(int(version_main))] if version_main else []) + ["STABLE"]
+    errors = []
+    for tag in tags:
+        path = _own_driver_path(tag)
+        if _own_driver_ok(path):
+            return path
+        try:
+            return _fetch_arm64_driver(tag)
+        except Exception as e:                              # noqa: BLE001
+            errors.append(f"{tag}: {e}")
+    cached = _cached_own_drivers()
+    if cached:
+        ui.warn(f"   couldn't fetch the Apple silicon chromedriver ("
+                f"{'; '.join(errors)}); using the one already here: {cached[0]}")
+        return cached[0]
+    ui.warn(f"   couldn't fetch the Apple silicon chromedriver ({'; '.join(errors)})")
+    return ""
+
+
+def driver_report() -> list[str]:
+    """What support needs to know about the browser driver on this machine,
+    for Export diagnostics: the CPU, Rosetta, where Chrome is, every driver
+    file with the CPU it was built for, and whether a Chrome is sitting on
+    Prism's profile right now. Never raises."""
+    lines = [f"CPU               {platform.machine()} ({platform.system()})"]
+    if platform.system() == "Darwin":
+        lines.append(f"Apple silicon     {'yes' if _is_apple_silicon() else 'no'}")
+        if _is_apple_silicon():
+            lines.append(f"Rosetta           "
+                         f"{'installed' if _rosetta_installed() else 'not installed'}")
+    chrome = next((c for c in _CHROME_BINARIES if os.path.exists(c)), None)
+    version = detect_chrome_version() if chrome else None
+    lines.append(f"Chrome            {chrome or 'not found'}"
+                 + (f" (v{version})" if version else ""))
+    for label, folder in (("uc driver cache", _uc_cache_dir()),
+                          ("Prism drivers", _PRISM_DRIVER_DIR)):
+        lines.append(f"{label:<17} {folder}"
+                     + ("" if os.path.isdir(folder) else " (absent)"))
+        try:
+            for root, _dirs, files in os.walk(folder):
+                for name in files:
+                    if "chromedriver" not in name.lower():
+                        continue
+                    path = os.path.join(root, name)
+                    arch = "/".join(sorted(_macho_arches(path))) or "not Mach-O"
+                    try:
+                        size = os.path.getsize(path)
+                    except OSError:
+                        size = 0
+                    lines.append(f"  {os.path.relpath(path, folder):<28} "
+                                 f"{arch:<14} {size} bytes")
+        except OSError as e:
+            lines.append(f"  (couldn't list: {e})")
+    pids = _chrome_pids_using_profile()
+    lines.append("Chrome on profile "
+                 + ("couldn't check" if pids is None
+                    else ", ".join(map(str, pids)) if pids else "none"))
+    return lines
 
 
 def _is_bad_arch_error(e: BaseException) -> bool:
@@ -901,13 +1053,28 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                     ui.warn(f"   couldn't replace the cached driver ({drop}): {e}")
 
     # On Apple silicon the driver is Prism's own arm64 download; uc only
-    # patches it. Empty everywhere else, and when the download failed.
+    # patches it. Empty everywhere else -- and when the download failed,
+    # which on a Mac without Rosetta is a stop, not a fallback.
     own_driver = _apple_silicon_driver(version_main)
-    extra = {"driver_executable_path": own_driver} if own_driver else {}
+    _refuse_intel_fallback(own_driver)
+
+    # Prism's own finder knows about ~/Applications; uc's checks
+    # /Applications only. So a per-user Chrome install (no admin rights)
+    # opened Login tabs fine and then failed every run with "could not
+    # determine browser executable". Tell uc where the browser is.
+    chrome = next((c for c in _CHROME_BINARIES if os.path.exists(c)), None)
+
+    def _kwargs(driver_path):
+        kw = {}
+        if driver_path:
+            kw["driver_executable_path"] = driver_path
+        if chrome:
+            kw["browser_executable_path"] = chrome
+        return kw
 
     try:
         drv = uc.Chrome(options=_options(), user_data_dir=tmp,
-                        version_main=version_main, **extra)
+                        version_main=version_main, **_kwargs(own_driver))
         _reset_to_blank_tab(drv)
         return drv
     except Exception as e:
@@ -936,15 +1103,15 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                     os.remove(own_driver)
                 except OSError:
                     pass
-                own_driver = _apple_silicon_driver(version_main)
-                extra = {"driver_executable_path": own_driver} if own_driver else {}
+            own_driver = _apple_silicon_driver(version_main)
+            _refuse_intel_fallback(own_driver)
         elif version_main is not None:
             ui.warn(f"   couldn't start Chrome for v{version_main} — retrying "
                     "with whatever driver is current")
         try:
             drv = uc.Chrome(options=_options(), user_data_dir=tmp,
                             version_main=version_main if bad_arch else None,
-                            **extra)
+                            **_kwargs(own_driver))
             _reset_to_blank_tab(drv)
             return drv
         except Exception as retry_error:
@@ -978,7 +1145,9 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                    "reach it.\n\n"
                    "  1. Close every Chrome window — including any Prism "
                    "opened for signing in — and try again.\n"
-                   "  2. If it keeps happening, restart the computer; that "
+                   + (f"     {_MAC_QUIT_CHROME}\n"
+                      if platform.system() == "Darwin" else "")
+                   + "  2. If it keeps happening, restart the computer; that "
                    "clears it for certain.\n"
                    "  3. Some antivirus and 'endpoint protection' tools block "
                    "one program from starting another. If you have one, allow "

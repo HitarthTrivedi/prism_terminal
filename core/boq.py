@@ -879,17 +879,20 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
     context = f" Project context: {project_context}." if project_context.strip() else ""
     if has_template:
         structure = (
-            "A BOQ TEMPLATE is attached — use it as a reference for the "
-            "firm's general style: the kind of section/trade breakdown it "
-            "uses, its column set, its numbering and description tone, its "
-            "boilerplate (headers, notes, disclaimers). Take inspiration "
-            "from it, do not copy its literal rows/columns verbatim — adapt "
-            "the structure to what this drawing's measured data actually "
-            "contains. Use your judgement on the best section grouping and "
-            "presentation for this specific quantity set; the template is a "
-            "style guide, not a form to fill in cell-by-cell. Still: every "
-            "quantity you present must trace back to the measured data "
-            "below, and nothing measured should be silently dropped."
+            "A SAMPLE BOQ IS ATTACHED. It is the firm's own document and it "
+            "defines what you are making: read it first, and produce the "
+            "same kind of document — its sections and trade breakdown, its "
+            "column set, its numbering, the level of detail per line, how "
+            "descriptions are worded, its units, its boilerplate (headers, "
+            "notes, disclaimers). Where the sample makes a design decision "
+            "for a comparable item (a spacing, an allowance, a cable "
+            "specification, a containment size), use the same one here "
+            "and say the sample is the basis. Adapt the CONTENT to what "
+            "this drawing's measured data actually contains — do not copy "
+            "the sample's rows or quantities — but keep its shape and "
+            "conventions rather than inventing your own. Every quantity you "
+            "present must trace back to the measured data below, and "
+            "nothing measured should be silently dropped."
         )
     else:
         structure = (

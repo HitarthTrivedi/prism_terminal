@@ -49,6 +49,7 @@ KNOWN LIMITATIONS (disclosed, not hidden):
 from __future__ import annotations
 import csv
 import math
+import re
 import os
 import platform
 import shutil
@@ -533,6 +534,23 @@ def measure(dxf_path: str) -> dict:
     block_layers: dict[str, set] = {}
     seen_layers: set[str] = set()
     entity_count = 0
+    # For the site facts (_site_facts): where each block sits and at what
+    # scale, and each layer's extent, piece count and whether it closes.
+    block_pos: dict[str, list] = {}
+    block_scales: dict[str, list] = {}
+    layer_geom: dict[str, dict] = {}
+
+    def extend(layer: str, pts, closed: bool):
+        g = layer_geom.setdefault(layer, {"minx": 1e300, "miny": 1e300,
+                                          "maxx": -1e300, "maxy": -1e300,
+                                          "pieces": 0, "closed": 0})
+        for x, y in pts:
+            if x < g["minx"]: g["minx"] = x
+            if y < g["miny"]: g["miny"] = y
+            if x > g["maxx"]: g["maxx"] = x
+            if y > g["maxy"]: g["maxy"] = y
+        g["pieces"] += 1
+        g["closed"] += 1 if closed else 0
 
     def add(d: dict, key: str, value: float):
         if value:
@@ -546,11 +564,14 @@ def measure(dxf_path: str) -> dict:
         seen_layers.add(layer)
         try:
             if t == "LINE":
-                add(lengths, layer, _dist(
-                    (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)))
+                a, b = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
+                add(lengths, layer, _dist(a, b))
+                extend(layer, (a, b), False)
             elif t == "LWPOLYLINE":
                 add(lengths, layer, _lwpolyline_length(e))
                 add(areas, layer, _lwpolyline_area(e))
+                extend(layer, [(v[0], v[1]) for v in e.get_points("xy")],
+                       bool(e.closed))
             elif t == "POLYLINE":
                 add(lengths, layer, _legacy_polyline_length(e))
                 add(areas, layer, _legacy_polyline_area(e))
@@ -571,14 +592,24 @@ def measure(dxf_path: str) -> dict:
                     # pole; HP actually sits on "Hand Pump", HT on "High
                     # Tension Pole").
                     block_layers.setdefault(name, set()).add(layer)
+                    pos = block_pos.setdefault(name, [])
+                    if len(pos) < 500:
+                        pos.append((float(e.dxf.insert.x), float(e.dxf.insert.y)))
+                    block_scales.setdefault(name, []).append(float(e.dxf.xscale))
         except Exception:
             # One malformed entity (a stray null vertex, a degenerate arc)
             # must not sink the whole takeoff — skip it, keep going.
             continue
 
+    try:
+        site = _site_facts(unit_code, lengths, layer_geom, block_pos, block_scales)
+    except Exception as exc:                                # noqa: BLE001
+        site = {"error": str(exc)}          # facts are a bonus, never a blocker
+
     return {
         "unit": unit, "unit_code": unit_code, "unit_confirmed": unit_code != 0,
         "notes": read_notes,
+        "site": site,
         "lengths_by_layer": dict(sorted(lengths.items())),
         "areas_by_layer": dict(sorted(areas.items())),
         "block_counts": dict(sorted(blocks.items())),
@@ -591,6 +622,159 @@ def measure(dxf_path: str) -> dict:
         "layers": sorted(seen_layers),
         "entity_count": entity_count,
     }
+
+
+# ── what the coordinates say ─────────────────────────────────────────────────
+# Three things a person reading the drawing would settle in a minute, and
+# that a table of totals cannot: what unit the drawing is in when the file
+# does not say, whether two similar-looking layers are one feature or two,
+# and which structures are nowhere near the others. All three came up on
+# the same site survey on 2026-09-10 -- the unit was flagged "unconfirmed"
+# in every BOQ written from it, one estimator dropped half the perimeter as
+# a duplicate layer, and six of seven pump houses sat kilometres away on a
+# pipeline and were counted as if they were on the campus network. Every
+# one of those is answerable from entity coordinates, locally.
+
+_SIZE_IN_NAME = re.compile(r"(\d+(?:\.\d+)?)\s*(MM|M|MTR|CM|FT)\b", re.IGNORECASE)
+REMOTE_M = 1000.0            # a block this far from the rest is another site
+
+
+def _median(values):
+    vals = sorted(values)
+    return vals[len(vals) // 2] if vals else 0.0
+
+
+def _site_facts(unit_code: int, lengths: dict, layer_geom: dict,
+                block_pos: dict, block_scales: dict) -> dict:
+    """Unit inference, look-alike layers, and remote structures -- from the
+    coordinates. Pure arithmetic over what measure() already walked."""
+    import difflib
+    out: dict = {"unit_inferred": "", "unit_evidence": [], "lookalikes": [],
+                 "remote_blocks": [], "distances": {}, "extent": None}
+
+    points = [p for pts in block_pos.values() for p in pts]
+    if points:
+        med = _median([abs(x) for x, _ in points] + [abs(y) for _, y in points])
+        if 100_000 <= med <= 20_000_000:
+            out["unit_evidence"].append(
+                "coordinates sit on a projected survey grid (eastings and "
+                "northings in the hundreds of thousands), which is metres")
+    for name, scales in block_scales.items():
+        m = _SIZE_IN_NAME.search(name)
+        if not m or not scales:
+            continue
+        named = m.group(2).upper()
+        scale = _median(scales)
+        # "About 0.001", not exactly: a 7 m gate block drawn 6,125 mm wide
+        # is placed at 0.00114 to come out at 7 m -- the scale is the
+        # draughtsman's fit, the order of magnitude is the fact.
+        if named in ("M", "MTR") and 0.0005 <= scale <= 0.002:
+            out["unit_evidence"].append(
+                f"block {name} is inserted at scale {scale:.4g} — drawn in "
+                f"millimetres, placed in metres")
+        elif named in ("M", "MTR") and abs(scale - 1.0) < 1e-6:
+            out["unit_evidence"].append(
+                f"block {name} is inserted at scale 1 and is named in metres")
+        elif named == "MM" and abs(scale - 1.0) < 1e-6:
+            out["unit_evidence"].append(
+                f"block {name} is inserted at scale 1 and is named in "
+                f"millimetres — the drawing unit is millimetres")
+    if unit_code == 0 and out["unit_evidence"]:
+        says_mm = any("is millimetres" in ev for ev in out["unit_evidence"])
+        out["unit_inferred"] = "millimeters" if says_mm else "meters"
+
+    names = [n for n in lengths if n in layer_geom and layer_geom[n]["pieces"]]
+
+    def norm(n):
+        return re.sub(r"[^a-z0-9]", "", n.lower())
+
+    def box(g):
+        return (g["minx"], g["miny"], g["maxx"], g["maxy"])
+
+    def iou(a, b):
+        ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        inter = ix * iy
+        ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+        return inter / ua if ua > 0 else 0.0
+
+    # Only pairs a person would also pause on: names that read as the same
+    # word (a misspelt or re-spaced duplicate), or footprints that all but
+    # coincide. Overlap alone is not enough -- a road, its centre line and
+    # its drain share an extent and are three different things.
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            similar = difflib.SequenceMatcher(None, norm(a), norm(b)).ratio() >= 0.8
+            ga, gb = layer_geom[a], layer_geom[b]
+            overlap = iou(box(ga), box(gb))
+            if not similar and overlap < 0.9:
+                continue
+            ux = (min(ga["minx"], gb["minx"]), min(ga["miny"], gb["miny"]),
+                  max(ga["maxx"], gb["maxx"]), max(ga["maxy"], gb["maxy"]))
+            box_perim = 2 * ((ux[2] - ux[0]) + (ux[3] - ux[1]))
+            combined = lengths[a] + lengths[b]
+            closed = ga["closed"] + gb["closed"]
+            if closed == 0 and box_perim and 0.85 <= combined / box_perim <= 1.15:
+                verdict = ("together they form one closed run around the same "
+                           "footprint — one feature drawn on two layers; count "
+                           "both, once each")
+            elif overlap >= 0.8 and abs(lengths[a] - lengths[b]) <= 0.15 * max(lengths[a], lengths[b]):
+                verdict = ("same extent and near-identical length — probably "
+                           "the same feature drawn twice; count once")
+            elif similar:
+                verdict = ("overlapping extents — check which is current before "
+                           "counting either")
+            else:
+                continue            # merely co-located, not look-alike
+            out["lookalikes"].append({
+                "layers": [a, b], "lengths": [round(lengths[a], 2), round(lengths[b], 2)],
+                "combined": round(combined, 2), "box_perimeter": round(box_perim, 2),
+                "verdict": verdict})
+
+    if points:
+        cx, cy = _median([x for x, _ in points]), _median([y for _, y in points])
+        near = [p for p in points if math.hypot(p[0] - cx, p[1] - cy) <= REMOTE_M]
+        if near:
+            xs = [p[0] for p in near]; ys = [p[1] for p in near]
+            out["extent"] = {"width": round(max(xs) - min(xs), 1),
+                             "height": round(max(ys) - min(ys), 1)}
+        for name, pts in block_pos.items():
+            ds = sorted(round(math.hypot(x - cx, y - cy)) for x, y in pts)
+            out["distances"][name] = ds[:60]
+            far = [d for d in ds if d > REMOTE_M]
+            if far:
+                out["remote_blocks"].append({
+                    "name": name, "count": len(far), "of": len(ds),
+                    "distances_m": far[:10]})
+    return out
+
+
+def site_facts_text(q: dict) -> list[str]:
+    """The coordinate facts, as lines for the summary and the screen."""
+    site = q.get("site") or {}
+    if not site or site.get("error"):
+        return []
+    lines = []
+    if site.get("unit_inferred") and not q.get("unit_confirmed", True):
+        lines.append(f"UNIT INFERRED FROM THE COORDINATES: {site['unit_inferred'].upper()} — "
+                     + "; ".join(site["unit_evidence"]) + ". Treat the figures "
+                     "below as that unit unless the source drawing says otherwise.")
+    for lk in site.get("lookalikes") or []:
+        a, b = lk["layers"]
+        lines.append(f"LOOK-ALIKE LAYERS: '{a}' ({lk['lengths'][0]:.2f}) and '{b}' "
+                     f"({lk['lengths'][1]:.2f}) — {lk['verdict']} (combined "
+                     f"{lk['combined']:.2f}; their footprint's perimeter is "
+                     f"{lk['box_perimeter']:.2f}).")
+    ext = site.get("extent")
+    if ext:
+        lines.append(f"SITE EXTENT (main cluster of blocks): about {ext['width']:.0f} x "
+                     f"{ext['height']:.0f} drawing units.")
+    for rb in site.get("remote_blocks") or []:
+        lines.append(f"REMOTE: {rb['count']} of {rb['of']} '{rb['name']}' blocks sit "
+                     f"{', '.join(str(d) for d in rb['distances_m'])} units from the "
+                     f"main site — another location; do not put them on the site's "
+                     f"cable network without saying so.")
+    return lines
 
 
 def apply_known_unit(q: dict, unit_name: str) -> dict:
@@ -673,6 +857,7 @@ def summary_text(q: dict) -> str:
                 "below) before assuming the scope truly has zero quantity.")
     for note in q.get("notes") or []:
         lines.append(f"⚠ {note}")
+    lines += site_facts_text(q)
     lines.append("")
     if q["lengths_by_layer"]:
         lines.append("LENGTHS BY LAYER:")

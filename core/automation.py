@@ -19,6 +19,7 @@ import subprocess
 import platform
 import webbrowser
 from . import agents as A
+from . import config as C
 from . import ui
 
 def _chrome_binaries() -> list[str]:
@@ -1679,6 +1680,25 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
     last_change = start
     grown = False
     settled = False
+    # An answer that is EMPTY and FINISHED. ChatGPT sometimes puts up a new
+    # assistant turn with nothing in it -- the toolbar, no text, no stop
+    # button -- and this loop, watching for text to grow, waited the whole
+    # cap for text that was never coming (300s on the 2026-09-10 run). A
+    # tool that says which element means "still generating" (busy_selector)
+    # and which means "a reply" (turn_selector) lets the wait end as soon
+    # as a new turn has sat idle and empty for a while; the caller then
+    # regenerates once (_regenerate_once) or fails the stage NOW, so the
+    # fallback tool gets it minutes earlier.
+    busy_sel = agent_cfg.get("busy_selector", "")
+    turn_sel = agent_cfg.get("turn_selector", "")
+    turns0 = None
+    empty_since = None
+
+    def _count(css: str) -> int:
+        try:
+            return len(driver.find_elements(By.CSS_SELECTOR, css))
+        except Exception:
+            return 0
 
     def has_marker() -> bool:
         if not expect:
@@ -1704,6 +1724,8 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
             # First reading — whatever is already on the page (our own typed
             # prompt, old chat turns) doesn't count as generation.
             baseline = last_len = total
+            if turn_sel:
+                turns0 = _count(turn_sel)
             continue
         if total != last_len:
             grown = grown or total > baseline
@@ -1714,7 +1736,63 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
               and has_marker()):
             settled = True
             break
+        if (turn_sel and busy_sel and not grown
+                and time.time() - start >= EMPTY_TURN_AFTER):
+            # A reply turn exists, nothing is generating, and no text has
+            # arrived: an empty answer. Give it a moment to be a slow start
+            # rather than a blank, then stop waiting.
+            if _count(turn_sel) > (turns0 or 0) and not _count(busy_sel):
+                empty_since = empty_since or time.time()
+                if time.time() - empty_since >= EMPTY_TURN_PATIENCE:
+                    ui.warn("   the tool finished with an empty answer — "
+                            "not waiting out the cap")
+                    settled = True
+                    break
+            else:
+                empty_since = None
     return int(time.time() - start), settled
+
+
+# How long an empty, finished reply turn is given before it is called empty:
+# seconds into the wait before the check starts, and how long the turn has to
+# stay idle and blank. Short on purpose -- a genuine answer starts streaming
+# text within seconds of the turn appearing.
+EMPTY_TURN_AFTER = 20
+EMPTY_TURN_PATIENCE = 15
+
+
+def _regenerate_once(driver, agent_cfg: dict) -> bool:
+    """Press the tool's own "regenerate" on an empty answer, once.
+
+    An empty ChatGPT turn is usually a hiccup, not a refusal: the same
+    prompt regenerated a moment later answers normally. One press, then the
+    ordinary wait; if it is empty again the stage fails and the fallback
+    tool takes it. Best-effort: the control is hover-only in the DOM and is
+    clicked through the page rather than the mouse. Returns whether
+    anything was clicked."""
+    sel = agent_cfg.get("regenerate_selector", "")
+    turn_sel = agent_cfg.get("turn_selector", "")
+    if not sel:
+        return False
+    js = """
+        const sel = arguments[0], turnSel = arguments[1];
+        let scope = document;
+        if (turnSel) {
+            const turns = document.querySelectorAll(turnSel);
+            if (turns.length) scope = turns[turns.length - 1];
+        }
+        let btn = scope.querySelector(sel) || document.querySelector(sel);
+        if (!btn) return false;
+        btn.click();
+        return true;
+    """
+    try:
+        clicked = bool(driver.execute_script(js, sel, turn_sel))
+    except Exception:
+        clicked = False
+    if clicked:
+        ui.info("   🔁  empty answer — asked the tool to regenerate once")
+    return clicked
 
 
 def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
@@ -1739,15 +1817,27 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
     # [data-message-author-role='assistant'] — the harvester was looking in
     # the one place they are not, and reported that none had appeared while
     # three sat on screen.
+    # Three readings, not one count. ChatGPT renders an image PROGRESSIVELY:
+    # a blurred preview <img> appears within seconds and is then replaced,
+    # in place, by the finished picture a minute or two later. Counting
+    # images alone saw "1, still 1, still 1" and called it done at 20s —
+    # which is how a /step-auto sheet came back as a smear. So the signature
+    # (sizes and sources) has to sit still too, and while the page itself
+    # says it is still creating the image, nothing is done regardless.
     js = """
-        let n = 0;
+        let n = 0, px = 0, sig = '';
         for (const img of document.querySelectorAll('img')) {
-          if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256)
+          if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256) {
             n++;
+            px += img.naturalWidth * img.naturalHeight;
+            sig += (img.currentSrc || img.src || '').slice(-48) + ';';
+          }
         }
-        return n;
+        const busy = /creating image|generating image|rendering image|image is being (?:created|generated)|creating your image/i
+                       .test(document.body.innerText || '');
+        return [n, px + ':' + sig, busy];
     """
-    start, last, steady = time.time(), 0, 0
+    start, last, last_sig, steady = time.time(), 0, "", 0
     while time.time() - start < cap:
         # Four seconds a poll, and stop/skip checked every poll: this loop
         # never polled should_stop at all, and a stage stuck "rendering" an
@@ -1756,20 +1846,22 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
         if _sleep_interruptibly(4, should_stop):
             break
         try:
-            n = int(driver.execute_script(js, sel) or 0)
+            n, sig, busy = driver.execute_script(js, sel)
+            n = int(n or 0)
         except Exception:
             continue
         if n > last:
-            last, steady = n, 0
+            last, last_sig, steady = n, sig, 0
             ui.info(f"   🖼️   {n} image(s) so far…")
-            if n >= want:
-                steady = 0
+        elif last and sig != last_sig:
+            last_sig, steady = sig, 0      # a preview became the real thing
         elif last:
             steady += 4
-            # Two images that have been sitting there for 20s are all there is.
-            if steady >= 20:
+            # Images that have been sitting there unchanged for 20s — and
+            # the page is not saying it is still drawing — are all there is.
+            if steady >= 20 and not busy:
                 break
-        elif grace is not None and time.time() - start >= grace:
+        elif grace is not None and not busy and time.time() - start >= grace:
             break   # nothing ever appeared — not this turn's kind of reply
     return last
 
@@ -1864,6 +1956,46 @@ def _is_natural(agent_cfg: dict) -> bool:
     return (agent_cfg or {}).get("prompt_style") == "natural"
 
 
+def _is_maker(agent_cfg: dict) -> bool:
+    """A tool whose deliverable is a thing it builds, not text -- see
+    agents._MAKES."""
+    return bool((agent_cfg or {}).get("makes"))
+
+
+def _maker_brief(agent_name: str, agent_cfg: dict) -> str:
+    """The opening of a maker's stage prompt: what it is for, in plain words.
+
+    Written as a person would brief a designer, and put FIRST so it frames
+    everything after it. The one thing it must do is set aside any
+    text-shaped instruction further down: the stage prompt is written by
+    the router for a chat tool, and "deliver the deck in plain-text format,
+    do NOT generate files" reached Canva verbatim on 2026-09-10 -- so Canva
+    typed the outline back instead of building the deck. Saying so up
+    front, in the tool's own terms, is what stops that.
+    """
+    makes = (agent_cfg or {}).get("makes", "")
+    if not makes:
+        return ""
+    return (
+        f"You are {agent_name}, and what I need from you is {makes}. Build "
+        f"it here, in this tool — the thing itself is the deliverable of "
+        f"this step, and it is what gets collected from this page. Use the "
+        f"content below exactly as written: the headings, the order, the "
+        f"wording. If anything below asks for plain text, a text-format "
+        f"version, a description or an outline instead of the thing, or "
+        f"says not to create files — that was written for a chat tool and "
+        f"does not apply to you: build it. When it is built, say so in one "
+        f"line.\n\n"
+    )
+
+
+def _maker_handoff() -> str:
+    """The closing rule for a maker: nothing but the thing, and one line."""
+    return ("\n\nWhat you build is what is collected. Do not add a handoff "
+            "section, a summary, an explanation or a follow-up question — "
+            "build it, then one line saying it is done.")
+
+
 # How much of the user's own request travels into every stage prompt. Generous
 # on purpose: this is the one piece of text nothing else can reconstruct, and
 # truncating the sentence that says what the product DOES is exactly the
@@ -1921,6 +2053,32 @@ def _browser_is_gone(error: object) -> bool:
     return any(marker in str(error).lower() for marker in _BROWSER_GONE)
 
 
+# What a step is called to a person — the plan screen's words, so the chat a
+# step opens is titled the way the timeline names it.
+STEP_NAMES = {
+    "brains": "Think it through", "research": "Look things up",
+    "leads": "Find the people", "content": "Write it up",
+    "visual": "Make the images", "media": "Make the video",
+    "audio": "Record the voice", "development": "Build the tool",
+    "presentation": "Build the slides", "design": "Design the reel",
+    "artwork": "Make the artwork", "script": "Write the script",
+    "analysis": "Read the files", "summary": "Sum it up",
+    "motion_plan": "Plan the motion", "format": "Format it",
+}
+
+
+def _chat_header(title: str, stage: str) -> str:
+    """The first line of the first message a stage sends: `Prism · <job> ·
+    <step>`. ChatGPT and Claude name a conversation after its opening, and
+    every Prism chat used to open with "Your ONLY task is: Act as a senior
+    …" — so a customer's sidebar read "Senior Creative Director Task" forty
+    times, and nothing said which job or which step any of them was."""
+    step = STEP_NAMES.get(stage) or STEP_NAMES.get(stage.split(" ")[0]) \
+        or stage.replace("_", " ").capitalize()
+    title = (title or "").strip()
+    return f"Prism · {title} · {step}\n\n" if title else f"Prism · {step}\n\n"
+
+
 def _intent_block(query: str) -> str:
     """The user's own words, verbatim, at the top of every stage prompt.
 
@@ -1958,19 +2116,16 @@ def _intent_block(query: str) -> str:
         "---\n"
         f"{text}\n"
         "---\n"
-        "Everything below is Prism's engineered version of that request. It "
-        "is there to help you, but it is a SUMMARY and summaries lose things. "
-        "Where the two differ, or where the text below is vaguer about what "
-        "the thing actually does, the words above win. Specific facts above — "
-        "how a product works, what a button does, what must be avoided — must "
-        "survive into your answer even if the brief below does not repeat "
-        "them.\n\n"
+        "Below is Prism's engineered summary of that request. Summaries lose "
+        "things: where the two differ, the words above win, and every "
+        "specific fact above (how a product works, what a button does, what "
+        "to avoid) must survive into your answer.\n\n"
     )
 
 
 def _context_header(agent_cfg: dict, prev_stage: str) -> str:
     """The line that introduces the previous stage's output."""
-    if _is_natural(agent_cfg):
+    if _is_natural(agent_cfg) or _is_maker(agent_cfg):
         return ("Here's what I've got so far on this — use whatever is useful "
                 "and ignore the rest:\n\n")
     return (f"Context from the previous pipeline stage ({prev_stage.upper()}) — "
@@ -1979,7 +2134,7 @@ def _context_header(agent_cfg: dict, prev_stage: str) -> str:
 
 
 def _context_footer(agent_cfg: dict) -> str:
-    if _is_natural(agent_cfg):
+    if _is_natural(agent_cfg) or _is_maker(agent_cfg):
         return "\n\nWith that in mind:\n\n"
     return "\n\nNow continue the pipeline and complete the following:\n\n"
 
@@ -2422,6 +2577,195 @@ def _run_apollo(driver, agent_cfg: dict, stage: str, brief: str) -> list[str]:
     return rows
 
 
+def _click_control(driver, labels, timeout: int = 10) -> str:
+    """Click the CONTROL whose own text starts with one of `labels` -- a
+    button, a role=button, or a link -- choosing the smallest match.
+
+    _click_by_text matches any span or div that CONTAINS the words, which
+    on a page like Canva AI's is the whole chat pane: the first live run
+    "pressed Generate design" on a container div and nothing happened.
+
+    A real WebDriver click first (it scrolls into view and fires the
+    pointer events a React card listens for -- a JS .click() opened
+    nothing on Canva's "View outline" card, the second live run), and the
+    page's own click only if that is intercepted. Returns the label that
+    was clicked, or "".
+    """
+    js = """
+        const labels = arguments[0].map(l => l.toLowerCase());
+        const vis = el => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2; };
+        const els = Array.from(document.querySelectorAll("button, [role='button'], a"));
+        let best = null, bestLabel = "";
+        for (const el of els) {
+            if (!vis(el)) continue;
+            const t = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+            for (const l of labels) {
+                // First line of the control's text, so "View outline" with a
+                // chevron or a second line still matches -- and no literal
+                // newline inside this JS string (that is what silently broke
+                // the whole matcher on the fourth live run).
+                const first = t.split(String.fromCharCode(10))[0].trim();
+                const hit = first === l || t.startsWith(l + " ");
+                if (hit && (!best || t.length < (best.innerText || '').trim().length)) {
+                    best = el; bestLabel = l;
+                }
+            }
+        }
+        return best ? [best, bestLabel] : null;
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            hit = driver.execute_script(js, list(labels))
+        except Exception:
+            hit = None
+        if hit:
+            el, label = hit
+            try:
+                el.click()
+            except Exception:
+                try:
+                    driver.execute_script("arguments[0].click()", el)
+                except Exception:
+                    return ""
+            return label
+        time.sleep(1)
+    return ""
+
+
+def _run_canva(driver, agent_cfg: dict, stage: str, prompt: str,
+               should_stop=None) -> list[str]:
+    """Canva AI is a chat that answers a deck request in two moves.
+
+    Read off the live page with Playwright on 2026-09-10
+    (devtools/canva_probe.py's sibling probes), because the generic path
+    failed twice on the owner's run -- "the prompt would not go into
+    Canva's message box" on the old /magic-design/ marketing page, and,
+    once the box was found, no generate button was ever pressed:
+
+      1. https://www.canva.com/ai opens with a promo dialog over the page
+         (student discount, free trial) whose video swallows every click.
+         Escape closes it. The composer is the one textarea with an
+         aria-label ("Describe your idea, and I'll bring it to life"); the
+         send control is button[aria-label='Submit'].
+      2. The first reply is an OUTLINE, not a design -- "I'll draft a
+         concise outline, then you can turn it into the full presentation"
+         -- with a "View outline" card and, once that is open, a
+         "Generate design" button at the foot of the outline pane. Pressing
+         it is what builds the deck; the reply then carries a preview card
+         and "Your N-slide presentation ... has been created".
+
+    The thread URL is the link Prism keeps: the deck opens from its card
+    there, and the design also lands in the customer's Canva Projects.
+    Best-effort throughout, like the NotebookLM runner: every step fails
+    soft with a message rather than hanging the run, and stop/skip/
+    fallback are polled between the long waits.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    def halted() -> bool:
+        return bool(should_stop and should_stop())
+
+    try:
+        if "canva.com/ai" not in (driver.current_url or ""):
+            driver.get(agent_cfg.get("url") or "https://www.canva.com/ai")
+        time.sleep(agent_cfg.get("page_wait", 10))
+        # The promo dialog. Escape is what closed it on the live page; a
+        # close button is tried as well in case the dialog changes.
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        _click_control(driver, ["not now", "maybe later"], timeout=2)
+        time.sleep(1)
+
+        box = WebDriverWait(driver, agent_cfg.get("input_wait", 30)).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, agent_cfg["textarea_selector"])))
+        box.click()
+        if not _fast_type(driver, box, _bmp_safe(prompt)):
+            box.send_keys(_bmp_safe(prompt))
+        time.sleep(1)
+        if not _text_landed(_composer_text(driver, box), prompt):
+            return ["Canva AI: the prompt would not go into the message box "
+                    "— nothing was sent. Its tab is open if you want to "
+                    "paste it by hand."]
+        sent = False
+        try:
+            WebDriverWait(driver, 8).until(EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, agent_cfg.get("submit_selector", "")))).click()
+            sent = True
+        except Exception:
+            pass
+        if not sent:
+            box.send_keys(Keys.ENTER)
+        ui.info("   ✓  prompt sent to Canva AI — waiting for the outline")
+
+        # Move one: the outline. Canva thinks for a while before the card
+        # appears; poll for either button rather than sleeping a fixed time.
+        # Canva AI sometimes asks a question first -- a brand/style picker
+        # ("Choose an existing layout or select Style only", with Skip),
+        # seen on the third live run once it had a brand in memory. Skip is
+        # answered for it; the outline follows.
+        found = ""
+        deadline = time.time() + min(int(agent_cfg.get("wait_time", 400)), 300)
+        while time.time() < deadline and not halted():
+            found = _click_control(
+                driver, ["generate design", "view outline", "skip"], timeout=3)
+            if found == "skip":
+                ui.info("   ⏭  skipped a Canva question (brand/style picker)")
+                found = ""
+                time.sleep(3)
+                continue
+            if found:
+                break
+        if halted():
+            return []
+        if not found:
+            return ["Canva AI answered, but no outline or Generate design "
+                    "button appeared — check the open tab."]
+        if found == "view outline":
+            # The card answers a click only once the reply has settled; the
+            # fifth live run pressed it while "Updated memory" was still
+            # landing and the pane never opened. Press, look for the button,
+            # and press again for up to a minute.
+            pressed = False
+            until = time.time() + 60
+            while time.time() < until and not halted():
+                time.sleep(3)
+                if _click_control(driver, ["generate design"], timeout=4):
+                    pressed = True
+                    break
+                _click_control(driver, ["view outline"], timeout=2)
+            if not pressed:
+                return ["Canva AI drafted an outline but the Generate design "
+                        "button was not found — open the tab and press it by "
+                        "hand."]
+        ui.info("   🎨  pressed Generate design — waiting for the deck")
+        # The outline pane closes and the reply grows a preview card once
+        # the press took. If the button is still there after a moment, the
+        # click did not land -- press it once more before waiting.
+        time.sleep(4)
+        if _click_control(driver, ["generate design"], timeout=2):
+            ui.info("   🎨  pressed Generate design again")
+
+        # Move two: the deck. The reply grows a preview card and a closing
+        # message; watch the text settle the way every other tool's is.
+        _smart_wait(driver, agent_cfg, int(agent_cfg.get("wait_time", 400)),
+                    expect="", should_stop=should_stop)
+        texts = _capture(driver, agent_cfg)
+        # Left on the thread on purpose: that is where the card that opens
+        # the deck lives, and it is what the saved link points at.
+        return texts or ["Canva AI generated the design — open the tab to "
+                         "see it (the reply text could not be read)."]
+    except Exception as e:
+        return [f"Canva AI automation stopped early ({e}). Its tab is open — "
+                "the design may still be there."]
+
+
 def _run_notebooklm(driver, agent_cfg: dict, stage: str, prompt: str) -> list[str]:
     """NotebookLM is not a chat box — it's a 'sources' notebook. This drives
     its multi-step UI as best-effort automation:
@@ -2680,8 +3024,14 @@ def _clean_capture(text: str) -> str:
     return t.strip()
 
 
-def _capture(driver, agent_cfg: dict) -> list[str]:
+def _capture(driver, agent_cfg: dict, keep: str = "") -> list[str]:
     """Everything on the page that reads as a reply, longest captures only.
+
+    `keep` is a marker a caller is waiting for. A reply that carries it is
+    kept however short it is: the length floor below exists to drop
+    buttons and chips, and "CANVA LINK: none" is sixteen characters -- so
+    the one answer _make_editable most needs to see was the one this used
+    to throw away, and a disconnected Canva app read as a silent one.
 
     Falls back to the GENERIC selector when the hand-tuned one matches nothing.
     The tuned selectors are pinned to markup we do not own: these sites roll
@@ -2706,7 +3056,8 @@ def _capture(driver, agent_cfg: dict) -> list[str]:
             t = el.text.strip()
         except Exception:
             continue
-        if len(t) > 50 and t not in texts:
+        wanted = bool(keep) and keep.lower() in t.lower()
+        if (len(t) > 50 or wanted) and t not in texts:
             texts.append(t)
     # Response selectors often match a container AND pieces inside it
     # (sections, citation chips…). Keep only the fullest captures: drop any
@@ -2740,7 +3091,8 @@ _EDITABLE_STAGES = ("visual", "presentation")
 
 def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
                    responses: list,
-                   machine_shaped: bool = False) -> tuple[list, str]:
+                   machine_shaped: bool = False,
+                   made_image: bool = False) -> tuple[list, str]:
     """Hand the image just generated to Canva, in the same conversation.
 
     Two prompts, not one. The first asked for the best picture the tool can
@@ -2769,10 +3121,18 @@ def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
         return responses, ""
     if not A.wants_canva(query):
         return responses, ""
-    if not responses:
+    if not responses and not made_image:
         # Nothing was made, so there is nothing to convert. Asking anyway
         # would have Canva invent a design from the prompt alone, which is
         # exactly the template-instead-of-artwork failure this avoids.
+        #
+        # `made_image` is the half this check used to miss. ChatGPT answers
+        # an image request with the picture and NO prose -- the assistant
+        # turn holds an <img> and an "Edit" button -- so the text capture
+        # is empty even though the artwork is right there. Seen on the
+        # 2026-09-09 Playwright run: the picture rendered, the Canva step
+        # was skipped as "nothing to make editable", and the customer who
+        # had asked for something editable got a flat PNG.
         ui.warn("   nothing to make editable — skipping the Canva step")
         return responses, ""
 
@@ -2830,10 +3190,172 @@ def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
             box.send_keys(Keys.ENTER)
         _smart_wait(driver, agent_cfg,
                     wait or agent_cfg.get("wait_time", 60), expect=expect)
-        return _capture(driver, agent_cfg)
+        return _capture(driver, agent_cfg, keep=expect)
     except Exception as e:
         ui.err(f"   follow-up failed: {e}")
         return []
+
+
+# How long a follow-up may wait for a tool, at least. A follow-up redoes a
+# whole deliverable — a document, a set of scenes — and the tool's everyday
+# budget (ChatGPT's is 300s) was cutting those off mid-way. A ceiling, not a
+# duration: the wait ends the moment the answer settles.
+FOLLOWUP_MIN_WAIT = 480
+
+
+def followup_wait(agent_cfg: dict) -> int:
+    """The wait ceiling for a follow-up turn on this tool."""
+    return max(int(agent_cfg.get("wait_time", 60) or 60), FOLLOWUP_MIN_WAIT)
+
+
+def _adopt_assets(spec: dict, files, generated=None) -> str:
+    """Add pictures to a filmed reel's artwork under new names — `new1`,
+    `new2`… — so nothing already placed is renamed underneath it. Returns
+    the manifest of what was added, for the design chat."""
+    from . import assets as _assets
+    try:
+        table = _assets.collect(files, generated=generated)
+    except Exception as e:                               # noqa: BLE001
+        ui.warn(f"   couldn't prepare the new artwork ({e})")
+        return ""
+    if not table:
+        return ""
+    have = spec.setdefault("_assets", {})
+    fresh, n = {}, 1
+    for entry in table.values():
+        while f"new{n}" in have:
+            n += 1
+        have[f"new{n}"] = {**entry, "kind": "art"}
+        fresh[f"new{n}"] = have[f"new{n}"]
+        n += 1
+    ui.ok(f"✂️   {len(fresh)} new asset(s): " + ", ".join(fresh))
+    return _assets.manifest(fresh)
+
+
+def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
+                    change: str, attachments=None, on_event=None,
+                    on_progress=None, images: str = "",
+                    context: str = "", task: str = "",
+                    title: str = "") -> tuple[str, str, str]:
+    """A change to a filmed Studio reel, made where the reel was designed.
+
+    Reopens the design conversation (its URL was saved with the run), asks
+    for only the scenes that change, and re-films locally. Returns (mp4,
+    spec path, note). The previous cut is left where it was; the new one
+    gets its own stamp beside it, so History keeps both.
+
+    A follow-up can need more than the design chat. `images` is a picture
+    the owner asked for — made first, in the image tool, and adopted as
+    `asset:new…` so the design chat can place it. `context` is what an
+    earlier step of the same follow-up produced (a rewritten script), so
+    the design chat changes the scenes it affects rather than guessing.
+
+    Before this, a follow-up on a reel went through the same classifier as
+    any other task and landed on the local renderer — a stage with a file
+    for a link and no chat to resume — or on the writer, in a fresh tab that
+    had never seen the design. Neither could change a scene.
+    """
+    import copy
+    import json as _json
+    import time as _time
+    from . import reel_web as _web, config as C
+
+    def emit(kind, payload):
+        if on_event:
+            on_event(kind, payload)
+
+    agent_cfg = (A.resolve_agent("design", agent_name)
+                 or A.resolve_agent("brains", agent_name))
+    if not agent_cfg:
+        raise RuntimeError(f"{agent_name} isn't in Prism's tool registry, so "
+                           "the design conversation can't be reopened.")
+    spec = copy.deepcopy(spec)
+    C.begin_run(task or change,             # this follow-up's own folder
+                title=title or C.fallback_title(task or change))
+    listing = ""
+    if attachments:
+        listing = _adopt_assets(spec, attachments)
+
+    driver = None
+    if images.strip():
+        # The picture first, in the tool that can draw — a fresh tab, since
+        # this is a new job, not a continuation. Harvested off the page the
+        # way the imagery stage's are, then adopted into the reel's artwork.
+        maker = (cfg.get("agents") or {}).get("visual") or "ChatGPT"
+        maker_cfg = A.resolve_agent("visual", maker)
+        if not maker_cfg:
+            ui.warn(f"   {maker} can't make pictures here — going on without")
+        else:
+            emit("stage_start", {"stage": "artwork", "agent": maker})
+            ui.rule(f"ARTWORK  ·  {maker}  ·  follow-up",
+                    style=A.CATEGORIES.get("visual", {}).get("color", "pink"))
+            driver, _ = _get_driver(cfg)
+            _open_tab(driver, maker)
+            driver.get(maker_cfg["url"])
+            _time.sleep(maker_cfg.get("page_wait", 4))
+            emit("waiting", {"stage": "artwork", "seconds": 300})
+            _reask(driver, maker_cfg,
+                   _web.followup_imagery_instructions(images, spec),
+                   wait=90)
+            ui.info("   ⏳  waiting for the picture(s) to finish rendering…")
+            _wait_for_images(driver, maker_cfg, 1, cap=300)
+            files = _harvest_images(driver, maker_cfg, "artwork")
+            made = [f["path"] for f in files if f.get("path")]
+            if made:
+                listing = (listing + "\n" if listing else "") + \
+                    _adopt_assets(spec, made, generated=set(made))
+            else:
+                ui.warn("   no picture came back — the design chat will be "
+                        "told nothing new was made")
+            try:
+                url = driver.current_url
+            except Exception:                            # noqa: BLE001
+                url = maker_cfg["url"]
+            emit("stage_done", {"stage": "artwork", "count": len(made),
+                                "texts": [f"{len(made)} picture(s) made"]
+                                if made else [],
+                                "url": url, "timed_out": False})
+
+    emit("stage_start", {"stage": "design", "agent": agent_name})
+    ui.rule(f"DESIGN  ·  {agent_name}  ·  follow-up",
+            style=A.CATEGORIES.get("design", {}).get("color", "pink"))
+    if driver is None:
+        driver, _ = _get_driver(cfg)
+    _open_tab(driver, agent_name)
+    driver.get(design_url)
+    _time.sleep(agent_cfg.get("page_wait", 4))
+    wait = followup_wait(agent_cfg)
+
+    def ask(prompt, expect=_web.SCENE_EXPECT):
+        emit("waiting", {"stage": "design", "seconds": wait})
+        got = _reask(driver, agent_cfg, prompt, expect=expect, wait=wait)
+        return got[-1] if got else ""
+
+    new_spec, notes = _web.refine_spec(
+        spec, change, ask, check=_web.inspect,
+        log=lambda m: ui.info(f"   {m}"), new_assets=listing,
+        context=context)
+    try:
+        url = driver.current_url or design_url
+    except Exception:                                    # noqa: BLE001
+        url = design_url
+    ui.ok("   " + "; ".join(notes))
+    emit("stage_done", {"stage": "design", "count": 1, "texts": notes,
+                        "url": url, "timed_out": False})
+
+    emit("stage_start", {"stage": "media", "agent": "Prism Studio"})
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    stamp = int(_time.time())
+    out = os.path.join(C.RUNS_DIR, f"reel_{stamp}.mp4")
+    spec_path = os.path.join(C.RUNS_DIR, f"reel_{stamp}.json")
+    with open(spec_path, "w", encoding="utf-8") as f:
+        _json.dump(new_spec, f, indent=2)
+    ui.info(f"   🎬  re-filming {len(new_spec['scenes'])} scenes…")
+    _web.render(new_spec, out, on_progress=on_progress, check=False)
+    note = f"reel re-filmed — {os.path.basename(out)} ({'; '.join(notes)})"
+    emit("stage_done", {"stage": "media", "count": 1, "texts": [note],
+                        "url": out, "timed_out": False})
+    return out, spec_path, note
 
 
 def _web_token() -> str:
@@ -2841,8 +3363,15 @@ def _web_token() -> str:
     return reel_web.ASSET_TOKEN
 
 
-def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None):
+def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
+                studio: dict | None = None):
     """Film the page the art-direction stage wrote.
+
+    `studio` is the conversation the design came from — {"design_url",
+    "agent"} — saved into the spec as `_studio` so Studio's Refine box can
+    reopen that exact chat later. ReelDialog writes the same key for its own
+    reels; without it here, every reel made by the router opened in Studio
+    with Refine dead ("This older reel has no saved Studio conversation").
 
     The design is not trusted, it is measured: the page is laid out in the
     browser and every piece of text checked for being inside the frame and
@@ -2891,6 +3420,28 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None):
         if sampled:
             spec["brand"] = sampled
 
+    # The design pass may have inspected the attached references and marked a
+    # file as limited/unusable. Keep that decision visible in the run log and
+    # in the saved spec; never silently substitute an invented asset name.
+    flags = spec.get("asset_flags")
+    if isinstance(flags, list):
+        clean_flags = []
+        for flag in flags[:32]:
+            if not isinstance(flag, dict):
+                continue
+            name = str(flag.get("asset", flag.get("name", ""))).strip()[:32]
+            state = str(flag.get("status", "limited")).strip().lower()
+            reason = str(flag.get("reason", "")).strip()[:240]
+            if name and state in ("limited", "unusable"):
+                clean_flags.append({"asset": name, "status": state,
+                                    "reason": reason})
+                ui.warn(f"   ⚑  {name} flagged {state}"
+                        + (f" — {reason}" if reason else ""))
+        if clean_flags:
+            spec["asset_flags"] = clean_flags
+        else:
+            spec.pop("asset_flags", None)
+
     # Rebuilt, not passed along: collect() names assets from the files in a
     # fixed order, so the table the design stage was shown and the table the
     # renderer resolves are the same one without either holding a reference.
@@ -2911,6 +3462,9 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None):
     os.makedirs(C.RUNS_DIR, exist_ok=True)
     stamp = int(_time.time())
     out = os.path.join(C.RUNS_DIR, f"reel_{stamp}.mp4")
+    if studio and studio.get("design_url"):
+        spec["_studio"] = {"design_url": str(studio.get("design_url", "")),
+                           "agent": str(studio.get("agent", ""))}
     _json.dump(spec, open(os.path.join(C.RUNS_DIR, f"reel_{stamp}.json"), "w"),
                indent=2)
 
@@ -2986,8 +3540,23 @@ def _run_motion(prior_text, attachments, cfg: dict, brand: dict | None = None):
     return out, f"motion graphic rendered — {os.path.basename(out)}"
 
 
+def _studio_conversation(stages, stage: str, all_links: dict) -> dict:
+    """The chat a local renderer's spec came from: the nearest earlier stage
+    that left a real URL behind. That is the conversation Studio's Refine
+    box reopens, so it is stored with the reel (see _run_studio)."""
+    names = [s[0] for s in stages]
+    if stage not in names:
+        return {}
+    for earlier in reversed(names[:names.index(stage)]):
+        url = str(all_links.get(earlier) or "")
+        if url.startswith("http"):
+            agent = next((s[1] for s in stages if s[0] == earlier), "")
+            return {"design_url": url, "agent": agent}
+    return {}
+
+
 def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
-               brand: dict | None = None):
+               brand: dict | None = None, studio: dict | None = None):
     """Execute an agent that lives in Prism rather than in a browser.
 
     prior_text is either a single string or the earlier stages' outputs,
@@ -2999,7 +3568,7 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
     way a scraped one does, never take the run down with it.
     """
     if kind == "reel_web":
-        return _run_studio(prior_text, attachments, cfg, brand)
+        return _run_studio(prior_text, attachments, cfg, brand, studio=studio)
     if kind == "motion":
         return _run_motion(prior_text, attachments, cfg, brand)
     if kind != "reel":
@@ -3044,6 +3613,9 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
     os.makedirs(C.RUNS_DIR, exist_ok=True)
     stamp = int(_time.time())
     out = os.path.join(C.RUNS_DIR, f"reel_{stamp}.mp4")
+    if studio and studio.get("design_url"):
+        spec["_studio"] = {"design_url": str(studio.get("design_url", "")),
+                           "agent": str(studio.get("agent", ""))}
     _json.dump(spec, open(os.path.join(C.RUNS_DIR, f"reel_{stamp}.json"), "w"),
                indent=2)
     secs = sum(float(sc.get("seconds", 4)) for sc in spec["scenes"])
@@ -3065,8 +3637,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         should_stop=None, failover: bool = True,
         reel_design_stage: str = "", pipeline_files_out: list | None = None,
         motion_design_stage: str = "", resume_urls: dict | None = None,
-        skip_signal=None):
+        skip_signal=None, skip_stages: list | None = None,
+        min_wait: int = 0, image_stages=None, fallback_signal=None):
     """Execute the pipeline. Returns (responses, links).
+
+    fallback_signal: a threading.Event the screen sets for "Use fallback" —
+                 stop waiting for the tool on the stage that is running and
+                 hand that stage to the next tool in its category NOW, the
+                 way the failover pass would after the cap ran out. For the
+                 person who can see the tool has errored and does not want
+                 to sit out a 600-second wait for Prism to notice. Cleared by
+                 the engine per press, like skip_signal.
+
+    image_stages: stage keys the caller PROMISES will produce a picture —
+                 /step-auto's "visual" stage, the STEP dialog's Draft. Such a
+                 stage gets the full image budget (minutes, like Reel's
+                 artwork) instead of the short look a generic visual turn
+                 gets, because on those a picture is possible, not certain.
 
     attachments: list of records from core.files.attach() — uploaded to each
                  tool and their extracted text prepended to the first prompt.
@@ -3269,7 +3856,20 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # few images, which are harvested off the page like any other
             # generated asset. Skipped only if the user turned it off.
             maker = agents.get("visual") or "ChatGPT"
-            if cfg.get("reel_imagery", True) and A.resolve_agent("visual", maker):
+            # `skip_stages` is what the plan screen left out. This stage is
+            # inserted here, not planned there, so unticking "Make the
+            # images" removed a row and changed nothing — the run still
+            # opened the image tool and made three pictures (2026-09-07).
+            # A step the owner switched off stays off.
+            left_out = "visual" in (skip_stages or ())
+            if left_out:
+                ui.info("🖼️   Make the images was left out of the plan — no "
+                        "pictures will be generated; the reel is built from "
+                        "type and colour"
+                        + (" and the artwork attached" if asset_list else "")
+                        + ".")
+            if (not left_out and cfg.get("reel_imagery", True)
+                    and A.resolve_agent("visual", maker)):
                 stages.insert(studio_at, ("artwork", maker, [
                     _web.imagery_instructions(query, bool(asset_list),
                                               attached=client_pics)]))
@@ -3417,6 +4017,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         ui.warn("Stopped before anything ran.")
         return {}, {}
 
+    # One artifact folder per run — a "Use again" of the same words, or a
+    # follow-up, is a new run and gets a new folder — named by the job's
+    # title, which the planner wrote (or the request's first words when it
+    # did not). See config.begin_run.
+    run_title = ((routing or {}).get("_title") or C.fallback_title(query))
+    C.begin_run(query, title=run_title)
     driver, fresh = _get_driver(cfg)
     all_responses: dict[str, list[str]] = {}
     all_links: dict[str, str] = {}
@@ -3437,10 +4043,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     def skip_requested() -> bool:
         return bool(skip_signal is not None and skip_signal.is_set())
 
+    def fallback_requested() -> bool:
+        return bool(fallback_signal is not None and fallback_signal.is_set())
+
     def stage_halt() -> bool:
-        # What the per-stage waits poll: a full Stop, or a skip of the stage
-        # that is waiting right now.
-        return stopped() or skip_requested()
+        # What the per-stage waits poll: a full Stop, a skip of the stage
+        # that is waiting right now, or "use fallback" on it.
+        return stopped() or skip_requested() or fallback_requested()
 
     # Stages that produced nothing, and why. Read by the failover pass after
     # the loop; see _retry_failed_stages().
@@ -3454,6 +4063,89 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # a partial answer done.
     incomplete: dict[str, dict] = {}
 
+    # Local renderers (Prism Reel / Studio / Motion) held back because a
+    # stage BEFORE them produced nothing and is queued for the failover
+    # pass. Run after that pass — see the local branch in the loop below.
+    deferred_locals: list[tuple[str, str, dict]] = []
+
+    def _run_local_stage(stage: str, agent_name: str, agent_cfg: dict) -> None:
+        """One local renderer stage, start to finish: a Python call inside
+        Prism — no tab, no upload, no scrape. Consumes the earlier stages'
+        text and files, produces a real file here, and reports like any
+        other stage. Shared by the main loop and the deferred pass."""
+        emit("stage_start", {"stage": stage, "agent": agent_name})
+        ui.rule(f"{stage.upper()}  ·  {agent_name}",
+                style=A.CATEGORIES.get(stage, {}).get("color", "pink"))
+        # Newest stage first, each kept separate: the spec comes from the
+        # stage right before this one, and merging every stage into one
+        # blob only gives the parser more prose to trip over.
+        prior_text = [t for ts in reversed(list(all_responses.values()))
+                      for t in ts if t.strip()]
+        # Images an earlier stage GENERATED count as artwork too — that is
+        # the whole point of harvesting them. The client's own files come
+        # first so their real mark wins the 'logo' slot over anything a
+        # model drew.
+        out, note = _run_local(agent_cfg["local"], prior_text,
+                               (attachments or []) + pipeline_files,
+                               cfg, stage, brand=studio_brand,
+                               studio=_studio_conversation(
+                                   stages, stage, all_links))
+        if out:
+            # Keep the internal reel_<timestamp> working name, but make
+            # the customer-facing artifact describe the original request.
+            try:
+                from . import config as _config
+                saved = _config.save_artifact(out, query, kind="reel",
+                                             task=query)
+                ui.info(f"   💾  saved to {saved}")
+            except Exception:                           # noqa: BLE001
+                pass       # rendering succeeded; copying is best-effort
+            all_responses[stage] = [note]
+            all_links[stage] = out
+            ui.ok(note)
+            ui.info(f"   📁  {out}")
+            emit("stage_done", {"stage": stage, "count": 1, "texts": [note],
+                                "url": out, "timed_out": False})
+        else:
+            ui.err(note)
+            emit("stage_error", {"stage": stage, "error": note, "url": ""})
+
+    def _hand_to_fallback(stage: str, agent_name: str, questions: list) -> None:
+        """"Use fallback", pressed while `agent_name` was being waited on.
+
+        The failover pass already knows how to give a stage to the next tool
+        in its category; it just runs after the loop, once the cap has run
+        out. This is the same pass, for this one stage, right now -- so the
+        stages after it get its answer instead of running on thinner context.
+        What the tool had on the page is deliberately not kept: the person
+        pressed the button because they could see it was not going to answer.
+        """
+        fallback_signal.clear()
+        ui.warn(f"   ↪  {stage}: handed to the fallback at your request — "
+                f"not waiting for {agent_name}")
+        try:
+            all_links[stage] = driver.current_url
+        except Exception:                                   # noqa: BLE001
+            pass
+        info = {"agent": agent_name, "questions": questions,
+                "reason": f"You handed this step to the fallback instead of "
+                          f"waiting for {agent_name}.",
+                "exhausted": False}
+        if not failover:
+            # A nested retry run never fails over again (one level only, see
+            # _retry_failed_stages). Report it and let the outer pass decide.
+            failures[stage] = info
+            emit("stage_error", {"stage": stage, "error": info["reason"],
+                                 "url": all_links.get(stage, "")})
+            return
+        _retry_failed_stages(
+            {stage: info}, cfg, all_responses, all_links,
+            attachments=attachments, query=query, emit=emit,
+            should_stop=should_stop, stages=None,
+            pipeline_files=pipeline_files, brand=studio_brand,
+            skip_signal=skip_signal, image_stages=image_stages,
+            fallback_signal=fallback_signal)
+
     for stage_idx, (stage, agent_name, questions) in enumerate(stages):
         if stopped():
             ui.warn("Stopped at your request — keeping everything finished so far.")
@@ -3463,6 +4155,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # A skip pressed in the dying moments of the previous stage must
             # not eat this one.
             skip_signal.clear()
+        if fallback_requested():
+            fallback_signal.clear()          # same rule for "use fallback"
 
         agent_cfg = A.resolve_agent(stage, agent_name)
         if not agent_cfg:
@@ -3477,44 +4171,51 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                           "it in the plan."})
             continue
 
-        emit("stage_start", {"stage": stage, "agent": agent_name})
-        ui.rule(f"{stage.upper()}  ·  {agent_name}", style=A.CATEGORIES.get(stage, {}).get("color", "pink"))
+        # A browser stage with no prompt is the run that uploads the files,
+        # asks nothing, and waits the whole cap for an answer to a question
+        # nobody put — 322 seconds on the 2026-09-07 reel run, and the next
+        # stage was doing the same when the owner pressed Stop.
+        #
+        # Only `custom_stages` can bring one here: _needed_stages() drops a
+        # stage with no questions, but the GUI's plan editor hands its
+        # ticked rows over as they are, and a row the router never planned
+        # has no prompt behind it. The "never received the prompt" guard
+        # further down cannot catch it either — it is set inside the
+        # per-prompt loop, which has nothing to loop over. Skipped, not
+        # failed: a failure is retried on another tool, and there is nothing
+        # to send that tool. Local renderers are exempt — they read the
+        # previous stage's output, not a prompt.
+        if not agent_cfg.get("local") and not any(
+                q and str(q).strip() for q in questions):
+            reason = (f"{stage} has no prompt behind it, so there is nothing "
+                      f"to ask {agent_name}. Open Prompt on that step and "
+                      "write one, or leave the step out.")
+            ui.warn(f"   {reason}")
+            emit("stage_skipped", {"stage": stage, "agent": agent_name,
+                                   "reason": reason})
+            continue
 
         # A LOCAL agent runs inside Prism — no tab, no upload, no scrape. It
-        # consumes the previous stage's text and produces a real file here.
+        # consumes the previous stages' text and files and produces a real
+        # file here. If a stage before it produced NOTHING and failover is
+        # about to retry that stage with another tool, rendering now would
+        # build the video without the images it is waiting on and show the
+        # customer "Make the video — FAILED" while "Make the images" is still
+        # being retried underneath it. So it is held back and run after the
+        # retry pass, with whatever that pass recovered. (Its card stays
+        # queued meanwhile: no stage_start is emitted until it really runs.)
         if agent_cfg.get("local"):
-            # Newest stage first, each kept separate: the spec comes from the
-            # stage right before this one, and merging every stage into one
-            # blob only gives the parser more prose to trip over.
-            prior_text = [t for ts in reversed(list(all_responses.values()))
-                          for t in ts if t.strip()]
-            # Images an earlier stage GENERATED count as artwork too — that is
-            # the whole point of harvesting them. The client's own files come
-            # first so their real mark wins the 'logo' slot over anything a
-            # model drew.
-            out, note = _run_local(agent_cfg["local"], prior_text,
-                                   (attachments or []) + pipeline_files,
-                                   cfg, stage, brand=studio_brand)
-            if out:
-                # Keep the internal reel_<timestamp> working name, but make
-                # the customer-facing artifact describe the original request.
-                try:
-                    from . import config as _config
-                    saved = _config.save_artifact(out, query, kind="reel",
-                                                 task=query)
-                    ui.info(f"   💾  saved to {saved}")
-                except Exception:                       # noqa: BLE001
-                    pass       # rendering succeeded; copying is best-effort
-                all_responses[stage] = [note]
-                all_links[stage] = out
-                ui.ok(note)
-                ui.info(f"   📁  {out}")
-                emit("stage_done", {"stage": stage, "count": 1, "texts": [note],
-                                    "url": out, "timed_out": False})
-            else:
-                ui.err(note)
-                emit("stage_error", {"stage": stage, "error": note, "url": ""})
+            if failover and failures:
+                deferred_locals.append((stage, agent_name, agent_cfg))
+                ui.warn(f"   ⏸  {stage}: holding until "
+                        f"{', '.join(failures)} has been retried — it feeds "
+                        "this step")
+                continue
+            _run_local_stage(stage, agent_name, agent_cfg)
             continue
+
+        emit("stage_start", {"stage": stage, "agent": agent_name})
+        ui.rule(f"{stage.upper()}  ·  {agent_name}", style=A.CATEGORIES.get(stage, {}).get("color", "pink"))
 
         timed_out = False
         try:
@@ -3647,23 +4348,28 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 handoff = A.AGENT_REGISTRY[stages[stage_idx + 1][1]]["handoff_spec"]
             elif stage_idx + 1 < len(stages):
                 nxt_stage, nxt_agent, _ = stages[stage_idx + 1]
+                # Said the way a senior colleague briefs another: what this
+                # answer is for, who reads it next, and the one thing that
+                # has to be there. The old numbered "STRICT PIPELINE RULES"
+                # read as a rule sheet, and a rule sheet is what a chat model
+                # answers thinly or not at all.
                 rules = [
-                    "Perform ONLY the task above — nothing more. Do not build, "
-                    "design or produce anything that was not explicitly asked of you.",
+                    "Do the task above and only that — nothing extra built, "
+                    "designed or produced that was not asked for.",
                 ]
                 if prior:
                     rules.append(
-                        "First analyse the context above from the previous stage and "
-                        "extract its most important findings in a short, precise form — "
-                        "they must survive into your handoff."
+                        "Read the context above first and pull out what "
+                        "matters from it, briefly and exactly — those points "
+                        "have to survive into your handoff."
                     )
                 rules.append(
-                    f"Your output will be passed directly to {nxt_agent} (the "
-                    f"'{nxt_stage}' stage of this pipeline), and {nxt_agent} will see "
-                    f"ONLY your answer — nothing from earlier stages. End with a "
-                    f"section titled 'HANDOFF FOR {nxt_agent.upper()}' containing a "
-                    f"short, precise summary of every key finding, decision and "
-                    f"constraint so far (earlier stages' AND your own) that "
+                    f"This is not for a person yet: it goes straight to "
+                    f"{nxt_agent} for the '{nxt_stage}' step, and {nxt_agent} "
+                    f"sees only your answer, nothing from before. So end with a "
+                    f"section titled 'HANDOFF FOR {nxt_agent.upper()}' — a "
+                    f"short, exact summary of every fact, decision and "
+                    f"constraint so far (earlier steps' and your own) that "
                     f"{nxt_agent} needs to do its job."
                 )
                 rules.append(
@@ -3674,17 +4380,24 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 handoff = (
                     _natural_handoff(nxt_agent, final=False)
                     if _is_natural(agent_cfg) else
-                    "\n\nSTRICT PIPELINE RULES:\n" + "\n".join(
+                    "\n\nHOW THIS FITS IN:\n" + "\n".join(
                         f"{i}. {r}" for i, r in enumerate(rules, 1)))
             else:
                 handoff = _natural_handoff("", final=True) if _is_natural(agent_cfg) else (
-                    "\n\nSTRICT PIPELINE RULES:\n"
-                    "You are the FINAL stage. The context above is your complete "
-                    "brief — everything important from earlier stages is already "
-                    "distilled into it. Perform ONLY the task above and deliver the "
-                    "polished final result. Do not add any handoff or summary "
-                    "section, and do not ask any follow-up questions."
+                    "\n\nHOW THIS FITS IN:\n"
+                    "You are the last step, so this goes to the person. "
+                    "Everything above is the whole brief — the earlier steps "
+                    "are already distilled into it. Do the task above and give "
+                    "the finished result: no handoff or summary section for a "
+                    "next step, and no questions back, because nobody is here "
+                    "to answer them."
                 )
+            if _is_maker(agent_cfg) and stage_idx not in machine_stages \
+                    and stage_idx != spec_feeder:
+                # A maker is never asked for a handoff section: what it
+                # builds is what the next stage gets (the harvest), and the
+                # STRICT PIPELINE RULES above read to it as "answer in text".
+                handoff = _maker_handoff()
 
             # The user asked for answers in their own language. Appended last
             # so it is the final instruction the model reads, and skipped for
@@ -3711,6 +4424,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 stage_responses = _run_apollo(
                     driver, agent_cfg, stage,
                     _bmp_safe("\n".join(questions) + "\n" + context))
+            elif agent_cfg.get("runner") == "canva":
+                # Canva AI answers with an outline first and needs its
+                # "Generate design" pressed before a deck exists -- see
+                # _run_canva. Handed the same prompt a chat tool would get.
+                canva_prompt = _bmp_safe(_maker_brief(agent_name, agent_cfg)
+                                         + context + "\n\n".join(questions)
+                                         + handoff)
+                stage_responses = _run_canva(driver, agent_cfg, stage,
+                                             canva_prompt, should_stop=stage_halt)
             elif agent_name == "NotebookLM":
                 # NotebookLM is not a chat box — it's a "sources" notebook
                 # (add a source, then either ask about it or generate a
@@ -3815,6 +4537,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             pass
 
                         full_prompt = ((context + prompt) if (idx == 1 and context) else prompt) + handoff
+                        if idx == 1:
+                            # A maker hears what it is for before anything
+                            # else -- see _maker_brief.
+                            full_prompt = _maker_brief(agent_name, agent_cfg) + full_prompt
+                            # The chat's name — see _chat_header.
+                            full_prompt = _chat_header(run_title, stage) + full_prompt
                         full_prompt = _bmp_safe(full_prompt)  # strip emoji ChromeDriver can't type
                         if not _fast_type(driver, textarea, full_prompt):
                             # JS insertion didn't take on this site — fall back
@@ -3914,7 +4642,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                        "reason": note, "exhausted": False}
                     continue
 
-                wait = agent_cfg.get("wait_time", 60)
+                # `min_wait` raises the ceiling for a run that redoes whole
+                # deliverables — a follow-up — where the tool's everyday
+                # budget cut the answer off mid-way. A ceiling only: the
+                # wait ends the moment the answer settles.
+                wait = max(int(agent_cfg.get("wait_time", 60) or 60),
+                           int(min_wait or 0))
                 # A caller that knows what a finished answer looks like says
                 # so (e.g. /email needs "SUBJECT:"), and a mid-answer pause
                 # can no longer end the wait early.
@@ -3960,6 +4693,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                   "to the next step."})
                     first_tab = False
                     continue
+                if fallback_requested() and not stopped():
+                    _hand_to_fallback(stage, agent_name, questions)
+                    first_tab = False
+                    continue
                 if stopped():
                     # Scrape before leaving: the tool has been generating for
                     # however long the user waited before pressing Stop, and
@@ -3992,7 +4729,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     ui.warn(f"still generating after {took}s — scraping what "
                             f"is on the page and keeping the link")
 
-                if stage in ("artwork", "visual", "media"):
+                promised = set(image_stages or ())
+                got = 0            # images that rendered this turn, if any
+                if stage in ("artwork", "visual", "media") or stage in promised:
                     # The images are the deliverable here, not the text, so
                     # this stage gets its own budget ON TOP of the agent's —
                     # long only where it needs to be, rather than making every
@@ -4002,6 +4741,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         # Reel's dedicated image-batch stage: a picture is
                         # always the point, so it gets the full budget.
                         want, cap, grace = _rw.MAX_GENERATED, 300, None
+                    elif stage in promised:
+                        # The caller said a picture IS the deliverable (a
+                        # /step-auto drawing sheet). ChatGPT's image model
+                        # takes one to three minutes and shows a blurred
+                        # preview meanwhile; 60s with a 12s grace was giving
+                        # up on it every time. Seven minutes is the cap, not
+                        # the wait — the loop returns the moment the picture
+                        # settles.
+                        want, cap, grace = 1, 420, None
                     else:
                         # visual/media also cover plain non-image turns (a
                         # Studio design turn answers with a CSS/JSON spec,
@@ -4020,7 +4768,25 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         ui.warn("   no images appeared — the reel will be "
                                 "type and colour only")
 
+                if fallback_requested() and not stopped():
+                    # Pressed while the pictures were being waited on.
+                    _hand_to_fallback(stage, agent_name, questions)
+                    first_tab = False
+                    continue
                 texts = _capture(driver, agent_cfg)
+                if (not texts and not stage_halt()
+                        and agent_cfg.get("regenerate_selector")
+                        and _regenerate_once(driver, agent_cfg)):
+                    # An empty turn is usually a hiccup. One regenerate, one
+                    # more (shorter) wait, then the honest answer.
+                    emit("retry", {"stage": stage,
+                                   "reason": "empty answer — regenerated once"})
+                    took2, settled2 = _smart_wait(
+                        driver, agent_cfg, min(wait, 300), expect=expect,
+                        should_stop=stage_halt)
+                    took += took2
+                    timed_out = timed_out and not settled2
+                    texts = _capture(driver, agent_cfg)
                 if not texts:
                     stage_responses = []
                 elif len(questions) == 1:
@@ -4286,7 +5052,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # prompt in the same chat rather than a different first prompt.
             stage_responses, canva_url = _make_editable(
                 driver, agent_cfg, stage, query, stage_responses,
-                machine_shaped=machine_shaped)
+                machine_shaped=machine_shaped, made_image=bool(got))
 
             if stage_responses:
                 ui.info(f"   📥  captured {sum(len(t) for t in stage_responses)} chars")
@@ -4433,7 +5199,18 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             failures, cfg, all_responses, all_links,
             attachments=attachments, query=query, emit=emit,
             should_stop=should_stop, stages=stages,
-            pipeline_files=pipeline_files, brand=studio_brand)
+            pipeline_files=pipeline_files, brand=studio_brand,
+            skip_signal=skip_signal, image_stages=image_stages)
+
+    # The renderers held back above, now that every retry has been tried.
+    # Recovered or not, the render happens: with the pictures if they came,
+    # honestly without them if they did not — but never before the retry
+    # that could have supplied them.
+    for stage, agent_name, agent_cfg in deferred_locals:
+        if stopped():
+            break
+        ui.info(f"   ▶  {stage}: the retries are done — rendering now")
+        _run_local_stage(stage, agent_name, agent_cfg)
 
     return all_responses, all_links
 
@@ -4443,7 +5220,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                          all_links: dict, *, attachments, query, emit,
                          should_stop, stages=None, pipeline_files=None,
-                         brand=None) -> None:
+                         brand=None, skip_signal=None, image_stages=None,
+                         fallback_signal=None) -> None:
     """Give each empty stage to a different tool.
 
     The failure this exists for: forty minutes into a run, the free tier on
@@ -4470,7 +5248,39 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
 
     Never raises: this is a rescue attempt, and a rescue that takes down the
     results it was rescuing would be worse than not trying.
+
+    "Skip this step" works in here too. It did not: the nested run() below
+    was started without the skip flag, so a press during a retry — the one
+    place a customer is most likely to press it, watching a second tool
+    grind on the same stuck stage — did nothing at all. Now the flag is what
+    the nested run's waits poll (as a stop, so it winds up quietly and keeps
+    what landed), and a press abandons the remaining alternatives for that
+    stage rather than trying the next tool anyway.
     """
+    def skipped() -> bool:
+        return bool(skip_signal is not None and skip_signal.is_set())
+
+    def fallback_pressed() -> bool:
+        # "Use fallback" during a retry means "not this one either -- the
+        # next tool, now". The nested run's waits break on it like a stop.
+        return bool(fallback_signal is not None and fallback_signal.is_set())
+
+    def halt() -> bool:
+        return bool(should_stop and should_stop()) or skipped() or fallback_pressed()
+
+    def give_up(stage: str, info: dict, texts: list) -> None:
+        skip_signal.clear()
+        if texts:
+            all_responses[stage] = texts
+        ui.warn(f"   ⤼  {stage}: skipped at your request — "
+                + ("keeping what landed" if texts else "moving on"))
+        emit("stage_skipped", {
+            "stage": stage, "agent": info.get("agent"),
+            "reason": "You skipped this step while it was being retried. "
+                      + ("Whatever the tool had produced was kept; "
+                         if texts else "")
+                      + "the run moved on."})
+
     recovered: set[str] = set()
     for stage, info in list(failures.items()):
         if should_stop and should_stop():
@@ -4478,11 +5288,17 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
         # A later pass may already have filled this in.
         if all_responses.get(stage):
             continue
+        if skipped():
+            give_up(stage, info, [])
+            continue
 
         tried = [info.get("agent")]
         for alternative in A.alternatives_for(stage, tried, cfg):
             if should_stop and should_stop():
                 return
+            if skipped():
+                give_up(stage, info, [])
+                break
             ui.rule(f"{stage.upper()}  ·  retrying with {alternative}",
                     style="yellow")
             ui.warn(f"   {info.get('agent')} couldn't finish: {info['reason']}")
@@ -4503,16 +5319,28 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                     # The file-analysis pre-stage would re-read every
                     # attachment before the one prompt we actually want.
                     chatgpt_analysis=False,
-                    should_stop=should_stop,
+                    # A skip reaches the nested run as a stop: its waits
+                    # break, it scrapes what landed and returns, and the
+                    # check just below decides what that means.
+                    should_stop=halt,
                     # One level only. Without this a category where every tool
                     # is having a bad afternoon retries itself forever.
                     failover=False,
-                    pipeline_files_out=recovered_files)
+                    pipeline_files_out=recovered_files,
+                    image_stages=image_stages)
             except Exception as e:                       # noqa: BLE001
                 ui.err(f"   {alternative} also failed: {e}")
                 continue
 
             texts = responses.get(stage) or []
+            if skipped():
+                give_up(stage, info, texts)
+                break
+            if fallback_pressed():
+                fallback_signal.clear()
+                ui.warn(f"   ↪  {alternative} abandoned at your request — "
+                        "trying the next tool")
+                continue
             if texts:
                 all_responses[stage] = texts
                 if links.get(stage):
@@ -4581,7 +5409,9 @@ def _rerender_local_after_recovery(recovered: set, stages, cfg: dict,
         try:
             out, note = _run_local(agent_cfg["local"], prior_text,
                                    (attachments or []) + (pipeline_files or []),
-                                   cfg, stage, brand=brand)
+                                   cfg, stage, brand=brand,
+                                   studio=_studio_conversation(
+                                       stages, stage, all_links))
         except Exception as e:                            # noqa: BLE001
             ui.err(f"   re-render failed: {e}")
             continue

@@ -14,6 +14,7 @@ import re
 import requests
 
 from . import agents as A
+from . import config as C
 from . import ui
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -445,7 +446,11 @@ def _stage_lines(agents: dict, premium: list | None = None) -> str:
         # 3.12+. Prism supports 3.10+, and on anything older this is a
         # SyntaxError raised at IMPORT time — so the whole engine, and the GUI
         # that imports it through core_bridge, failed to start at all.
-        lines.append(f"- {stage.upper()} → {name}: {spec}{star}\n"
+        makes = (A.AGENT_REGISTRY.get(name) or {}).get("makes", "")
+        maker = (f"\n    MAKES: {makes}. Its stage's deliverable is the thing "
+                 f"itself — brief it to BUILD that, never to write text about it."
+                 if makes else "")
+        lines.append(f"- {stage.upper()} → {name}: {spec}{star}{maker}\n"
                      f"    USE FOR: {_STAGE_HELP.get(stage, '')}")
     return "\n".join(lines)
 
@@ -627,6 +632,39 @@ def _self_directing_rule(agents: dict) -> str:
         f"  which is the entire reason it was picked over a plain search tool.\n")
 
 
+def _maker_names(agents: dict) -> list[str]:
+    return sorted(n for n in set(agents.values())
+                  if A.is_maker(A.AGENT_REGISTRY.get(n) or {}))
+
+
+def _maker_rule(agents: dict) -> str:
+    """For a tool that builds the thing, the prompt is a brief to build it.
+
+    Included only when such a tool is in the plan. Without this the planner
+    writes every stage the same way -- a text deliverable spec with a
+    "do not create files" non-goal -- and a deck-building tool obeys it and
+    types the outline back (Canva, 2026-09-10).
+    """
+    names = _maker_names(agents)
+    if not names:
+        return ""
+    listed = " and ".join(names)
+    what = "; ".join(f"{n} makes {A.AGENT_REGISTRY[n]['makes']}" for n in names)
+    return (
+        f"- MAKER TOOLS ({listed}). {what}. For such a stage the deliverable is\n"
+        f"  the THING, built inside that tool, and the prompt is a brief to build\n"
+        f"  it -- written the way a senior person briefs a designer:\n"
+        f"    • Name the tool actually assigned to the stage, never another one.\n"
+        f"    • Say what to build (a 7-slide deck; one square post), what goes on\n"
+        f"      it (the headings and bullets from the previous stage, verbatim, in\n"
+        f"      order), the look (palette, tone, audience), and the size/count.\n"
+        f"    • Never ask for \"plain text\", a \"text format\", a description,\n"
+        f"      an outline, or an export file, and never say \"do not generate\n"
+        f"      files\" -- the tool would obey and hand back words.\n"
+        f"    • DELIVERABLE SPEC = the built thing; QUALITY BAR = about the thing\n"
+        f"      (every slide present, headings exact, readable at a glance).\n")
+
+
 def build_prompt(query: str, profile: str, agents: dict, attachments: list | None = None,
                  premium: list | None = None, brief: str = "") -> str:
     profile_line = (
@@ -656,6 +694,7 @@ def build_prompt(query: str, profile: str, agents: dict, attachments: list | Non
         "tool is premium.\n" if enabled_premium else ""
     )
     self_directing_block = _self_directing_rule(agents)
+    maker_block = _maker_rule(agents)
     brief_block = (
         "\n═══ TASK BRIEF (auto-expanded from the raw request by a prompt-"
         "engineering pass; mine it for context, deliverable specs, quality "
@@ -725,7 +764,7 @@ outputs as context:
   stage genuinely needs distinct prompts.
 - DEVELOPMENT prompts must include full specs so the agent can ship a working
   result. SUMMARY must explicitly reference and combine the earlier outputs.
-{self_directing_block}- PROMPT CRAFT (this is why Prism exists — every stage prompt must read like
+{self_directing_block}{maker_block}- PROMPT CRAFT (this is why Prism exists — every stage prompt must read like
   professional prompt engineering, never a paraphrase of the user's words).
   After the mandatory "Your ONLY task is:" opener, every prompt MUST contain:
     • ROLE: cast the agent as a specific senior expert matched to the task
@@ -791,6 +830,260 @@ def verify_key(api_key: str, model: str = "") -> str:
     return ""
 
 
+def _escape_inner_quotes(block: str) -> str:
+    """Escape a raw double quote a model left INSIDE a JSON string.
+
+    The plan's prompts are about writing, so they quote things — `Act as a
+    "senior" strategist` — and a model that has just been told to write
+    engaging copy does not always remember that the quote has to be `\\"`
+    once it is inside a JSON string. Walks the text tracking whether it is
+    inside a string; a quote there that is not followed (after whitespace)
+    by `,` `}` `]` or `:` cannot be the string's end, so it is escaped.
+    """
+    out, in_str, esc = [], False, False
+    n = len(block)
+    for i, ch in enumerate(block):
+        if in_str:
+            if esc:
+                esc = False
+                out.append(ch)
+                continue
+            if ch == "\\":
+                esc = True
+                out.append(ch)
+                continue
+            if ch == '"':
+                j = i + 1
+                while j < n and block[j] in " \t\r\n":
+                    j += 1
+                if j >= n or block[j] in ",}]:":
+                    in_str = False
+                    out.append(ch)
+                else:
+                    out.append('\\"')
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_str = True
+        out.append(ch)
+    return "".join(out)
+
+
+def _parse_plan(text: str):
+    """The routing dict out of a planner reply — (dict, None), or (None, why).
+
+    Tries the reply as written, then the repairs a scraped browser reply
+    already gets (comments, curly quotes, trailing commas, control
+    characters in strings — core.reel._loosen), then the one fault a
+    planner makes that those do not cover: a raw quote inside a string.
+    """
+    from . import reel as _reel
+    text = text or ""
+    blocks = _reel._blocks(text, "{", "}")
+    s, e = text.find("{"), text.rfind("}") + 1
+    if s != -1 and e > s and text[s:e] not in blocks:
+        # An unbalanced quote throws the string-aware brace scan off; the
+        # outermost slice is the plain-minded fallback.
+        blocks.append(text[s:e])
+    if not blocks:
+        return None, "no JSON object in the reply"
+    why = None
+    for block in blocks:
+        for candidate in (block, _reel._loosen(block),
+                          _escape_inner_quotes(block),
+                          _escape_inner_quotes(_reel._loosen(block))):
+            try:
+                got = json.loads(candidate)
+            except Exception as err:                       # noqa: BLE001
+                why = why or err
+                continue
+            if isinstance(got, dict):
+                return got, None
+    return None, why or "the reply was not a JSON object"
+
+
+def title_for(query: str, brief: str, api_key: str, model: str) -> str:
+    """A short name for the job — what a folder, a History row and a chat
+    should be called. Six words at most, no verb, no quotes: "Instagram
+    reel · brand guide" for "make a reel for instgram for this brand".
+    Until now every one of those surfaces carried the request verbatim,
+    typos and all, and every chat Prism opened was titled by its own
+    opening line — "Senior Creative Director Task", forty times over.
+    Never raises: a planner that cannot name the job gets the request's
+    first words instead."""
+    prompt = (
+        "Name this job in at most six words, the way a folder or a chat "
+        "thread would be named: what is being made, and for whom or about "
+        "what. No verbs like 'create' or 'make', no quotes, no trailing "
+        "punctuation, spell names correctly even if the request does not.\n\n"
+        f"The request: {query}\n"
+        + (f"\nThe brief: {brief[:600]}\n" if brief else "")
+        + '\nReply with ONLY a JSON object: {"title": "..."}')
+    try:
+        out = groq_chat(api_key, model, prompt, temperature=0, timeout=20,
+                        retries=0, json_mode=True)
+        title = C.tidy_title(str(json.loads(out).get("title", "")))
+    except Exception:                                    # noqa: BLE001
+        title = ""
+    return title or C.fallback_title(query)
+
+
+def planned_steps(routing: dict, agents: dict) -> list[tuple[str, str]]:
+    """(stage, tool) for every step the router's plan would run, in order --
+    the same reading automation._needed_stages makes, before the person
+    has touched anything."""
+    out = []
+    for stage in A.PIPELINE_ORDER:
+        data = (routing or {}).get(stage) or {}
+        if not data.get("needed"):
+            continue
+        if not [q for q in (data.get("questions") or []) if q and str(q).strip()]:
+            continue
+        name = (A.summary_agent_name(agents) if stage == "summary"
+                else data.get("agent_override") or agents.get(stage))
+        if name:
+            out.append((stage, name))
+    return out
+
+
+def plan_changed(planned: list, confirmed: list) -> bool:
+    """Did the person change the plan before pressing Start?
+
+    Two lists of (stage, tool). Any difference in membership, order or tool
+    counts -- the prompts were written for the plan as routed, and a prompt
+    written for Gamma names Gamma even when the step now runs on Canva
+    (the owner's deck run of 2026-09-10). A step with no prompt at all
+    counts as changed too; it has nothing to send.
+    """
+    def key(steps):
+        return [(str(s[0]), str(s[1])) for s in steps]
+    if key(planned) != key(confirmed):
+        return True
+    return any(len(s) > 2 and not [q for q in (s[2] or []) if q and str(q).strip()]
+               for s in confirmed)
+
+
+def passthrough_prompt(query: str, stage: str, brief: str = "") -> str:
+    """The floor under a step with no prompt: the person's own words,
+    scoped to that step's job. Never a great prompt, always a real one."""
+    meta = A.CATEGORIES.get(stage) or {}
+    job = meta.get("desc") or meta.get("label") or stage
+    text = (f"Your ONLY task is: {job[0].lower() + job[1:]}, for the request "
+            "below. Do that part of the job and nothing else — other steps "
+            "handle the rest.\n\n"
+            f"The request:\n{query.strip()}\n")
+    if (brief or "").strip():
+        text += f"\nWhat the job is about, in more detail:\n{brief.strip()}\n"
+    return text + ("\nDeliver the finished result for this step, ready to "
+                   "use, and do not ask questions back.")
+
+
+def brief_confirmed_plan(query: str, cfg: dict, steps: list,
+                         routing: dict | None = None) -> list:
+    """Write the prompts for the plan AS THE PERSON CONFIRMED IT.
+
+    `steps` is the ordered [(stage, tool, draft questions)] the Plan screen
+    is about to run. The router wrote its prompts before anyone looked at
+    the plan; if a step was dropped, added, moved, or given a different tool,
+    those prompts are wrong -- they name the old tool, hand off to a step
+    that no longer follows, or do not exist. One Groq call rewrites them for
+    exactly these steps, in this order, on these tools: the drafts are the
+    substance to keep, the tools and the order are the truth.
+
+    Returns the same list with the questions replaced. Never raises: on a
+    failure the drafts stand, and a step with no draft gets the floor
+    (passthrough_prompt), so the run always has something real to send.
+    """
+    steps = [(str(s[0]), str(s[1]), [q for q in (s[2] if len(s) > 2 else [])
+                                     if q and str(q).strip()]) for s in steps]
+    brief = ((routing or {}).get("_brief") or "").strip()
+    api_key = cfg.get("api_key")
+    model = cfg.get("model", "llama-3.3-70b-versatile")
+
+    def floor(step):
+        stage, tool, qs = step
+        return (stage, tool, qs or [passthrough_prompt(query, stage, brief)])
+
+    if not api_key or not steps:
+        return [floor(s) for s in steps]
+
+    profile = cfg.get("profile", "")
+    profile_line = (f"The user describes themselves / their work as: "
+                    f"\"{profile}\". Tailor every prompt to that context.\n\n"
+                    if profile else "")
+    lines = []
+    for i, (stage, tool, qs) in enumerate(steps, 1):
+        meta = A.CATEGORIES.get(stage) or {}
+        entry = A.AGENT_REGISTRY.get(tool) or {}
+        makes = entry.get("makes", "")
+        draft = " ".join(" ".join(qs).split())[:1200] if qs else "(no draft — write it)"
+        lines.append(
+            f"STEP {i} — {stage.upper()} on {tool}"
+            f"{' (last step)' if i == len(steps) else ''}\n"
+            f"  what this tool is: {entry.get('specialty', 'general-purpose AI')}\n"
+            + (f"  MAKES: {makes} — brief it to BUILD that, never to write "
+               f"text about it\n" if makes else "")
+            + f"  the step's job: {meta.get('desc', meta.get('label', stage))}\n"
+            f"  draft prompt: {draft}")
+    agents = {stage: tool for stage, tool, _ in steps}
+    maker_block = _maker_rule(agents)
+    brief_block = f"The task brief the drafts were written from:\n{brief}\n\n" if brief else ""
+    prompt = f"""You are the routing brain of Prism — a multi-agent AI pipeline.
+The person has looked at the plan and CONFIRMED these steps, in this order,
+on these tools. Write the final prompt for every step, for this plan exactly.
+
+{profile_line}{brief_block}User's raw request (authoritative on scope):
+{query}
+
+THE CONFIRMED PLAN:
+{chr(10).join(lines)}
+
+═══ RULES ═══
+- One prompt per step, in the order above. The drafts hold the substance —
+  keep every fact, constraint and deliverable in them — but the TOOL and the
+  ORDER above are the truth: name the tool the step actually runs on, never
+  another one, and hand off to the step that actually follows.
+- HAND-OFF: every step except the last says its answer is not for the user —
+  it goes to the next step as that step's working brief — and ends with a
+  section titled 'HANDOFF FOR <NEXT TOOL IN CAPITALS>' summarising every
+  fact, decision and constraint the next step needs.
+- FINAL STEP: the last step says the opposite — it is the last step, deliver
+  the finished result for the person, no hand-off.
+{maker_block}- PROMPT CRAFT: after the opener "Your ONLY task is:", each prompt has
+  ROLE (a specific senior expert), CONTEXT (every relevant fact and
+  constraint), DELIVERABLE SPEC (the exact output; for a maker, the built
+  thing), QUALITY BAR (2–3 concrete criteria) and NON-GOALS. 120–250 words.
+- Each prompt is COMPLETE and self-contained.
+
+Return ONLY this JSON (no markdown, no commentary):
+{{"steps": [{{"stage": "<stage>", "questions": ["<prompt>"]}}, ...]}}"""
+    try:
+        try:
+            text = groq_chat(api_key, model, prompt, timeout=60, json_mode=True)
+        except RuntimeError:
+            text = groq_chat(api_key, model, prompt, timeout=60)
+    except Exception as e:                                  # noqa: BLE001
+        ui.warn(f"could not rewrite the prompts for the confirmed plan ({e}) "
+                "— running with the drafts")
+        return [floor(s) for s in steps]
+    got, _why = _parse_plan(text)
+    raw = got.get("steps") if isinstance(got, dict) else None
+    if not isinstance(raw, list) or len(raw) != len(steps):
+        ui.warn("the rewritten prompts did not match the plan — running with "
+                "the drafts")
+        return [floor(s) for s in steps]
+    out = []
+    for step, item in zip(steps, raw):
+        qs = (item or {}).get("questions") if isinstance(item, dict) else None
+        if isinstance(qs, str):
+            qs = [qs]
+        qs = [str(q).strip() for q in (qs or []) if q and str(q).strip()]
+        out.append((step[0], step[1], qs) if qs else floor(step))
+    ui.info("✍️  prompts written for the plan as you confirmed it")
+    return out
+
+
 def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     """Call Groq and return the routing dict (stage -> {questions, needed})."""
     agents = {k: v for k, v in (cfg.get("agents") or {}).items() if v}
@@ -817,10 +1110,31 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     # The one call the whole plan depends on, so this is the one that gets a
     # retry and the full model chain.
     text = groq_chat(api_key, model, prompt, timeout=60)
-    s, e = text.find("{"), text.rfind("}") + 1
-    if s == -1 or e <= s:
-        raise RuntimeError(f"Groq returned no JSON:\n{text[:400]}")
-    routing = json.loads(text[s:e])
+    routing, why = _parse_plan(text)
+    if routing is None:
+        # "Expecting ',' delimiter: line 16 column 49" — twice in a row on
+        # 2026-09-07, a raw quote inside a prompt string, and each time the
+        # whole plan was thrown away behind a "Something went wrong" dialog
+        # with the parser's words in it. The repairs in _parse_plan catch
+        # most of that; what they cannot, one more ask with the error quoted
+        # back does — in JSON mode, where Groq itself refuses to hand back
+        # anything that does not parse.
+        ui.warn(f"the plan came back as JSON that would not parse ({why}) "
+                "— asking once more")
+        again = (prompt + "\n\nYOUR PREVIOUS REPLY WAS NOT VALID JSON — the "
+                 f"parser said: {why}. Reply again with ONLY the JSON "
+                 "object: every double quote inside a string escaped as "
+                 "\\\", no comments, no trailing commas, nothing before or "
+                 "after it.")
+        try:
+            text = groq_chat(api_key, model, again, timeout=60, json_mode=True)
+        except RuntimeError:
+            text = groq_chat(api_key, model, again, timeout=60)
+        routing, why = _parse_plan(text)
+    if routing is None:
+        raise RuntimeError(
+            "Prism's planner wrote a plan it could not read back "
+            f"({why}). This is usually momentary — press Make a plan again.")
 
     # Deterministic safety net: force make-stages the user clearly asked for.
     forced = apply_make_guardrail(query, routing, agents)
@@ -837,6 +1151,12 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     # chain (raw words → brief → stage prompts). Consumers iterate
     # PIPELINE_ORDER, so this extra key is invisible to them.
     routing["_brief"] = brief
+    # The job's name, for the run folder, History, Home and every chat's
+    # title. Same "invisible to consumers" convention as _brief.
+    try:
+        routing["_title"] = title_for(query, brief, api_key, model)
+    except Exception:                                    # noqa: BLE001
+        routing["_title"] = C.fallback_title(query)
     try:
         routing["_named_tools"] = detect_named_tools(query)
     except Exception:

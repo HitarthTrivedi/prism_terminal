@@ -16,6 +16,7 @@ import csv
 import io
 import re
 import ssl
+import random
 import time
 import smtplib
 from email.message import EmailMessage
@@ -39,7 +40,36 @@ _SMTP_HOSTS = {
 }
 
 # Pause between sends — keeps providers from flagging the account for bursts.
+# The GUI reads the customer's own figure out of cfg["email"]["send"] (see
+# email_config.send_policy in prism_gui); this is what a bare call gets.
 SEND_DELAY = 2.0
+
+
+def pause_after_send(delay: float, jitter: float = 0.0) -> float:
+    """How long to wait before the next message: the fixed gap plus a random
+    slice of `jitter`. A list sent with an identical pause every time is a
+    metronome a provider can hear; a little randomness reads as a person."""
+    delay = max(0.0, float(delay or 0.0))
+    jitter = max(0.0, float(jitter or 0.0))
+    return delay + (random.uniform(0.0, jitter) if jitter else 0.0)
+
+
+def _sleep_until(deadline: float, should_stop=None, on_wait=None) -> bool:
+    """Wait for wall-clock `deadline` (time.time()), in quarter-second
+    slices so a cancel lands promptly. on_wait(seconds_left) is called once a
+    second for a screen to count down on. Returns False if stopped."""
+    last_told = None
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            return True
+        if should_stop and should_stop():
+            return False
+        told = int(left)
+        if on_wait and told != last_told:
+            on_wait(told)
+            last_told = told
+        time.sleep(min(0.25, left))
 
 
 # ── recipients (parsed locally — the CSV never reaches any AI) ────────────────
@@ -642,7 +672,9 @@ class _SentSaver:
 
 def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
               files: list[dict], delay: float = SEND_DELAY,
-              session_max: int = 20, on_progress=None, should_stop=None):
+              session_max: int = 20, on_progress=None, should_stop=None, *,
+              jitter: float = 0.0, limit: int = 0, start_at: float = 0.0,
+              on_wait=None):
     """Send the draft to every recipient, one message each (so {name} can be
     personalised and one bad address can't sink the rest).
     Returns (sent emails, [(email, error), …]).
@@ -650,8 +682,30 @@ def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
     on_progress(i, total, email, ok, error) is called after every attempt, and
     should_stop() is polled between them — a blast of 200 addresses takes
     minutes at SEND_DELAY, and the GUI needs both a live count and a way out.
-    Neither is used by the CLI, which has ui.* and Ctrl-C for the same jobs."""
+    Neither is used by the CLI, which has ui.* and Ctrl-C for the same jobs.
+
+    Pace and limits — the three knobs a list send needs so it does not read
+    as spam to the provider or to the people on it:
+      delay + jitter   the gap between two messages: `delay` seconds plus a
+                       random 0..`jitter` on top (pause_after_send)
+      limit            send to at most this many this run; 0 = everyone.
+                       The rest are not attempted and are reported as such
+      start_at         a wall-clock time (time.time()) to begin at; the
+                       login happens only once it arrives, so a send set for
+                       the morning does not hold an SMTP session open all
+                       night. on_wait(seconds_left) ticks once a second
+                       meanwhile; a stop during the wait sends nothing."""
     ec = cfg["email"]
+    if limit and limit > 0 and len(recipients) > limit:
+        ui.info(f"   ⏳  sending to {limit} of {len(recipients)} this run — "
+                f"{len(recipients) - limit} left for the next")
+        recipients = list(recipients)[:limit]
+    if start_at and start_at > time.time():
+        ui.info(f"   🕒  waiting until {time.strftime('%H:%M', time.localtime(start_at))} "
+                "to begin")
+        if not _sleep_until(start_at, should_stop, on_wait):
+            ui.warn("stopped before the scheduled time — nothing sent")
+            return [], []
     timeout = _send_timeout(files)
     if timeout > 60:
         ui.info(f"   📦  large attachment(s) — allowing up to {timeout}s per send")
@@ -722,11 +776,12 @@ def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
             if i < len(recipients):
                 # Split the pause so a cancel lands in ~a quarter second
                 # instead of after the full provider-friendly delay.
+                pause = pause_after_send(delay, jitter)
                 waited = 0.0
-                while waited < delay:
+                while waited < pause:
                     if should_stop and should_stop():
                         break
-                    time.sleep(min(0.25, delay - waited))
+                    time.sleep(min(0.25, pause - waited))
                     waited += 0.25
     finally:
         try:

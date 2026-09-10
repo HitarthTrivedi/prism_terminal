@@ -27,6 +27,10 @@ DEFAULT = {
     "chrome_version": "", # pinned Chrome major version; "" = auto-detect
     "onboarded": False,
     "model": "llama-3.3-70b-versatile",
+    # Where /step puts a model's files. "" = ~/Desktop/Prism Step. The GUI
+    # asks the person where their STEP work should live and stores it here;
+    # the terminal sets it with /step-folder. See core.stepfile.output_dir.
+    "step_out_dir": "",
 }
 
 
@@ -147,37 +151,134 @@ def _clean_name(text: str, limit: int = 60) -> str:
     return " ".join(clean.split())[:limit].strip(" .")
 
 
-def _artifact_stem(prompt: str, kind: str) -> str:
+_STOP_TAIL = {"a", "an", "the", "for", "and", "of", "to", "with", "in", "on",
+              "at", "by", "from", "or", "this", "that", "my", "our", "me", "us",
+              "like", "but", "as", "is", "are", "be", "so", "which", "into",
+              "than", "about", "using", "via"}
+
+
+def fallback_title(text: str, words: int = 6) -> str:
+    """A short name for a run when no planner wrote one: the first few words
+    of the request. A cut is not allowed to land on a joining word — it
+    runs on (a little) until a real word ends the phrase, and any joining
+    word still left dangling is trimmed. "make me a poster of a spring"
+    stays whole; "can we make a platform like github but more…" becomes
+    "can we make a platform like github". Not pretty; a folder can be
+    found by it."""
+    import re
+    parts = re.sub(r"[^\w\s'&/-]", " ", text or "").split()
+    n = min(len(parts), words)
+    while 0 < n < len(parts) and n < words + 3 and parts[n - 1].lower() in _STOP_TAIL:
+        n += 1
+    out = parts[:n]
+    while len(out) > 1 and out[-1].lower() in _STOP_TAIL:
+        out.pop()
+    return " ".join(out).strip() or "Task"
+
+
+def tidy_title(title: str, limit: int = 60) -> str:
+    """A model's answer, made fit for a folder name and a chat title: one
+    line, no wrapping quotes, no trailing punctuation, bounded."""
+    t = str(title or "").strip().split("\n")[0]        # first line only
+    t = " ".join(t.split())
+    t = t.strip().strip("\"'“”‘’`").rstrip(".:;,!").strip()
+    return t[:limit].strip(" .-")
+
+
+def _artifact_stem(prompt: str, kind: str, dated: bool = True) -> str:
     """A filename a person can actually read in Finder/Explorer without
-    opening it: what they asked for, what kind of thing this is, and when —
-    not a sanitized-to-underscores prompt fragment glued to a raw unix
-    timestamp."""
+    opening it. Inside a run folder it is the run's title and what kind of
+    thing this is — "Instagram reel · brand guide — Artwork.png" — so a
+    file dragged out of its folder still says what it is. Loose at the top
+    level (no task given) it carries the prompt and the time as before."""
     import datetime
+    label = (kind or "artifact").replace("_", " ").capitalize()
+    if not dated:
+        title = _run.get("title") or _clean_name(prompt, limit=40)
+        return f"{title} — {label}" if title else label
     clean = _clean_name(prompt)
     when = datetime.datetime.now().strftime("%Y-%m-%d %I-%M %p")
-    label = (kind or "artifact").replace("_", " ").capitalize()
     return " - ".join(p for p in (clean, label, when) if p)
 
 
+# ── one folder per RUN ──────────────────────────────────────────────────────
+# Prism Artifacts/<Task>/<2026-09-07 16-18>/. Grouped under the task so
+# related runs sit together, one folder per run so they never merge: filed
+# by the task's TEXT alone, every "Use again", every re-film and every
+# follow-up of "make a reel for instgram for this brand" landed in one
+# folder — twelve files from four runs on 2026-09-07 — and the follow-up
+# dialog then attached all twelve to the next change.
+ABOUT_FILE = "About this run.txt"
+RUN_STAMP = "%Y-%m-%d %H-%M"
+_run: dict = {"task": None, "dir": None, "title": None}
+
+
+def begin_run(task: str, title: str = "") -> str:
+    """Open a fresh folder for one run of `task` and make it current, so
+    every save_artifact(task=…) until the next begin_run lands in it.
+    Returns the folder. An empty task means the loose top level.
+
+    `title` names the folder — the planner's short name for the job
+    ("Instagram reel · brand guide"), not the request verbatim with its
+    typos and its forty words. Without one the request is trimmed to a
+    few words; the full request is always in the About file.
+    """
+    import datetime
+    task = (task or "").strip()
+    if not task:
+        _run.update(task=None, dir=None, title=None)
+        os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+        return ARTIFACTS_DIR
+    title = tidy_title(title) or fallback_title(task)
+    parent = os.path.join(ARTIFACTS_DIR, _clean_name(title, limit=80) or "Task")
+    stamp = datetime.datetime.now().strftime(RUN_STAMP)
+    folder, n = os.path.join(parent, stamp), 1
+    while os.path.exists(folder):
+        n += 1
+        folder = os.path.join(parent, f"{stamp} ({n})")
+    os.makedirs(folder, exist_ok=True)
+    try:
+        with open(os.path.join(folder, ABOUT_FILE), "w", encoding="utf-8") as f:
+            f.write(f"{title}\n\nThe request, as typed:\n  {task}\n\n"
+                    f"Started {datetime.datetime.now():%A %d %B %Y, %H:%M}\n"
+                    "Everything Prism produced for this run is in this folder.\n")
+    except OSError:
+        pass
+    _run.update(task=task, dir=folder, title=title)
+    return folder
+
+
+def current_run_title() -> str:
+    return _run.get("title") or ""
+
+
+def current_run_dir() -> str:
+    """The folder the current run's artifacts go to, or "" before any run."""
+    folder = _run.get("dir") or ""
+    return folder if folder and os.path.isdir(folder) else ""
+
+
 def artifact_task_dir(task: str) -> str:
-    """The per-task subfolder under ARTIFACTS_DIR that `save_artifact()` also
-    writes into when passed this same `task` string — grouping everything one
-    New Task (or one BOQ/Gerber/quote job) produced into one folder a customer
-    can open, instead of every image/doc/video for every run landing loose in
-    one ever-growing list.
+    """The folder `save_artifact()` writes into for this `task`: the current
+    run's, when the task is the one begin_run() opened — otherwise a run is
+    begun for it here, so a caller that never announced its run (an add-on
+    dialog nobody has updated yet) still gets a folder of its own rather
+    than everything it ever made in one pile.
 
     Exposed on its own (not only through save_artifact) for a caller whose
     deliverable is a whole directory tree — Gerber's cleaned-copy output,
     which is a folder of layers plus a report and preview images, not a
     single file `shutil.copy2` can land in one call.
 
-    Empty `task` returns ARTIFACTS_DIR itself: today's flat top-level
-    behavior, so a caller nobody has updated yet keeps working unchanged.
+    Empty `task` returns ARTIFACTS_DIR itself: the flat top level, so a
+    caller passing nothing keeps working unchanged.
     """
-    folder = (os.path.join(ARTIFACTS_DIR, _clean_name(task, limit=80) or "Task")
-             if task else ARTIFACTS_DIR)
-    os.makedirs(folder, exist_ok=True)
-    return folder
+    if not task:
+        os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+        return ARTIFACTS_DIR
+    if _run.get("task") == task and current_run_dir():
+        return _run["dir"]
+    return begin_run(task)
 
 
 def save_artifact(src_path: str, prompt: str, kind: str = "artifact",
@@ -203,12 +304,13 @@ def save_artifact(src_path: str, prompt: str, kind: str = "artifact",
     """
     dest_dir = artifact_task_dir(task)
     _, ext = os.path.splitext(src_path)
-    stem = _artifact_stem(prompt, kind)
+    stem = _artifact_stem(prompt, kind, dated=not task)
     dest = os.path.join(dest_dir, f"{stem}{ext}")
     n = 1
     while os.path.exists(dest):
         n += 1
-        dest = os.path.join(dest_dir, f"{stem}_{n}{ext}")
+        dest = os.path.join(dest_dir, f"{stem} {n}{ext}" if task
+                            else f"{stem}_{n}{ext}")
     import shutil
     shutil.copy2(src_path, dest)
     if link:

@@ -664,13 +664,17 @@ def _macho_arches(path: str) -> set:
     """The CPU architectures a Mach-O file carries: {"x86_64"}, {"arm64"},
     both for a universal binary, or an empty set for anything unreadable
     or not Mach-O at all."""
-    import struct
-    names = {_MACHO_X86_64: "x86_64", _MACHO_ARM64: "arm64"}
     try:
         with open(path, "rb") as f:
             head = f.read(4096)
     except OSError:
         return set()
+    return _macho_arches_bytes(head)
+
+
+def _macho_arches_bytes(head: bytes) -> set:
+    import struct
+    names = {_MACHO_X86_64: "x86_64", _MACHO_ARM64: "arm64"}
     if len(head) < 8:
         return set()
     magic = head[:4]
@@ -716,6 +720,7 @@ def _purge_uc_cache(why: str) -> None:
     d = _uc_cache_dir()
     if not os.path.isdir(d):
         return
+    stuck = []
     for f in os.listdir(d):
         fp = os.path.join(d, f)
         try:
@@ -724,20 +729,89 @@ def _purge_uc_cache(why: str) -> None:
             else:
                 os.remove(fp)
         except OSError as e:
-            ui.warn(f"   couldn't remove the cached browser driver {fp}: {e}")
+            stuck.append(f"{fp}: {e}")
+    if stuck:
+        # A folder the user cannot write into (Migration Assistant leaves
+        # those): move the whole thing aside instead -- that only needs the
+        # parent to be writable, which ~/Library/Application Support is.
+        aside = f"{d}.intel-{int(time.time())}"
+        try:
+            os.rename(d, aside)
+            ui.info(f"   ♻️   moved the old driver folder aside → {aside}")
+        except OSError as e:
+            ui.warn("   couldn't remove the cached browser driver: "
+                    + "; ".join(stuck) + f"; nor move it aside: {e}")
+            return
     ui.info(f"   ♻️   replacing the cached driver — {why}")
 
 
 _INTEL_DRIVER_HELP = (
-    "The browser driver on this Mac was built for Intel Macs, and this Mac "
-    "has no Rosetta to run it. It was most likely copied over from an older "
-    "Mac by Migration Assistant.\n\n"
-    "  1. Prism has removed it and downloads the Apple silicon driver on the "
-    "next run — press Start again.\n"
-    "  2. If it comes back, delete the folder\n"
-    "     ~/Library/Application Support/undetected_chromedriver\n"
-    "     and try once more."
+    "The browser driver that was run is built for Intel Macs, and this Mac "
+    "has no Rosetta to run it.\n\n"
+    "  1. Press Start again: Prism now fetches its own Apple silicon driver "
+    "into ~/.prism/chromedriver and uses that.\n"
+    "  2. If it comes back, run this in Terminal and try once more:\n"
+    "     rm -rf ~/Library/Application\\ Support/undetected_chromedriver\n"
+    "  3. Still stuck? Settings → Export diagnostics and send the file."
 )
+
+# ── Prism's own driver on Apple silicon ─────────────────────────────────────
+# undetected-chromedriver decides which chromedriver to fetch from
+# platform.machine() and unlinks + re-downloads on EVERY launch; when the
+# unlink is refused it silently reuses whatever is there. On a client's M2
+# that left an Intel driver (migrated from an old Mac, in a folder the
+# user could not delete) being executed run after run, with no Rosetta.
+# So on Darwin/arm64 Prism fetches the mac-arm64 driver itself, from the
+# same Chrome-for-Testing feed uc uses, into its own folder, checks the
+# Mach-O header, and hands uc that path. uc's own cache no longer matters.
+_PRISM_DRIVER_DIR = os.path.join(C.CONFIG_DIR, "chromedriver")
+_CFT_LATEST = "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_{}"
+_CFT_ZIP = ("https://storage.googleapis.com/chrome-for-testing-public/{}/"
+            "mac-arm64/chromedriver-mac-arm64.zip")
+
+
+def _http_get(url: str, timeout: float = 60.0) -> bytes:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Prism"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:      # noqa: S310
+        return r.read()
+
+
+def _apple_silicon_driver(version_main=None) -> str:
+    """Path to an arm64 chromedriver for this Chrome, downloading it once
+    per Chrome major into ~/.prism/chromedriver/<major>/. "" anywhere but
+    Darwin/arm64, and "" (with a warning) when the download fails -- uc
+    then does what it always did."""
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return ""
+    tag = str(int(version_main)) if version_main else "STABLE"
+    folder = os.path.join(_PRISM_DRIVER_DIR, tag)
+    path = os.path.join(folder, "chromedriver")
+    if os.path.isfile(path) and "arm64" in _macho_arches(path):
+        return path
+    try:
+        import io
+        import zipfile
+        version = _http_get(_CFT_LATEST.format(tag), timeout=30).decode().strip()
+        data = _http_get(_CFT_ZIP.format(version))
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            member = next(n for n in z.namelist()
+                          if n.endswith("/chromedriver") or n == "chromedriver")
+            blob = z.read(member)
+        if "arm64" not in _macho_arches_bytes(blob):
+            raise RuntimeError("the downloaded driver is not an arm64 build")
+        os.makedirs(folder, exist_ok=True)
+        tmp_path = path + ".part"
+        with open(tmp_path, "wb") as f:
+            f.write(blob)
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, path)
+        ui.info(f"   ⬇️   fetched the Apple silicon chromedriver {version}")
+        return path
+    except Exception as e:                                  # noqa: BLE001
+        ui.warn(f"   couldn't fetch the Apple silicon chromedriver ({e}); "
+                "letting undetected-chromedriver choose")
+        return ""
 
 
 def _is_bad_arch_error(e: BaseException) -> bool:
@@ -826,9 +900,14 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                     # and let uc try it and report the real failure.
                     ui.warn(f"   couldn't replace the cached driver ({drop}): {e}")
 
+    # On Apple silicon the driver is Prism's own arm64 download; uc only
+    # patches it. Empty everywhere else, and when the download failed.
+    own_driver = _apple_silicon_driver(version_main)
+    extra = {"driver_executable_path": own_driver} if own_driver else {}
+
     try:
         drv = uc.Chrome(options=_options(), user_data_dir=tmp,
-                        version_main=version_main)
+                        version_main=version_main, **extra)
         _reset_to_blank_tab(drv)
         return drv
     except Exception as e:
@@ -849,14 +928,23 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
         bad_arch = _is_bad_arch_error(e)
         if bad_arch:
             # The driver that was just executed is for the other CPU. Throw
-            # the cache away so the retry downloads the one for this Mac.
+            # uc's cache away, and Prism's own copy if that is what ran, so
+            # the retry starts from a fresh download.
             _purge_uc_cache("it was built for another kind of Mac")
+            if own_driver:
+                try:
+                    os.remove(own_driver)
+                except OSError:
+                    pass
+                own_driver = _apple_silicon_driver(version_main)
+                extra = {"driver_executable_path": own_driver} if own_driver else {}
         elif version_main is not None:
             ui.warn(f"   couldn't start Chrome for v{version_main} — retrying "
                     "with whatever driver is current")
         try:
             drv = uc.Chrome(options=_options(), user_data_dir=tmp,
-                            version_main=version_main if bad_arch else None)
+                            version_main=version_main if bad_arch else None,
+                            **extra)
             _reset_to_blank_tab(drv)
             return drv
         except Exception as retry_error:

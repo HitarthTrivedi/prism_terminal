@@ -912,26 +912,32 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "descriptions and its scope list to decide what appears:\n"
         f"{brief_text.strip()}"
     ) if brief_text.strip() else ""
-    # Explicit, not "if you can". Left soft, the writer skips straight to
-    # formatting the numbers and never opens the drawing — which is the
-    # difference between a document that knows WHERE the gates and buildings
-    # are (so cameras and cable routes can be placed sensibly) and one that
-    # only reshuffles a table of totals.
+    # The drawing itself is NOT attached -- the same rule Gerber and STEP
+    # keep, and the customer's drawing is their product. What the writer
+    # has is the measured summary below: every layer name, every block name
+    # with its count, the lengths and areas per layer. That is enough to
+    # say what the drawing is and to write the BOQ; anything spatial it
+    # cannot know from a table it must say it does not know, not invent.
     cad_note = (
-        "\n\nThe drawing has ALREADY been measured for you — the quantities "
-        "listed below were extracted programmatically from its geometry and "
-        "are authoritative. Treat them as ground truth; do not recompute them. "
-        "Do NOT build, install, compile or download any tool, library or "
-        "converter, and do NOT try to convert a DWG — that is never worth your "
-        "time here and is not the task. Any CAD file attached is there only so "
-        "you can glance at the spatial LAYOUT (where the boundary, gates, "
-        "roads, buildings and existing poles sit) to place any DERIVED items "
-        "sensibly. If it opens in a second with a tool you already have (ezdxf "
-        "reads DXF directly), use it for that layout; if it does not open "
-        "trivially, work entirely from the measured summary below — never "
-        "spend effort acquiring a CAD toolchain. Briefly say what the drawing "
-        "IS (site survey, services layout, floor plan…) from its measured "
-        "layers and blocks, then write the BOQ."
+        "\n\nABOUT THE DRAWING. It was measured on the customer's own machine "
+        "and is NOT attached — you will not receive the file, so do not ask "
+        "for it and do not try to open one. Do NOT build, install or download "
+        "any CAD tool or converter, and do NOT try to convert a DWG — that is "
+        "never the task here. The MEASURED QUANTITIES below are "
+        "the authoritative numbers for the BOQ: they were read from the "
+        "drawing's real geometry, layer by layer and block by block. Then:\n"
+        "  (a) From the layer and block names and the figures, state briefly "
+        "what the drawing IS (site survey, services layout, floor plan…) and "
+        "what it contains.\n"
+        "  (b) Build every line item from those figures. Where a quantity "
+        "must be derived (a count from a length, a rate from a norm), say "
+        "so on that line.\n"
+        "  (c) Where the layout itself would decide something — where a "
+        "camera goes, how a cable is routed — and the figures do not say, "
+        "write the item with the quantity the figures support and flag the "
+        "placement as to be confirmed on the drawing. Never invent geometry "
+        "you have not been given.\n"
+        "Do not skip this and jump to formatting."
     ) if has_cad else ""
     if not has_cad:
         # Spec mode: no drawing exists at all. Everything is derived from the

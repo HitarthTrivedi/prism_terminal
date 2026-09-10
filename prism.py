@@ -1169,7 +1169,9 @@ def cmd_boq(cfg, arg: str, attachments: list):
     # The writer DOES get the raw CAD file when there is one — Claude can open
     # a .dwg and read its layers directly, which is exactly why it belongs
     # here and not on ChatGPT's stage.
-    write_files = ([cad_file] if cad_file else []) + templates + note_files
+    # Never the drawing: the writer gets the measured figures in its
+    # prompt and the templates/notes as files (same rule as /gerber).
+    write_files = templates + note_files
     responses, l2 = automation.run(
         {}, cfg, attachments=write_files, chatgpt_analysis=False,
         custom_stages=[("format", agents[writer], [format_q])],

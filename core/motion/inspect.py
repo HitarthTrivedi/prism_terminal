@@ -347,7 +347,14 @@ def inspect(spec: dict[str, Any]) -> list[str]:
                 # at the left edge — entirely outside the frame never fires
                 # for a PARTIAL overflow like that, so this is checked
                 # separately, not folded into the condition above.
-                elif left < 0 or top < 0 or right > canvas_w or bottom > canvas_h:
+                # ...except a plain shape that is LARGER than the frame on
+                # the axis it overflows: a ring or a rect that encloses the
+                # canvas is a backdrop by construction, not clipped content
+                # that a different anchor would have fitted.
+                elif ((left < 0 or top < 0 or right > canvas_w or bottom > canvas_h)
+                      and not (node.get("type") in ("shape_circle", "circle", "shape_rect")
+                               and ((right - left >= canvas_w and (left < 0 or right > canvas_w))
+                                    or (bottom - top >= canvas_h and (top < 0 or bottom > canvas_h))))):
                     faults.append(
                         f'node "{nid}" runs off the edge of the '
                         f"{canvas_w}x{canvas_h} frame (approx. bounds "

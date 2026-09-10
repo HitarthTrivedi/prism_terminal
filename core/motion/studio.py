@@ -384,8 +384,13 @@ def apply_followup(spec: dict, scene_index: int, reply: str) -> Tuple[Optional[d
         return None, f"the rewritten scene does not validate ({e})"
     if faults:
         notes.append(f"{len(faults)} layout problem(s): " + "; ".join(faults[:3]))
-    if rep["errors"]:
-        notes.append("continuity broken: " + "; ".join(e["message"] for e in rep["errors"][:2]))
+    # Kept, but named: a rewrite that drops the thread (an error the
+    # renderer would refuse, or the gap warning continuity.report keeps
+    # as a warning so a finished plan is never thrown away) is applied
+    # and said out loud, so the person can put the key back.
+    broken = rep["errors"] or rep["warnings"]
+    if broken:
+        notes.append("continuity broken: " + "; ".join(e["message"] for e in broken[:2]))
     return out, ". ".join(notes)
 
 

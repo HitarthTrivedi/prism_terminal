@@ -1,0 +1,50 @@
+/* Prism Motion Studio — the edit layer over the runtime page.
+   The runtime sizes html/body to the frame; the studio wraps the four
+   frame layers in #motion-frame and scales that as one unit. */
+:root { color-scheme: dark; }
+html, body { background: #0b0d10 !important; overflow: hidden !important; width: 100vw !important; height: 100vh !important; font-family: Inter, ui-sans-serif, system-ui, sans-serif !important; }
+#motion-viewport { position: fixed; left: 272px; right: 340px; top: 58px; bottom: 214px; overflow: hidden; background: #101419; }
+#motion-frame { position: absolute; left: 0; top: 0; transform-origin: 0 0; box-shadow: 0 32px 90px #0009; overflow: hidden; background: #000; }
+#motion-frame > * { position: absolute !important; inset: 0; }
+#motion-safe { position: absolute; inset: 0; pointer-events: none; z-index: 9; display: none; }
+#motion-safe.on { display: block; }
+#motion-safe .band { position: absolute; left: 0; right: 0; background: rgba(252,110,120,0.16); border: 0 dashed rgba(252,110,120,0.7); }
+#motion-safe .band.top { top: 0; border-bottom-width: 2px; } #motion-safe .band.bottom { bottom: 0; border-top-width: 2px; }
+#motion-safe .side { position: absolute; top: 0; bottom: 0; background: rgba(252,110,120,0.10); }
+#motion-safe .zone { position: absolute; left: 0; right: 0; border: 1px dashed rgba(140,170,255,0.45); }
+#motion-safe .tag { position: absolute; left: 16px; color: #fff; font: 700 28px Inter, sans-serif; opacity: .75; }
+#motion-top { position: fixed; inset: 0 0 auto; height: 58px; z-index: 2147483647; display: flex; align-items: center; gap: 8px; padding: 0 16px; border-bottom: 1px solid #282d35; background: #11151a; color: #edf1f7; }
+#motion-top .brand { font-weight: 750; letter-spacing: -.02em; margin-right: 12px; white-space: nowrap; } #motion-top .brand i { color: #7c9cff; font-style: normal; }
+.ms-btn { border: 1px solid #343b47; background: #1a2028; color: #e7ebf3; border-radius: 7px; padding: 7px 10px; cursor: pointer; font: 600 12px inherit; white-space: nowrap; }
+.ms-btn:hover, .ms-btn.active { background: #29344a; border-color: #6b86c6; } .ms-btn:disabled { opacity: .45; cursor: default; } .ms-btn.primary { background: #6f83e8; border-color: #7f92f0; color: #fff; }
+.ms-sep { width: 1px; height: 26px; background: #2b313b; margin: 0 4px; } .ms-spacer { flex: 1; } .ms-status { font-size: 12px; color: #98a3b7; min-width: 82px; text-align: right; }
+#motion-left, #motion-right { position: fixed; top: 59px; bottom: 0; z-index: 2147483646; background: #101419; color: #dfe5ef; box-sizing: border-box; overflow: auto; }
+#motion-left { left: 0; width: 272px; border-right: 1px solid #282d35; padding: 18px 12px 220px; } #motion-right { right: 0; width: 340px; border-left: 1px solid #282d35; padding: 18px 15px 220px; }
+.ms-kicker { margin: 0 0 9px; color: #8592a8; font-size: 10px; font-weight: 750; text-transform: uppercase; letter-spacing: .13em; } .ms-section { margin: 0 0 21px; padding-bottom: 16px; border-bottom: 1px solid #1d232c; }
+.ms-card, .ms-row-btn { width: 100%; border: 1px solid transparent; background: transparent; color: inherit; border-radius: 8px; padding: 7px; text-align: left; cursor: pointer; display: flex; gap: 8px; align-items: center; font: inherit; }
+.ms-card:hover, .ms-row-btn:hover, .ms-card.active, .ms-row-btn.active { background: #1a2230; border-color: #33405a; }
+.ms-card strong { display: block; font-size: 12px; } .ms-card small, .ms-row-btn small { display: block; color: #8793a9; font-size: 11px; margin-top: 2px; }
+.ms-thumb { width: 44px; height: 58px; border-radius: 4px; background: linear-gradient(145deg, #6678c8, #202838 62%, #e6825b); flex: none; }
+.ms-dot { width: 7px; height: 7px; border-radius: 50%; background: #8799ff; flex: none; } .ms-dot.key { background: #fc6e78; box-shadow: 0 0 0 3px #fc6e7833; }
+.ms-row-btn { font-size: 12px; white-space: nowrap; overflow: hidden; } .ms-row-btn span { overflow: hidden; text-overflow: ellipsis; }
+.ms-thread { border: 1px solid #2a3244; border-radius: 8px; padding: 8px; margin-bottom: 8px; cursor: pointer; } .ms-thread:hover, .ms-thread.active { border-color: #fc6e78; background: #1a1c26; }
+.ms-thread b { font-size: 12px; color: #ffd0d4; } .ms-thread small { display: block; color: #8793a9; font-size: 11px; margin-top: 3px; line-height: 1.4; }
+.ms-field { width: 100%; box-sizing: border-box; margin: 4px 0 10px; background: #0b0f14; color: #f0f3f8; border: 1px solid #303947; border-radius: 7px; padding: 8px; font: 12px inherit; } .ms-field:focus { outline: 2px solid #7089e866; border-color: #839cf2; }
+.ms-label { display: block; font-size: 11px; color: #9ca9bd; font-weight: 650; margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ms-f { min-width: 0; } .ms-row { display: flex; gap: 8px; align-items: flex-end; margin-bottom: 2px; } .ms-row > * { min-width: 0; } .ms-row > .ms-f { flex: 1; } .ms-row .ms-btn { margin: 4px 0 10px; }
+.ms-muted { font-size: 12px; color: #7d899b; line-height: 1.45; } .ms-range { accent-color: #8198ff; width: 100%; margin: 6px 0 10px; }
+.ms-diag { font-size: 11px; line-height: 1.45; margin: 0 0 6px; padding: 7px 9px; border-radius: 6px; } .ms-diag.err { background: #3a1f26; color: #ffb3bd; } .ms-diag.warn { background: #34301c; color: #ffe2a0; } .ms-diag.ok { background: #1c3328; color: #b6f0cc; }
+#motion-bottom { position: fixed; left: 272px; right: 340px; bottom: 0; height: 214px; z-index: 2147483647; background: #11151a; border-top: 1px solid #282d35; box-sizing: border-box; padding: 12px 16px; color: #e8edf5; }
+.ms-transport { display: flex; align-items: center; gap: 10px; } .ms-transport .ms-range { margin: 0; } .ms-time { font: 12px ui-monospace, SFMono-Regular, monospace; color: #aeb8ca; min-width: 110px; }
+.ms-timeline { height: 62px; margin: 10px 0 8px; display: flex; gap: 3px; position: relative; align-items: stretch; }
+.ms-timeline:after { content: ''; position: absolute; top: -4px; bottom: -4px; width: 2px; background: #fc6e78; left: var(--playhead, 0%); box-shadow: 0 0 0 1px #fc6e7855; pointer-events: none; }
+.ms-block { border: 1px solid #485367; background: #202938; border-radius: 5px; min-width: 24px; cursor: pointer; padding: 5px 7px; color: #dfe7fa; font-size: 11px; overflow: hidden; position: relative; text-align: left; font-family: inherit; }
+.ms-block.active { background: #5268b8; border-color: #9cafff; } .ms-block .cam { display: block; color: #ffd8a8; font-size: 10px; margin-top: 3px; } .ms-block .thread { display: block; color: #ffb3bd; font-size: 10px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ms-handle { position: absolute; top: -6px; width: 14px; height: 14px; margin-left: -7px; background: #fc6e78; border: 2px solid #11151a; border-radius: 3px; transform: rotate(45deg); cursor: pointer; z-index: 2; } .ms-handle:hover { background: #ff97a0; } .ms-handle.broken { background: #ff3b3b; box-shadow: 0 0 0 3px #ff3b3b55; }
+.ms-beat { position: absolute; bottom: -6px; width: 1px; height: 6px; background: #4d5a75; pointer-events: none; } .ms-beat.bar { height: 10px; bottom: -10px; background: #8198ff; }
+.ms-offbeat { position: absolute; bottom: -12px; width: 6px; height: 6px; margin-left: -3px; border-radius: 50%; background: #ffd8a8; }
+.ms-review { display: flex; gap: 6px; align-items: center; margin: 4px 0 8px; } .ms-review .ms-muted { margin-right: 4px; white-space: nowrap; }
+.ms-prompt { display: flex; gap: 8px; } .ms-prompt input { flex: 1; margin: 0; }
+.ms-help { font-size: 11px; color: #748095; margin-top: 6px; }
+.__motion-sel { outline: 2px solid #8aa2ff !important; outline-offset: 3px; }
+.__motion-thread { outline: 2px dashed #fc6e78 !important; outline-offset: 6px; }
+@media (max-width: 1100px) { #motion-left { width: 220px; } #motion-right { width: 290px; } #motion-viewport, #motion-bottom { left: 220px; right: 290px; } }

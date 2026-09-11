@@ -75,8 +75,16 @@ def _strip_markup(msg: str) -> str:
             return _Text.from_markup(msg).plain
         except Exception:
             pass
+    # No rich -- every packaged build, because rich is in this engine's
+    # requirements and not the app's. A bracket literal() escaped is text,
+    # not a tag: keep it, and take the escape off.
     import re
-    return re.sub(r"\[/?[a-zA-Z0-9 #_.-]*\]", "", msg)
+    return _unescape(re.sub(r"(?<!\\)\[/?[a-zA-Z0-9 #_.-]*\]", "", msg))
+
+
+def _unescape(msg: str) -> str:
+    """'\\[slide-deck]' -> '[slide-deck]': literal()'s escape, taken off."""
+    return msg.replace("\\[", "[")
 
 
 def _tell(level: str, msg: str) -> None:
@@ -91,7 +99,7 @@ def _tell(level: str, msg: str) -> None:
 
 
 def _plain(msg: str):
-    print(msg)
+    print(_unescape(msg))   # literal()'s escape is for the sink, not the reader
 
 
 def rule(label: str = "", style: str = "pink"):
@@ -141,13 +149,15 @@ def literal(text) -> str:
     goes into an f-string for say/info/warn.
     """
     s = str(text)
-    if not _RICH:
-        return s
-    try:
-        from rich.markup import escape as _escape
-        return _escape(s)
-    except Exception:
-        return s.replace("[", "\\[")
+    if _RICH:
+        try:
+            from rich.markup import escape as _escape
+            return _escape(s)
+        except Exception:
+            pass
+    # Without rich, _strip_markup's fallback drops "[slide-deck]" just as
+    # rich would, so escape it either way; the fallback and _plain undo it.
+    return s.replace("[", "\\[")
 
 
 def banner():

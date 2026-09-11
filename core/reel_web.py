@@ -1130,7 +1130,7 @@ def script_instructions() -> str:
         "program. Reply with ONLY a JSON object, wrapped in a ```json "
         "fenced code block and nothing else — no prose before it, none "
         "after. The fence keeps the chat window from reformatting what "
-        "you wrote.\n\n"
+        "you wrote. " + IN_CHAT_RULE + "\n\n"
         "You are writing the SCRIPT for a short vertical brand reel. Words "
         "and running order only. You do not decide how it looks: a separate "
         "art-direction pass does that, and anything you say about colour, "
@@ -1452,7 +1452,8 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "ONLY a JSON object, wrapped in a ```json fenced code block and "
         "nothing else — no prose before it, none after. The fence matters: "
         "outside one, the chat window eats the asterisks in your CSS and "
-        "breaks long URLs across lines, and the design is lost.\n\n"
+        "breaks long URLs across lines, and the design is lost. "
+        + IN_CHAT_RULE + "\n\n"
         "You are the ART DIRECTOR for a 1080x1920 vertical reel. The script "
         "above is final: use its words exactly, in its order, with its "
         "timings. Everything about how it LOOKS and MOVES is yours — "
@@ -1681,6 +1682,27 @@ def read_script(script_text: str) -> list[dict]:
         if isinstance(scenes, list) and scenes:
             return [s for s in scenes if isinstance(s, dict)]
     return []
+
+
+# The sentence every JSON-returning Studio prompt carries. Found on a
+# client's Mac (11 Sep 2026): the art-direction reply came back with no JSON
+# in the chat at all -- the kind of reply Claude moves into an artifact panel
+# and ChatGPT into a canvas by default when it is long and code-shaped. Prism
+# reads the conversation text; a side panel is invisible to it, so the
+# design was "lost" while sitting on screen. Nothing in the prompt had said
+# not to do that.
+IN_CHAT_RULE = (
+    "Put it in this chat message itself: do NOT create an artifact, a "
+    "canvas, a document or a downloadable file. The program reads only the "
+    "conversation text, so anything placed in a side panel is never seen "
+    "and the work is lost.")
+
+IN_CHAT_REASK = (
+    "Your design did not reach me: nothing in your chat message parses as "
+    "JSON, which usually means it went into an artifact, canvas or file. "
+    "Send the SAME design again as a ```json fenced code block IN THIS CHAT "
+    "MESSAGE ITSELF, with the \"design\" and \"storyboard\" keys, nothing "
+    "before or after it, and do not create an artifact or canvas.")
 
 
 def parse_design(text: str) -> tuple[dict, list[dict]]:
@@ -1933,7 +1955,8 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
                if "asset:logo" in assets else "")
             + "\n") if assets else "")
 
-        + "REPLY WITH ONLY THIS JSON OBJECT, in a ```json fenced code block, "
+        + "REPLY WITH ONLY THIS JSON OBJECT, in a ```json fenced code block "
+        "in this chat message itself (no artifact, canvas or file), "
         "nothing before or after it:\n"
         '{\n'
         f'  "seconds": {seconds:g},\n'

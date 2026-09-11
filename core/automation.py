@@ -3671,6 +3671,75 @@ def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
     return responses + [text], canva_url
 
 
+def _rescue_json_from_page(driver, marker: str) -> list[str]:
+    """Code-shaped text anywhere on the page that carries `marker`, oldest
+    first -- the reply's own code block, a Claude artifact panel, a ChatGPT
+    canvas, an editor. _capture() reads the reply element; when a tool has
+    moved a long JSON answer into a side panel the reply element holds a
+    sentence and the JSON sits beside it. Prism's own prompt echoes are
+    dropped, since the design prompt contains an example. Never raises."""
+    js = """
+        const marker = arguments[0];
+        const sel = "pre, code, .cm-content, [data-testid*='artifact' i], "
+                  + "[class*='artifact' i], [class*='canvas' i], "
+                  + "[role='dialog'], textarea";
+        const out = [], seen = new Set();
+        for (const el of document.querySelectorAll(sel)) {
+            const t = (el.innerText || el.value || el.textContent || '').trim();
+            if (t.length < 40 || !t.includes(marker) || seen.has(t)) continue;
+            seen.add(t); out.push(t);
+        }
+        return out.slice(-6);
+    """
+    try:
+        found = driver.execute_script(js, marker) or []
+    except Exception:
+        return []
+    return [t for t in found if isinstance(t, str) and not _is_prompt_echo(t)]
+
+
+def _design_turn_text(driver, agent_cfg: dict, texts: list, web, ask) -> str:
+    """The art-direction reply that actually parses, found wherever it is.
+
+    Newest capture first (the reply is at the end of the chat; the prompt,
+    with its example, is above it). Then the page's code panels -- an
+    artifact or canvas the tool put the JSON in. Then one plain re-ask that
+    names the problem, and both again. Falls back to the newest capture, so
+    the caller's own error and its saved evidence are unchanged when nothing
+    helps. Found on a client's Mac, 11 Sep 2026: "No JSON found in the
+    agent's reply" with the design visibly on screen."""
+    def parses(text: str) -> bool:
+        try:
+            web.parse_design(text)
+            return True
+        except Exception:                                   # noqa: BLE001
+            return False
+
+    for t in reversed([t for t in (texts or []) if str(t).strip()]):
+        if parses(t):
+            return t
+    for marker in ('"storyboard"', '"design"'):
+        for t in reversed(_rescue_json_from_page(driver, marker)):
+            if parses(t):
+                ui.info("   📋  the design was in a panel beside the chat, "
+                        "not in the reply — read it from there")
+                return t
+    ui.warn("   the design did not arrive in the chat message — asking for "
+            "it there, not in an artifact or canvas")
+    got = ""
+    try:
+        got = ask(web.IN_CHAT_REASK, '"css"') or ""
+    except Exception as e:                                  # noqa: BLE001
+        ui.warn(f"   couldn't ask again: {e}")
+    if got and parses(got):
+        return got
+    for marker in ('"storyboard"', '"design"'):
+        for t in reversed(_rescue_json_from_page(driver, marker)):
+            if parses(t):
+                return t
+    return texts[-1] if texts else got
+
+
 def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
            wait: int = 0) -> list[str]:
     """Send one follow-up in the SAME tab and re-scrape.
@@ -5357,8 +5426,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 
                     script_txt = "\n".join(all_responses.get(script_stage) or [])
                     try:
+                        first_reply = _design_turn_text(driver, agent_cfg, texts,
+                                                        _web, _ask)
                         spec = _web.build_spec(
-                            texts[-1], _ask,
+                            first_reply, _ask,
                             script=script_txt, assets=listing,
                             assets_table=design_assets,
                             check=_web.inspect,

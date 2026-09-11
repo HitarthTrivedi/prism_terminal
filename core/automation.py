@@ -1188,6 +1188,24 @@ def _needed_stages(routing: dict, agents: dict):
         yield stage, name, questions
 
 
+def _reel_imagery_on(routing: dict, cfg: dict) -> bool:
+    """Does this reel get generated pictures?
+
+    Three voices, strongest last: Prism's default (yes), the customer's own
+    setting, and what the person asked for in this request — "type only" and
+    "no images" are honoured, and router.apply_reel_imagery_guardrail is
+    where that reading happens. Kept as one function so the Studio and
+    Motion paths cannot answer it differently, which is how one of them
+    ended up with no image step at all.
+    """
+    # The router can only turn the pictures OFF (the person said "type
+    # only"). Its "on" is the default restated, and letting it win overrode
+    # a customer's own reel_imagery: false.
+    if (routing or {}).get("_reel_imagery") is False:
+        return False
+    return bool(cfg.get("reel_imagery", True))
+
+
 def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
     """Push any attached files into the tool's <input type='file'>, if present.
 
@@ -1648,6 +1666,47 @@ def _anchor_text(anchor) -> str:
         return ""
 
 
+#: The "Document·DOCX" line on a generated-file card. Claude labels an
+#: artifact by its TYPE, not by a filename — "Lazycook design brief" on one
+#: line, "Document·DOCX" on the next, "Download" on the third — so nothing
+#: in the card ends in ".docx" and every extension-based test walked past a
+#: document the tool had plainly just built (run of 2026-09-08 15:07).
+_CARD_TYPE_RE = re.compile(
+    r"^(?:(?P<word>document|spreadsheet|presentation|code|text|file)\s*)?"
+    r"(?P<sep>[·•|]\s*)?"
+    r"(?P<ext>docx?|pdf|pptx?|xlsx?|csv|md|txt|zip|json|py|ipynb)\s*$", re.I)
+
+#: Labels on a card that are controls, not the document's name.
+_CARD_CONTROLS = ("download", "copy", "open", "preview", "publish", "share")
+
+
+def _card_filename(text: str) -> str:
+    """The filename a generated-file CARD implies, from its type label.
+
+    Deliberately conservative: a bare "PDF" on a line is not enough, since a
+    reply can say that about anything. The type must be introduced — by the
+    word ("Document PDF") or by a separator ("· PDF") — which is how every
+    card that has been seen actually writes it.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    lines = [ln for ln in lines if ln]
+    ext, type_at = "", -1
+    for i, line in enumerate(lines):
+        m = _CARD_TYPE_RE.match(line)
+        if m and (m.group("word") or m.group("sep")):
+            ext, type_at = "." + m.group("ext").lower(), i
+            break
+    if not ext:
+        return ""
+    name = ""
+    for line in reversed(lines[:type_at]):
+        if line.lower() in _CARD_CONTROLS:
+            continue
+        name = line
+        break
+    return _safe_filename(name or "document")[:80] + ext
+
+
 def _filename_in_text(text: str) -> str:
     """The filename an anchor SHOWS, when its href gives nothing away.
 
@@ -1661,17 +1720,19 @@ def _filename_in_text(text: str) -> str:
     labelled "Download" (the chip is labelled with the filename), and the
     step was reported as "Prism couldn't read the response"."""
     text = (text or "").strip()
-    if not text or len(text) > 160:
+    if not text:
         return ""
-    low = text.lower()
-    if any(low.endswith(ext) for ext in _HARVESTABLE_EXTS):
-        return text
-    for token in text.split():
-        t = token.strip("()[],;:\"'")
-        if any(t.lower().endswith(ext) for ext in _HARVESTABLE_EXTS) and len(t) > len(
-                os.path.splitext(t)[1]):
-            return t
-    return ""
+    if len(text) <= 160:
+        low = text.lower()
+        if any(low.endswith(ext) for ext in _HARVESTABLE_EXTS):
+            return text
+        for token in text.split():
+            t = token.strip("()[],;:\"'")
+            if any(t.lower().endswith(ext) for ext in _HARVESTABLE_EXTS) and len(t) > len(
+                    os.path.splitext(t)[1]):
+                return t
+    # No extension anywhere — but a card that names its type is still a file.
+    return _card_filename(text)
 
 
 def _safe_filename(name: str) -> str:
@@ -1899,6 +1960,119 @@ def _files_as_reply(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _doc_stem(text: str, stage: str) -> str:
+    """A filename for a document Prism had to write itself — taken from the
+    answer's own first heading, so the file in Artifacts is called what the
+    document calls itself rather than "content 3"."""
+    for line in (text or "").splitlines():
+        s = line.strip().lstrip("#").strip(" *_")
+        if not s:
+            continue
+        if 3 <= len(s) <= 80 and not s.endswith((".", ":", "!", "?")):
+            return _safe_filename(s)
+        break
+    return _safe_filename(stage or "document")
+
+
+def _meet_contract(driver, agent_cfg: dict, stage: str, kind: str,
+                   texts: list, made: list, *, query: str = "",
+                   attachments=None, should_stop=None) -> dict:
+    """Hold a finished step to what it owed, and try ONCE to put it right.
+
+    This is the half of core/contract.py that touches the page. A step whose
+    kind is `file` and which came back as chat text is not finished: the tool
+    still has everything it just wrote, so one short follow-up in the same
+    chat ("give me that as a downloadable .docx, built here") is both the
+    cheapest and the likeliest fix — far better than failing the run or
+    starting the step again somewhere else.
+
+    When even that comes back as prose, the words are not thrown away: Prism
+    writes the document itself from the step's own text, so the person still
+    ends up with a file to open and is told plainly who made it.
+
+    Returns {"files": [...harvest-shaped items...], "texts": [...], "note":
+    str, "missing": str}. Never raises: a step that produced a real answer
+    must not be failed by the machinery that was trying to improve it.
+    """
+    from . import contract as _c
+    files = [m for m in made if (m.get("kind") or "file") != "image"]
+    images = [m for m in made if (m.get("kind") or "") == "image"]
+    out: dict = {"files": [], "texts": [], "note": "", "missing": ""}
+    short = _c.missing(kind, texts=texts, files=len(files), images=len(images))
+    if not short:
+        return out
+
+    ext = _c.wanted_ext(query)
+    ask = _c.reask(kind, ext=ext)
+    halted = should_stop or (lambda: False)
+    if (ask and driver is not None and agent_cfg.get("textarea_selector")
+            and not halted()):
+        ui.warn(f"   {short} — asking once more for it")
+        try:
+            # The tool's own budget, not the follow-up minimum: this is a
+            # one-line correction, and Stop/Skip are polled throughout.
+            more = _reask(driver, agent_cfg, ask, should_stop=halted,
+                          wait=int(agent_cfg.get("wait_time", 60) or 60))
+        except Exception as e:                              # noqa: BLE001
+            ui.warn(f"   couldn't ask again ({e})")
+            more = []
+        if halted():
+            out["missing"] = short
+            return out
+        try:
+            if kind == "image":
+                if _wait_for_images(driver, agent_cfg, 1, cap=180, grace=20,
+                                    should_stop=should_stop):
+                    out["files"] = _harvest_images(driver, agent_cfg, stage)
+            else:
+                _wait_for_files(driver, stage=stage, cap=45, grace=12)
+                ignore = tuple(
+                    os.path.basename(a.get("name") or a.get("path") or "")
+                    for a in (attachments or []) if isinstance(a, dict))
+                out["files"] = _harvest_files(
+                    driver, agent_cfg, stage,
+                    ignore_names=tuple(n for n in ignore if n),
+                    click_fallback=True)
+        except Exception as e:                              # noqa: BLE001
+            ui.warn(f"   couldn't collect it ({e})")
+        if out["files"]:
+            ui.ok(f"   ✅  got it on the second ask — "
+                  f"{len(out['files'])} file(s)")
+            return out
+        out["texts"] = [t for t in more if (t or "").strip()]
+
+    if kind != "file":
+        out["missing"] = short
+        return out
+
+    # Last resort, and the reason a document request can no longer end with
+    # nothing to open: write the file out of the words the tool did write.
+    best = max((t for t in list(texts) + out["texts"] if (t or "").strip()),
+               key=len, default="")
+    if not best:
+        out["missing"] = short
+        return out
+    import tempfile
+    try:
+        folder = tempfile.mkdtemp(prefix="prism-doc-")
+        stem = _doc_stem(best, stage)
+        path, note = _c.document_from_text(best, folder, stem, ext)
+    except Exception as e:                                  # noqa: BLE001
+        ui.warn(f"   couldn't write the document ({e})")
+        out["missing"] = short
+        return out
+    if not path:
+        out["missing"] = short
+        return out
+    out["files"] = [{"path": path, "name": os.path.basename(path),
+                     "kind": "document", "url": "",
+                     "size": os.path.getsize(path),
+                     "_site_name": os.path.basename(path)}]
+    out["note"] = note
+    ui.ok(f"   📝  {note} — {os.path.basename(path)}")
+    return out
+
+
 def _file_summaries(items: list[dict]) -> list[dict]:
     """The part of a harvested record the GUI can show: no text dump."""
     return [{"name": it.get("_site_name") or it.get("name") or "",
@@ -2114,10 +2288,28 @@ _PROMPT_ECHO_MARKERS = (
     "context from the previous pipeline stage",
 )
 
+#: Lines of Prism's own composed message that a tool might reasonably QUOTE
+#: in a real answer — a hand-off that repeats "what the person actually asked
+#: for" is doing its job. One of these alone is not enough to call a capture
+#: Prism's echo and throw it away; the whole message carries several. (The
+#: first version counted any one of them, and would have discarded exactly
+#: that hand-off.)
+_PROMPT_ECHO_SOFT = (
+    "what the person actually asked for — in their own words",
+    "where this goes: your answer passes straight to",
+    "below is prism's engineered summary of that request",
+)
+
 
 def _is_prompt_echo(text: str) -> bool:
     low = (text or "").lower()
-    return any(m in low for m in _PROMPT_ECHO_MARKERS)
+    if any(m in low for m in _PROMPT_ECHO_MARKERS):
+        return True
+    # Every first message opens "Prism · <job> · <step>" (_chat_header), and
+    # no tool's answer does.
+    if "prism · " in low[:200]:
+        return True
+    return sum(m in low for m in _PROMPT_ECHO_SOFT) >= 2
 
 
 def _safe_url(driver, exclude=()) -> str:
@@ -2394,7 +2586,18 @@ def _wait_for_files(driver, cap: int = 60, grace: int = 12,
         "const byText = [...document.querySelectorAll('a[href]')].filter(a => {"
         "  const t = (a.textContent || '').trim().toLowerCase();"
         "  return t.length < 160 && exts.some(e => t.endsWith(e)); });"
-        "return new Set([...byHref, ...byText]).size;")
+        # A third shape, and the one that cost a customer their document: a
+        # CARD with no anchor and no extension anywhere, labelled by type —
+        # "Document·DOCX" over a Download button. Matched on the artifact
+        # containers the page itself names, so this stays cheap and does not
+        # sweep every div on a long conversation.
+        + r"const typeRe = /(^|[·•|\s])(docx?|pdf|pptx?|xlsx?|csv|md|txt|zip"
+        r"|json|py|ipynb)\s*$/im;"
+        "const cards = [...document.querySelectorAll(\"[data-testid*='artifact' i], "
+        "[class*='artifact' i]\")].filter(el => "
+        "typeRe.test(((el.innerText || '').trim())) "
+        "&& /download/i.test(el.innerText || ''));"
+        "return new Set([...byHref, ...byText, ...cards]).size;")
 
     def probe() -> int:
         try:
@@ -2426,15 +2629,54 @@ def _wait_for_files(driver, cap: int = 60, grace: int = 12,
     return last
 
 
+#: Tags that are actually a control rather than something wrapped around one.
+_CONTROL_TAGS = ("button", "a")
+
+
+def _innermost_control(elements) -> object | None:
+    """Of the elements whose text matched, the one that IS the control.
+
+    This is the whole fix for a document that a tool built and Prism then
+    dropped. `contains(normalize-space(.), 'download')` matches every
+    ANCESTOR of the real button as well — the card, the message, the whole
+    conversation column — and document order puts the outermost of those
+    first. So Prism clicked a <div>, Selenium reported a successful click,
+    _harvest_via_download waited its full 45 seconds for a download that was
+    never going to start, and the DOCX Claude had just built was lost with
+    no error anywhere (run of 2026-09-08 15:07).
+
+    Two keys, in order: a real control beats a container, and among equals
+    the SHORTEST text wins — the button says "Download", the card around it
+    says the document's whole name and type as well.
+    """
+    best, best_key = None, None
+    for el in elements:
+        try:
+            if not (el.is_displayed() and el.is_enabled()):
+                continue
+            tag = (el.tag_name or "").lower()
+            role = (el.get_attribute("role") or "").lower()
+            text = (el.text or "").strip()
+        except Exception:                                   # noqa: BLE001
+            continue        # a node that went stale mid-scan is not a control
+        key = (0 if (tag in _CONTROL_TAGS or role == "button") else 1, len(text))
+        if best_key is None or key < best_key:
+            best, best_key = el, key
+    return best
+
+
 def _click_by_text(driver, texts: list[str], timeout: int = 10) -> bool:
-    """Best-effort: click the first visible, clickable element whose text
-    matches one of `texts` (case-insensitive, substring). NotebookLM's UI
-    doesn't expose stable ids/classes the way ChatGPT/Claude do, so matching
-    on visible button/label TEXT is the more durable anchor here. Returns
-    False (never raises) if nothing matched within `timeout`."""
+    """Best-effort: click the visible element whose text matches one of
+    `texts` (case-insensitive, substring). NotebookLM's UI doesn't expose
+    stable ids/classes the way ChatGPT/Claude do, so matching on visible
+    button/label TEXT is the more durable anchor here.
+
+    Polls rather than using element_to_be_clickable: that helper returns the
+    FIRST match in document order, which for a text match is the outermost
+    container — see _innermost_control. Returns False (never raises) if
+    nothing matched within `timeout`.
+    """
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
     parts = []
     for t in texts:
         tl = t.lower()
@@ -2445,13 +2687,27 @@ def _click_by_text(driver, texts: list[str], timeout: int = 10) -> bool:
             f"'{tl}')]"
         )
     xpath = " | ".join(parts)
-    try:
-        el = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.XPATH, xpath)))
-        el.click()
-        return True
-    except Exception:
-        return False
+    deadline = time.time() + max(timeout, 0)
+    while True:
+        try:
+            found = driver.find_elements(By.XPATH, xpath)
+        except Exception:                                   # noqa: BLE001
+            found = []
+        el = _innermost_control(found)
+        if el is not None:
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", el)
+            except Exception:                               # noqa: BLE001
+                pass
+            try:
+                el.click()
+                return True
+            except Exception:                               # noqa: BLE001
+                pass        # covered/animating — try again on the next poll
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
 
 
 # ── how firmly to talk to a tool ──────────────────────────────────────────────
@@ -3741,7 +3997,7 @@ def _design_turn_text(driver, agent_cfg: dict, texts: list, web, ask) -> str:
 
 
 def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
-           wait: int = 0) -> list[str]:
+           wait: int = 0, should_stop=None) -> list[str]:
     """Send one follow-up in the SAME tab and re-scrape.
 
     Used when a stage answered but not in the shape the next stage needs. The
@@ -3775,7 +4031,8 @@ def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
         if not clicked:
             box.send_keys(Keys.ENTER)
         _smart_wait(driver, agent_cfg,
-                    wait or agent_cfg.get("wait_time", 60), expect=expect)
+                    wait or agent_cfg.get("wait_time", 60), expect=expect,
+                    should_stop=should_stop)
         return _capture(driver, agent_cfg, keep=expect)
     except Exception as e:
         ui.err(f"   follow-up failed: {e}")
@@ -4461,12 +4718,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 ui.info("🖼️   Make the images was left out of the plan — no "
                         "pictures will be generated; the reel is built from "
                         "type and colour"
-                        + (" and the artwork attached" if asset_list else "")
+                        + (" and the artwork attached" if client_pics else "")
                         + ". This is an asset choice, not a layout check.")
-            if (not left_out and cfg.get("reel_imagery", True)
+            if (not left_out and _reel_imagery_on(routing, cfg)
                     and A.resolve_agent("visual", maker)):
                 stages.insert(studio_at, ("artwork", maker, [
-                    _web.imagery_instructions(query, bool(asset_list),
+                    _web.imagery_instructions(query, bool(client_pics),
                                               attached=client_pics)]))
                 machine_stages[studio_at] = (
                     "\n\nSTRICT PIPELINE RULES:\n"
@@ -4585,6 +4842,38 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     "to plan the motion graphic.")
         else:
             from .motion import generate as _motion_gen
+            from . import reel_web as _web_m
+            # Motion makes its pictures the same way Studio does, and for
+            # the same reason: most jobs arrive with a company name and a
+            # sentence, nothing attached. This step used to exist only on
+            # the Studio path, so a reel rendered by Motion could not
+            # contain a generated picture at all however the plan was
+            # written — the storyboard was told what assets existed, there
+            # were none, and every scene came out as type and colour.
+            # Inserted BEFORE the storyboard stage, so the images exist
+            # when the scenes that place them are written.
+            maker_m = agents.get("visual") or "ChatGPT"
+            if ("visual" in (skip_stages or ())):
+                ui.info("🖼️   Make the images was switched off — the motion "
+                        "graphic is built from type and colour")
+            elif _reel_imagery_on(routing, cfg) and A.resolve_agent("visual", maker_m):
+                own = []
+                try:
+                    from . import assets as _assets_m
+                    own = list(_assets_m.collect(attachments or []))
+                except Exception:                          # noqa: BLE001
+                    own = []
+                stages.insert(motion_at, ("artwork", maker_m, [
+                    _web_m.imagery_instructions(query, bool(own),
+                                                attached=own)]))
+                machine_stages[motion_at] = (
+                    "\n\nThe images themselves are collected from this page "
+                    "automatically — they ARE the deliverable. Produce them, "
+                    "then write one short line per image saying what it is. "
+                    "Nothing else is read.")
+                motion_at += 1
+                ui.info(f"🖼️   {maker_m} will make up to "
+                        f"{_web_m.MAX_GENERATED} images for the motion graphic")
             stages.insert(motion_at, ("motion_plan", planner,
                                       [_motion_gen.storyboard_instructions(
                                           query,
@@ -4660,6 +4949,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # claim, and this is what lets the run say so instead of quietly calling
     # a partial answer done.
     incomplete: dict[str, dict] = {}
+    # Something worth telling the person about a step that otherwise went
+    # fine — today only "Prism wrote this document itself from the tool's
+    # text" (see _meet_contract). Carried on the stage_done event so the
+    # card can say it, rather than living only in the log.
+    stage_notes: dict[str, str] = {}
 
     # Local renderers (Prism Reel / Studio / Motion) held back because a
     # stage BEFORE them produced nothing and is queued for the failover
@@ -4700,6 +4994,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 pass       # rendering succeeded; copying is best-effort
             all_responses[stage] = [note]
             all_links[stage] = out
+            delivered["video"] = delivered.get("video", 0) + 1
             ui.ok(note)
             ui.info(f"   📁  {out}")
             emit("stage_done", {"stage": stage, "count": 1, "texts": [note],
@@ -4743,6 +5038,38 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             pipeline_files=pipeline_files, brand=studio_brand,
             skip_signal=skip_signal, image_stages=image_stages,
             fallback_signal=fallback_signal)
+
+    # What each step owes the person — see core/contract.py. Resolved HERE,
+    # after every insertion above, so the stages the engine adds for itself
+    # (analysis, artwork, design, motion_plan) are held to the same contract
+    # as the ones the planner wrote, and so a plan that predates kinds still
+    # has one for every step.
+    from . import contract as _contract
+    stage_kinds: dict[int, str] = {}
+    _entries = []
+    _read_by_program = {i for i in (spec_feeder, design_feeder, motion_feeder)
+                        if i is not None} | set(machine_stages)
+    for _i, (_st, _an, _qs) in enumerate(stages):
+        _cfg = A.resolve_agent(_st, _an) or {}
+        _planned = routing.get(_st)
+        _k = _contract.for_stage(
+            _st, _planned.get("kind", "") if isinstance(_planned, dict) else "",
+            _cfg)
+        # A step whose reply a program reads (the script feeding a renderer,
+        # the design, the storyboard) never owes the person a file — asking
+        # it for one would put a document request on top of "JSON only".
+        # The artwork step is read by a program too, but its deliverable IS
+        # the pictures, so it keeps its kind.
+        if _i in _read_by_program and _st != "artwork":
+            _k = "data"
+        stage_kinds[_i] = _k
+        _entries.append((_st, _k, _cfg))
+    _file_at = _contract.file_step_index(_entries, query)
+    if _file_at >= 0:
+        stage_kinds[_file_at] = "file"
+    owed = _contract.promised(
+        [(_st, stage_kinds[_i]) for _i, (_st, _a, _q) in enumerate(stages)])
+    delivered: dict[str, int] = {}
 
     for stage_idx, (stage, agent_name, questions) in enumerate(stages):
         if stopped():
@@ -4951,51 +5278,59 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # has to be there. The old numbered "STRICT PIPELINE RULES"
                 # read as a rule sheet, and a rule sheet is what a chat model
                 # answers thinly or not at all.
-                rules = [
-                    "Do the task above and only that — nothing extra built, "
-                    "designed or produced that was not asked for.",
-                ]
-                if prior:
-                    rules.append(
-                        "Read the context above first and pull out what "
-                        "matters from it, briefly and exactly — those points "
-                        "have to survive into your handoff."
-                    )
-                rules.append(
-                    f"This is not for a person yet: it goes straight to "
-                    f"{nxt_agent} for the '{nxt_stage}' step, and {nxt_agent} "
-                    f"sees only your answer, nothing from before. So end with a "
-                    f"section titled 'HANDOFF FOR {nxt_agent.upper()}' — a "
-                    f"short, exact summary of every fact, decision and "
-                    f"constraint so far (earlier steps' and your own) that "
-                    f"{nxt_agent} needs to do its job."
-                )
-                rules.append(
-                    "Your reader is another AI, not a human — never end with a "
-                    "follow-up question or an offer of options. The handoff "
-                    "section must be the LAST thing in your answer."
-                )
+                # One short paragraph, not a numbered rule sheet. It was
+                # four rules — "do only the task", "read the context",
+                # "end with HANDOFF FOR X", "your reader is another AI" —
+                # 753 characters of procedure wrapped around a task that
+                # was often 200. On an image step it demanded a written
+                # handoff from a step whose whole job is to return a
+                # picture, and that is what came back instead of the
+                # picture. Everything it still needs to say fits here.
                 handoff = (
                     _natural_handoff(nxt_agent, final=False)
                     if _is_natural(agent_cfg) else
-                    "\n\nHOW THIS FITS IN:\n" + "\n".join(
-                        f"{i}. {r}" for i, r in enumerate(rules, 1)))
+                    "\n\nWHERE THIS GOES: your answer passes straight to "
+                    f"{nxt_agent} for the '{nxt_stage}' step, which sees "
+                    "nothing else from this run. Do the task above and "
+                    "nothing else, then finish with a short section headed "
+                    f"'HANDOFF FOR {nxt_agent.upper()}' carrying the facts, "
+                    "decisions and constraints it needs — last thing in your "
+                    "answer, and no questions back.")
             else:
                 handoff = _natural_handoff("", final=True) if _is_natural(agent_cfg) else (
-                    "\n\nHOW THIS FITS IN:\n"
-                    "You are the last step, so this goes to the person. "
-                    "Everything above is the whole brief — the earlier steps "
-                    "are already distilled into it. Do the task above and give "
-                    "the finished result: no handoff or summary section for a "
-                    "next step, and no questions back, because nobody is here "
-                    "to answer them."
-                )
+                    "\n\nThis is the last step, so your answer goes to the "
+                    "person. Give the finished result — no handoff section, "
+                    "no summary for a next step, and no questions back.")
             if _is_maker(agent_cfg) and stage_idx not in machine_stages \
                     and stage_idx != spec_feeder:
                 # A maker is never asked for a handoff section: what it
                 # builds is what the next stage gets (the harvest), and the
                 # STRICT PIPELINE RULES above read to it as "answer in text".
                 handoff = _maker_handoff()
+
+            # ONE line saying what to hand back, written for this step's kind
+            # and this tool — see core/contract.py. It goes FIRST, ahead of
+            # the pipeline's own wording, because it is the thing the person
+            # actually wants; and it is the only such line in the message,
+            # which is the point. A machine-read stage already has its format
+            # block and must not be given a second one.
+            _kind = stage_kinds.get(stage_idx, "text")
+            if _kind in ("file", "image", "video") and not machine_shaped:
+                _line = _contract.deliverable_line(
+                    _kind, agent_name, agent_cfg,
+                    ext=_contract.wanted_ext(query))
+                if _line:
+                    handoff = "\n\n" + _line + handoff
+            elif _kind == "text" and not machine_shaped:
+                # This tool's own known drift, one line, and only where it
+                # matters: a long answer that lands in a canvas or a side
+                # panel is invisible to the scraper, which is how a reel
+                # script written perfectly well by Claude became six scenes
+                # with no words in them. Not said on a `file` step — there
+                # the panel IS the deliverable.
+                _drift = (agent_cfg.get("avoid") or "").strip()
+                if _drift:
+                    handoff = "\n\n" + _drift + handoff
 
             # The user asked for answers in their own language. Appended last
             # so it is the final instruction the model reads, and skipped for
@@ -5485,7 +5820,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     # rather than approximate one out of shapes and text.
                     motion_assets_table = {}
                     try:
-                        motion_assets_table = _assets.collect(attachments or [])
+                        # The client's own files AND whatever earlier steps
+                        # generated. Attachments only, until now — so the
+                        # pictures an image step had just made and saved were
+                        # never offered to the storyboard, and a Motion reel
+                        # was type and colour however many images the run had
+                        # produced.
+                        _made = {f["path"] for f in pipeline_files}
+                        motion_assets_table = _assets.collect(
+                            (attachments or []) + pipeline_files,
+                            generated=_made)
                         if motion_assets_table:
                             ui.info(f"   🖼️   {len(motion_assets_table)} "
                                     "asset(s) prepared from the artwork: "
@@ -5709,6 +6053,54 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     _save_artifacts(made_files, query, stage, link=all_links.get(stage, ""))
                     made_here = made_files
 
+            # Did this step produce what it owed? A `file` step that came
+            # back as chat text is asked once for the file, and if it still
+            # answers in prose the text is written out as a document — see
+            # _meet_contract and core/contract.py. This is what stops "make
+            # me a DOCX" ending with nine thousand characters in a chat
+            # window and nothing on the disk.
+            kind_here = stage_kinds.get(stage_idx, "text")
+            short_of = ""
+            # Only a CHAT can be asked again. Canva, Gamma and the other
+            # makers, Apollo's search screen and NotebookLM have a prompt
+            # box but no conversation: "please give me that as a file"
+            # typed there starts a new generation, and the text scraped off
+            # the page is not the design it built. Their deliverable is
+            # what they made in their own page, and the link keeps it.
+            chat_tool = not (_is_maker(agent_cfg)
+                             or agent_cfg.get("search_tool")
+                             or agent_cfg.get("runner")
+                             or agent_name == "NotebookLM")
+            if not stopped() and chat_tool and not machine_shaped:
+                fixed = _meet_contract(
+                    driver, agent_cfg, stage, kind_here, stage_responses,
+                    made_here, query=query, attachments=attachments,
+                    should_stop=stage_halt)
+                if fixed["files"]:
+                    _save_artifacts(fixed["files"], query, stage,
+                                    link=all_links.get(stage, ""))
+                    pipeline_files[:] = (pipeline_files + fixed["files"])[-6:]
+                    made_here = list(made_here) + fixed["files"]
+                if fixed["texts"] and not stage_responses:
+                    stage_responses = fixed["texts"]
+                    all_responses[stage] = stage_responses
+                if fixed["note"]:
+                    stage_notes[stage] = fixed["note"]
+                short_of = fixed["missing"]
+            if made_here:
+                if kind_here == "video":
+                    # A browser video tool's output is harvested like a
+                    # picture and tagged "image"; the step was owed a video.
+                    delivered["video"] = delivered.get("video", 0) + 1
+                for _item in made_here:
+                    _k = "image" if (_item.get("kind") == "image") else "file"
+                    delivered[_k] = delivered.get(_k, 0) + 1
+            elif (not chat_tool and stage_responses
+                    and kind_here in ("file", "image", "video")):
+                # A maker answered and its design or video lives in its own
+                # page; the saved link is the deliverable.
+                delivered[kind_here] = delivered.get(kind_here, 0) + 1
+
             # A tool that answered WITH A FILE and no prose has answered.
             # This used to fall through to "it returned nothing": the card
             # said "Prism couldn't read the response off the page", the run
@@ -5721,10 +6113,19 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 
             if stage_responses:
                 ui.ok(f"captured {len(stage_responses)} response(s)")
+                if short_of:
+                    # Finished, but not with the thing that was asked for.
+                    # Said out loud here and carried to the card: an image
+                    # step that produced no image used to be reported as a
+                    # completed step and only noticed when the reel came out
+                    # blank.
+                    ui.warn(f"   ⚠️   {short_of}")
                 emit("stage_done", {"stage": stage, "count": len(stage_responses),
                                     "snippet": stage_responses[0][:200],
                                     "texts": stage_responses, "url": driver.current_url,
                                     "timed_out": timed_out,
+                                    "note": stage_notes.get(stage, ""),
+                                    "missing": short_of,
                                     "files": _file_summaries(made_here)})
                 if timed_out:
                     # Real output, kept in all_responses above — but the cap,
@@ -5820,6 +6221,32 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             break
         ui.info(f"   ▶  {stage}: the retries are done — rendering now")
         _run_local_stage(stage, agent_name, agent_cfg)
+
+    # Finally: did the run produce the things it was for? Every step can end
+    # green and the folder still be empty — a picture step that answered in
+    # prose, a document step whose file was never collected, a render that
+    # was skipped because an earlier stage failed. Checked once, here,
+    # against what the plan promised, so the last thing said about a run is
+    # true rather than merely tidy.
+    if owed and not stopped():
+        # The failover pass runs a nested run with counts of its own, and a
+        # render re-run after a recovery never passes through the loop above;
+        # both leave their evidence here instead.
+        for _item in pipeline_files:
+            _k = "image" if _item.get("kind") == "image" else "file"
+            delivered[_k] = max(delivered.get(_k, 0), 1)
+        for _i, (_st, _a, _q) in enumerate(stages):
+            _link = all_links.get(_st) or ""
+            if (stage_kinds.get(_i) == "video" and _link
+                    and os.path.isfile(_link)):
+                delivered["video"] = max(delivered.get("video", 0), 1)
+        gap = _contract.shortfall(owed, delivered)
+        emit("run_shortfall", {"missing": gap, "delivered": dict(delivered)})
+        if gap:
+            ui.warn("this run was asked for "
+                    + ", ".join(_contract.label(k) for k in owed)
+                    + " — and did not produce "
+                    + ", ".join(_contract.label(k) for k in gap))
 
     return all_responses, all_links
 

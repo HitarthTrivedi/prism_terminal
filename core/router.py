@@ -236,6 +236,55 @@ def _tool_notes() -> str:
                 continue
     return "\n\n".join(parts)[:_NOTES_MAX_CHARS]
 
+
+#: A tool's own heading in the notes file: "Perplexity:", "Kimi 2.6:". The
+#: sub-headings inside one ("Pros:", "Cons:", "My recommendation:") match the
+#: same shape, so they are listed out rather than guessed at.
+_NOTE_TOOL_HEAD = re.compile(r"^([A-Za-z][\w .+/&-]{0,30}?)\s*:\s*$")
+_NOTE_SUBHEADS = ("pros", "cons", "myrecommendation", "recommendation",
+                  "note", "notes", "mytake", "usefor", "avoidfor")
+
+
+def _squash(name: str) -> str:
+    return "".join((name or "").lower().split())
+
+
+def _notes_for(agents: dict) -> str:
+    """The field notes for the tools ACTUALLY IN THIS PLAN, plus the general
+    routing sections.
+
+    The whole file used to go to the planner — 6,343 characters on the
+    owner's machine, most of it about tools the plan does not use and
+    advice ("use Runway for generated video") the planner cannot act on,
+    since it chooses steps and not tools. It was also introduced as
+    outranking the rules, which is how a note about one tool ended up
+    competing with the rule that decides whether a step runs at all.
+
+    Notes for a tool that is in the plan are worth their space: they say how
+    that tool behaves in practice. Everything else is budget spent on
+    confusion, so it is left out.
+    """
+    raw = _tool_notes()
+    if not raw:
+        return ""
+    wanted = {_squash(n) for n in agents.values() if n}
+    out: list[str] = []
+    keep = True
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("=="):
+            keep = True                 # a general routing note, not a tool
+        else:
+            head = _NOTE_TOOL_HEAD.match(line)
+            if head and not line[:1].isspace():
+                name = _squash(head.group(1))
+                if name not in _NOTE_SUBHEADS:
+                    keep = any(name.startswith(w) or w.startswith(name)
+                               for w in wanted if w)
+        if keep:
+            out.append(line)
+    return "\n".join(out).strip()[:_NOTES_MAX_CHARS]
+
 # ── Deterministic make-stage guardrail ────────────────────────────────────────
 # If the query clearly asks to BUILD an artefact, we force the matching make-stage
 # on even when the model skipped it — so "design a PPT" can never come back as a
@@ -257,16 +306,27 @@ _ARTEFACT_STAGES = {
               "audio", "podcast", "tts", "avatar", "reel", "short video",
               "short-form"],
     # NOTE: no bare "prototype" here — it's usually the SUBJECT of a task
-    # ("pitch the prototype"), not a request to build software.
+    # ("pitch the prototype"), not a request to build software. And no bare
+    # "api" either, for exactly the same reason: "make me documentation for
+    # this API" is a writing job, and a bare "api" sent it to a tool that
+    # builds and deploys software instead.
     "development": ["web app", "webapp", "website", "web site", "web page",
                     "webpage", "landing page", "mobile app", "app", "ui component",
                     "dashboard", "frontend", "front-end", "backend", "back-end",
-                    "api", "web tool", "saas", "platform"],
+                    "build an api", "rest api", "api server", "api endpoint",
+                    "graphql", "web tool", "saas", "platform"],
+    # "document" and "report" were both missing, while "api" above was
+    # present — so "write a report on X" forced nothing and "documentation
+    # for this API" forced an app build. These are the words people
+    # actually use when they want something written.
     "content": ["article", "essay", "blog post", "blog", "whitepaper",
                 "white paper", "newsletter", "ebook", "e-book", "screenplay",
                 "script", "story", "novel", "documentation", "manuscript",
                 "specification", "spec", "technical spec", "requirements document",
-                "prd", "srs", "design document", "design doc"],
+                "prd", "srs", "design document", "design doc",
+                "document", "report", "memo", "case study", "one-pager",
+                "onepager", "manual", "user guide", "proposal", "brochure",
+                "datasheet", "data sheet", "sop", "policy"],
 }
 
 _MAKE_LABEL = {
@@ -396,45 +456,51 @@ def apply_studio_guardrail(query: str, routing: dict, agents: dict) -> str:
             "Studio instead for this run")
 
 
-def apply_studio_imagery_guardrail(query: str, routing: dict,
-                                   agents: dict) -> bool:
-    """Keep Studio reels visual by default when an image maker is available.
+def apply_reel_imagery_guardrail(query: str, routing: dict,
+                                 agents: dict) -> str:
+    """Does this reel get generated pictures? Decided once, here.
 
-    The planner often selected ``media`` but omitted ``visual`` because it
-    interpreted artwork as optional. Studio then correctly followed the plan
-    and produced a type-only reel, even though its intended art-directed mode
-    includes generated scene imagery. The user can still untick the visual
-    row after planning; this only fixes an ambiguous planner omission.
+    It used to answer that question by FORCING a `visual` step into the plan
+    with a prompt of its own. That was the right instinct and the wrong
+    mechanism: the engine inserts its own image step ahead of a local
+    renderer anyway (automation.run), so a run ended up with two image
+    stages — the forced one, briefed "for the Prism Studio reel" even when
+    the renderer was Prism Motion, and the engine's. The first picture the
+    generic stage produced then took the "logo" slot in the asset table.
+
+    So this now sets a flag the engine reads instead of adding a step, and
+    the half that was always worth keeping — honouring "no images", "type
+    only" — is what it is really for. Returns "on", "off" or "".
     """
-    if agents.get("media") != "Prism Studio" or not agents.get("visual"):
-        return False
+    entry = A.AGENT_REGISTRY.get(agents.get("media") or "") or {}
+    if not entry.get("local"):
+        return ""                      # not a renderer Prism drives itself
+    m = routing.get("media") or {}
+    if not (m.get("needed") and m.get("questions")):
+        return ""
     q = query.lower()
-    if not _mentions(q, _ARTEFACT_STAGES["media"]):
-        return False
     explicit_type_only = (
         "without image" in q or "no image" in q or "no artwork" in q or
         "type only" in q or "typography only" in q or "text only" in q or
         "type and colour only" in q or "type and color only" in q)
-    if explicit_type_only:
-        return False
-    visual = routing.get("visual") or {}
-    if visual.get("needed") and visual.get("questions"):
-        return False
-    routing["visual"] = {"needed": True, "questions": [
-        "Generate separate, reusable visual assets for the Prism Studio reel. "
-        "Inspect the brief and make individual images only; never a storyboard, "
-        "collage, poster, or image containing baked-in scene text."
-    ]}
-    return True
+    routing["_reel_imagery"] = not explicit_type_only
+    return "off" if explicit_type_only else "on"
 
 
 # One-line description of what each stage is FOR, injected into the prompt only
 # for the stages the user actually enabled.
 _STAGE_HELP = {
-    "research": "HEAVY tasks only — genuinely NEW external facts/citations/papers/prices the model "
-                "wouldn't already know, e.g. a complex build needing current docs or real market data. "
-                "NOT for analysing given material and NOT for simple asks."
-                "For research purpose where you'll need the factual evidences on recent events or when webscraping will be needed along with writing something about that information in depth",
+    # Two sentences used to be glued together here with no space —
+    # "…NOT for simple asks.For research purpose where you'll need the
+    # factual evidences … along with writing something about that
+    # information in depth" — and the second half told the planner that
+    # research should also do the writing, contradicting the first half and
+    # CONTENT's own line. One statement now, and it says the same thing
+    # whichever way it is read.
+    "research": "facts from the live web the model would not already know — "
+                "current prices, named companies, recent events, papers, "
+                "citations, scraping a real site. NOT for analysing material "
+                "the person has already given you, and NOT for a simple ask.",
     "leads": "finding WHO to approach — real companies, named decision-makers and their "
              "contact email addresses. Turn this on for anything shaped like 'find "
              "customers / prospects / leads / companies in <place or industry>', or an "
@@ -442,9 +508,9 @@ _STAGE_HELP = {
              "does not write the email, that is content or brains. Independent of "
              "research — a run may need research to decide which industry to target "
              "and leads to pull the companies in it, so turning BOTH on is normal.",
-    "brains": "the DEFAULT workhorse — analysis, reasoning, strategy, architecture, planning, AND short"
-              "written outputs like briefs, plans, explanations or prompts for the next stage. Small tasks "
-              "usually need ONLY this stage.",
+    "brains": "the DEFAULT workhorse — analysis, reasoning, strategy, "
+              "architecture, planning, AND short written outputs like briefs, "
+              "plans and explanations. Small tasks usually need ONLY this step.",
     "content": "ONLY when the deliverable is a SUBSTANTIAL written piece (full article, essay, long-form "
                "copy, script, documentation). Short text, answers and briefs belong to brains, not here.",
     "visual": "generating images, art, character designs, logos, illustrations.",
@@ -461,6 +527,11 @@ _STAGE_HELP = {
 
 
 def _stage_lines(agents: dict, premium: list | None = None) -> str:
+    # One tool often carries several steps, and its description used to be
+    # repeated in full for each of them — ChatGPT's 437-character line five
+    # times over on the owner's configuration, 2,185 characters of the
+    # planner's budget saying the same thing. Said once, referred to after.
+    said: dict[str, str] = {}
     premium = premium or []
     lines = []
     for stage in A.PIPELINE_ORDER:
@@ -472,7 +543,11 @@ def _stage_lines(agents: dict, premium: list | None = None) -> str:
             name = agents.get(stage)
             if not name:
                 continue
-        spec = A.specialty_for(stage, name)
+        if name in said:
+            spec = f"as described under {said[name]} above"
+        else:
+            spec = A.specialty_for(stage, name)
+            said[name] = stage.upper()
         star = "  ⭐ PREMIUM (the user pays for this tool)" if name in premium else ""
         # The inner quotes are single on purpose: reusing double quotes inside a
         # double-quoted f-string is PEP 701 syntax and only parses on Python
@@ -488,6 +563,11 @@ def _stage_lines(agents: dict, premium: list | None = None) -> str:
     return "\n".join(lines)
 
 
+def _contract_kind(stage: str) -> str:
+    from . import contract as _contract
+    return _contract.for_stage(stage)
+
+
 def _schema_stub(agents: dict) -> str:
     parts = []
     for stage in A.PIPELINE_ORDER:
@@ -496,7 +576,12 @@ def _schema_stub(agents: dict) -> str:
                 continue
         elif not agents.get(stage):
             continue
-        parts.append(f'  "{stage}": {{ "questions": ["..."], "needed": false }}')
+        # The example shows each step's OWN default kind. It showed "text"
+        # on every line, and a model that copies the example turns "Make the
+        # images" into a text step — no image line, no image check.
+        kind = _contract_kind(stage)
+        parts.append(f'  "{stage}": {{ "needed": false, "kind": "{kind}", '
+                     '"questions": ["..."] }')
     return "{\n" + ",\n".join(parts) + "\n}"
 
 
@@ -654,15 +739,12 @@ def _self_directing_rule(agents: dict) -> str:
     listed = " and ".join(names)
     return (
         f"- SELF-DIRECTING TOOLS ({listed}). {listed} runs its own multi-pass\n"
-        f"  research loop and scrapes the live web itself. For its stage ONLY,\n"
-        f"  write the prompt as a well-briefed human would ask a specialist:\n"
-        f"    • Do NOT use the \"Your ONLY task is:\" opener.\n"
-        f"    • Give it the SUBJECT, the audience, and what a good answer must\n"
-        f"      cover — then let it choose how to get there.\n"
-        f"    • Do NOT prescribe the steps, the section list, or the word count.\n"
-        f"    • Keep ROLE and CONTEXT; drop the rigid DELIVERABLE SPEC.\n"
-        f"  Over-specifying makes {listed} skip its analyse and optimise passes,\n"
-        f"  which is the entire reason it was picked over a plain search tool.\n")
+        f"  research loop and scrapes the live web itself. Give its step the\n"
+        f"  subject, the audience and what a good answer must cover — then let\n"
+        f"  it choose how to get there. Do NOT prescribe the steps, the section\n"
+        f"  list or the word count: over-specifying makes {listed} skip the\n"
+        f"  analyse and optimise passes that are the reason it was picked over\n"
+        f"  a plain search tool.\n")
 
 
 def _maker_names(agents: dict) -> list[str]:
@@ -706,14 +788,13 @@ def build_prompt(query: str, profile: str, agents: dict, attachments: list | Non
     )
     from . import files as F
     attach_line = F.routing_note(attachments or [])
-    notes = _tool_notes()
+    notes = _notes_for(agents)
     notes_block = (
-        "═══ FIELD NOTES — HIGHEST PRIORITY (written by the user from real "
-        "hands-on experience with these exact tools) ═══\n"
-        "If anything in the RULES section below conflicts with these notes, "
-        "THE NOTES WIN. When deciding WHICH stage should carry a piece of "
-        "work, follow the notes' 'Use for / Avoid for / My take' lines over "
-        "the generic tool descriptions above and over the rules below.\n"
+        "═══ FIELD NOTES on the tools in this plan (written by the user, "
+        "from hands-on use) ═══\n"
+        "How these tools behave in practice. Where a note says something the "
+        "descriptions above do not, believe the note. It does not decide "
+        "which steps run — the rules below do.\n"
         f"{notes}\n\n" if notes else ""
     )
     premium = premium or []
@@ -734,91 +815,68 @@ def build_prompt(query: str, profile: str, agents: dict, attachments: list | Non
         "criteria and non-goals when writing each stage prompt) ═══\n"
         f"{brief}\n" if brief else ""
     )
-    return f"""You are the routing brain of Prism — a multi-agent AI pipeline.
+    return f"""You are the planner of Prism — a desktop app that runs real AI
+tools in a browser, one step after another, and collects what they produce.
 
-{profile_line}{attach_line}The user has enabled these pipeline stages (each backed by a specialist AI).
-Stages run in this exact order, and each one receives the previous stages'
-outputs as context:
+{profile_line}{attach_line}These steps are available, in this order. Each one is carried by the tool
+named, and each receives the previous step's answer as its context:
 
 {_stage_lines(agents, premium)}
 
-{notes_block}═══ RULES ═══
-{premium_rule}- DELIVERABLE RULE (overrides brains-first): if the user asks you to MAKE/BUILD/
-  CREATE/DESIGN/GENERATE a concrete artefact, the matching MAKE-STAGE MUST run —
-  brains alone only PLANS it, it does not produce it. Map the artefact to its stage:
-    • image / logo / art / illustration ............ VISUAL
-    • video / animation / voiceover / music ........ MEDIA
-    • web app / website / UI / software tool ....... DEVELOPMENT
-    • slide deck / PowerPoint / PPT / pitch deck ... PRESENTATION
-    • full article / essay / long-form copy / script  CONTENT
-  Typically pair BRAINS (plan/outline) → the make-stage (produce it). Never answer a
-  "make me an X" request with brains only.
-- SCRIPT RULE: a reel, video or deck needs WORDS — script, narration, captions,
-  slide copy. Writing those words is CONTENT's job, not BRAINS'. Whenever MEDIA
-  or PRESENTATION will produce the deliverable and CONTENT is enabled, add a
-  CONTENT stage between the plan and the make-stage to write the exact words.
-  BRAINS plans the concept; CONTENT writes the script; the make-stage produces it.
-- SCOPE LOCK: every prompt you write MUST begin with the exact words "Your ONLY
-  task is:" followed by that stage's job and nothing else. The agent must NEVER
-  be asked to produce a deliverable that belongs to another stage. Example: if
-  CONTENT is asked for webpage copy and DEVELOPMENT builds the page, the CONTENT
-  prompt must end with "Do NOT design or build the webpage itself — output text
-  only; the build happens in a later stage." Agents like Claude will build whole
-  apps if you leave the door open, so close it explicitly.
-- HAND-OFF AWARENESS: for every stage EXCEPT the last one you enable, the prompt
-  must state that its output is not for the user — it will be passed verbatim to
-  the next enabled stage as that stage's working brief. Instruct the agent to end
-  its answer with a concise summary of every fact, decision and constraint the
-  next stage needs (names, specs, style choices, wording that must be kept).
-- FINAL STAGE: the LAST enabled stage's prompt must say the opposite — "you are
-  the final stage; deliver the polished end result for the user, no hand-off."
-- BRAINS-FIRST DEFAULT (for non-deliverables): if the task is analysis, a question,
-  reasoning, planning, or a short written brief, use BRAINS ONLY.
-- Small/simple tasks with no artefact → BRAINS ALONE.
-- BRAINS also does the analysis + short brief that would otherwise look like RESEARCH
-  or CONTENT. Do NOT add RESEARCH to "analyse this and design a logo" — that is
-  BRAINS (analyse + brief) → VISUAL (make the image). Nothing else.
-- RESEARCH is reserved for HEAVY tasks needing genuinely new external facts the model
-  wouldn't know (complex web builds needing current docs, real market/price data,
-  academic citations). Never for analysing given material or simple requests.
-- CONTENT is reserved for SUBSTANTIAL writing deliverables. A short brief or plan is
-  brains, not content.
-- SUMMARY is OFF unless 3+ other stages ran AND need consolidating. With 1–2 stages,
-  the final stage's own output IS the answer.
-- Prefer ONE stage. Two is common. Three+ should be rare and clearly justified.
-- Each stage receives the PREVIOUS stage's output as context (Prism injects it),
-  so later prompts should say "using the previous stage's output, do X" rather
-  than re-deriving from scratch. Don't ask a later stage to re-analyse raw input
-  the earlier stage already handled.
-- Set "needed": false (and "questions": []) for stages that don't apply.
-- Never invent stages that aren't listed above.
-- Each entry in "questions" must be a COMPLETE, self-contained prompt.
-- Return an ARRAY of prompts per stage: usually ONE; use multiple only when the
-  stage genuinely needs distinct prompts.
-- DEVELOPMENT prompts must include full specs so the agent can ship a working
-  result. SUMMARY must explicitly reference and combine the earlier outputs.
-{self_directing_block}{maker_block}- PROMPT CRAFT (this is why Prism exists — every stage prompt must read like
-  professional prompt engineering, never a paraphrase of the user's words).
-  After the mandatory "Your ONLY task is:" opener, every prompt MUST contain:
-    • ROLE: cast the agent as a specific senior expert matched to the task
-      (e.g. "Act as a senior speech-ML researcher who has shipped multilingual
-      ASR systems"), not a generic assistant.
-    • CONTEXT: the situation plus every relevant fact, constraint and given
-      from the task brief — the agent must never have to guess what's known.
-    • DELIVERABLE SPEC: the exact output structure — named sections, tables,
-      comparisons, word counts, format. Never just "provide a specification";
-      list WHICH sections the specification must contain.
-    • QUALITY BAR: 2–3 concrete success criteria the output must satisfy
-      (e.g. "every model named must include its licence and hardware needs").
-    • NON-GOALS: what the agent must NOT do, taken from SCOPE and scope lock.
-  A well-crafted stage prompt is typically 120–250 words. A one-line prompt
-  that restates the user's request is a routing failure.
-{brief_block}
-User's raw request (authoritative on scope — if the brief conflicts, this wins):
+{notes_block}═══ WHICH STEPS RUN ═══
+{premium_rule}- MAKE-STEPS. If the person asks for something to be MADE, the step that
+  makes it MUST run — a thinking step only describes it. Map the thing to
+  its step:
+    image / logo / art / poster ............ VISUAL
+    video / reel / animation ............... MEDIA
+    voice-over / narration / music ......... AUDIO
+    slide deck / presentation .............. PRESENTATION
+    web app / website / tool ............... DEVELOPMENT
+    document / report / article / script ... CONTENT
+  Pair BRAINS with the make-step when the thing needs thinking about first.
+- WORDS FIRST. A reel, video or deck needs a script, captions or slide copy,
+  and writing those is CONTENT's job, not BRAINS'.
+- RESEARCH is for facts from the live web the model would not already know —
+  real prices, named companies, recent events, citations. Not for material
+  the person has already given you, and not for a simple request.
+- ONE STEP IS OFTEN ENOUGH. A question, an analysis or a short piece of
+  writing is BRAINS alone. Steps that are not needed make a run slower, not
+  better — but never drop a make-step to keep the plan short.
+- SUMMARY only when three or more steps ran and their answers need pulling
+  together.
+- Set "needed": false and "questions": [] for a step that does not apply.
+  Never invent a step that is not listed above.
+
+═══ WHAT TO WRITE FOR EACH STEP ═══
+- "kind" — what must EXIST when the step ends. Pick exactly one:
+    text    an answer written in the chat
+    file    a document, deck or spreadsheet the person can download
+    image   generated picture(s)
+    video   a finished video file
+    data    a reply a program will read
+    links   companies, contacts or rows
+  If the person asked for a .docx, a PDF, a spreadsheet, a deck "as a file"
+  or anything to download, that step's kind is "file", never "text".
+- "questions" — ONE brief of 40–80 words in plain language: what this step
+  is to do, the facts and constraints it needs, and what a good answer
+  contains. Write it the way one competent colleague briefs another.
+- Do NOT write a role to play ("act as a senior…"), a section list, a word
+  count, a quality bar, non-goals, formatting rules, or anything about
+  handing over to the next step. Prism adds what it needs itself, and a
+  second set of instructions in the same message is what makes a tool answer
+  ABOUT the instructions instead of doing the work.
+- Never assert something the step will not actually have. Only write a fact
+  into a brief if the person gave it or an earlier step will really produce
+  it — a brief that says "you have been given the brand colours" when nobody
+  found any is worse than one that asks for them.
+{self_directing_block}{maker_block}{brief_block}
+The person's own request — authoritative on scope, and it wins over the
+brief wherever the two differ:
 {query}
 
 Return ONLY this JSON (no markdown, no commentary), using exactly these keys:
 {_schema_stub(agents)}"""
+
 
 
 def verify_key(api_key: str, model: str = "") -> str:
@@ -1180,9 +1238,13 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     studio_swap = apply_studio_guardrail(query, routing, agents)
     if studio_swap:
         ui.info(f"🛡️  guardrail: {studio_swap}")
-    if apply_studio_imagery_guardrail(query, routing, agents):
-        ui.info("🛡️  Studio reel imagery enabled — the planner omitted the "
-                "visual stage, so individual scene assets will be generated")
+    imagery = apply_reel_imagery_guardrail(query, routing, agents)
+    if imagery == "on":
+        ui.info("🖼️   the reel gets its own generated artwork — Prism makes "
+                "the pictures for its scenes")
+    elif imagery == "off":
+        ui.info("🖼️   type and colour only, as asked — no pictures will be "
+                "generated for the reel")
     # Surface the enrichment brief so the UI can show the full transformation
     # chain (raw words → brief → stage prompts). Consumers iterate
     # PIPELINE_ORDER, so this extra key is invisible to them.

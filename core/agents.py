@@ -316,6 +316,146 @@ _APOLLO_HANDOFF = (
 )
 
 
+# ── how each tool thinks ─────────────────────────────────────────────────────
+#
+# Every tool used to get the same message. That is wrong in both directions:
+# Claude puts a long answer in a side panel and will build a real .docx if
+# asked to; ChatGPT will route an image through Canva given half a chance and
+# answers shorter than it could; Perplexity runs one pass and forgets the
+# conversation. None of that is visible in a CSS selector, and all of it
+# changes what a good prompt looks like.
+#
+# So a tool carries a PROFILE, and Prism composes against it:
+#
+#   produces    what this tool can actually hand back (core/contract.py holds
+#               a step to `text` rather than failing it for a file the tool
+#               was never going to produce)
+#   file_hint   one clause added to "give me the file" for this tool
+#   avoid       one short line appended when this tool's known drift matters
+#               for the kind of step being run
+#
+# Deliberately data, not code, and deliberately small — three fields that
+# change the message, not a second personality sheet for the model to read.
+# The licence payload can replace any of them (licensing/payload.py), so
+# "Claude moved its download button" or "ask Gemini for files like this now"
+# is a row in the admin console and reaches every customer on their next
+# check-in, instead of a release.
+_PROFILES: dict[str, dict] = {
+    "ChatGPT": {
+        "produces": ("text", "image", "file", "data"),
+        "file_hint": "Use your own tools to build it and give me the "
+                     "download link in this chat.",
+        "avoid": "Do not put this in a canvas — answer in the chat itself.",
+    },
+    "Claude": {
+        "produces": ("text", "file", "data"),
+        "file_hint": "Build it as a real document with your own tools, then "
+                     "leave the download in the chat.",
+        "avoid": "Write it in the chat, not in a side panel or an artifact — "
+                 "Prism reads the conversation, not the panel.",
+    },
+    "Claude Design": {
+        "produces": ("text", "file", "image"),
+        "file_hint": "Build the design here and leave the export in the chat.",
+        "avoid": "",
+    },
+    "Perplexity": {
+        "produces": ("text",),
+        "file_hint": "",
+        # Its answers are short and it does not carry a brief between turns,
+        # so everything it needs has to be in the one message.
+        "avoid": "",
+    },
+    "LAZYCOOK": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "Kimi 2.6": {
+        "produces": ("text", "file", "data"),
+        "file_hint": "",
+        "avoid": "Answer in English.",
+    },
+    "Canva": {
+        "produces": ("image", "file"),
+        "file_hint": "Build it in Canva; the design itself is what I need.",
+        "avoid": "",
+    },
+    "Gamma.app": {
+        "produces": ("file",),
+        "file_hint": "Build the deck in Gamma; the deck itself is what I need.",
+        "avoid": "",
+    },
+    "Tome": {"produces": ("file",), "file_hint": "", "avoid": ""},
+    "Midjourney": {"produces": ("image",), "file_hint": "", "avoid": ""},
+    "Leonardo.ai": {"produces": ("image",), "file_hint": "", "avoid": ""},
+    "Adobe Firefly": {"produces": ("image",), "file_hint": "", "avoid": ""},
+    "Runway": {"produces": ("video",), "file_hint": "", "avoid": ""},
+    "Pika Labs": {"produces": ("video",), "file_hint": "", "avoid": ""},
+    "Google Flow": {"produces": ("video",), "file_hint": "", "avoid": ""},
+    "InVideo AI": {"produces": ("video",), "file_hint": "", "avoid": ""},
+    "HeyGen": {"produces": ("video",), "file_hint": "", "avoid": ""},
+    "ElevenLabs": {"produces": ("file",), "file_hint": "", "avoid": ""},
+    "Suno": {"produces": ("file",), "file_hint": "", "avoid": ""},
+    "NotebookLM": {"produces": ("text", "file", "video"), "file_hint": "",
+                   "avoid": ""},
+    "Apollo": {"produces": ("links",), "file_hint": "", "avoid": ""},
+    "omma.build": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "emergent.sh": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "v0.dev": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "Jasper": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "Copy.ai": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "Writesonic": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "Consensus": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "WolframAlpha": {"produces": ("text",), "file_hint": "", "avoid": ""},
+    "Semantic Scholar": {"produces": ("text",), "file_hint": "", "avoid": ""},
+}
+
+
+import copy as _copy  # noqa: E402  (a pristine copy for apply_profiles to reset to)
+
+#: The profiles this build ships with, untouched by any payload.
+_BUILTIN_PROFILES: dict[str, dict] = _copy.deepcopy(_PROFILES)
+
+
+def profile_for(name: str) -> dict:
+    """What is known about how `name` likes to be asked. {} when nothing is.
+
+    Read through resolve_agent() in normal use; exposed on its own for
+    diagnostics and for the plan screen, which says what a step will produce
+    before it runs.
+    """
+    return dict(_PROFILES.get(name) or {})
+
+
+def apply_profiles(mapping: dict[str, dict] | None) -> int:
+    """Replace the published tool profiles. Returns how many tools have one.
+
+    Same shape and the same reasoning as apply_overrides(): the payload is
+    the whole intended state, so a tool dropped from it goes back to its
+    built-in profile rather than keeping one nobody can see. Rubbish is
+    ignored — a bad publish must never be able to stop Prism asking.
+    """
+    known = ("produces", "file_hint", "avoid")
+    # Reset first, as apply_overrides() does. Merging on top of whatever was
+    # applied last meant an unpublished profile — an empty payload, or a
+    # tool dropped from it — stayed in force until Prism was restarted,
+    # which is the opposite of what this docstring promises.
+    _PROFILES.clear()
+    _PROFILES.update(_copy.deepcopy(_BUILTIN_PROFILES))
+    for name, prof in (mapping or {}).items():
+        if not isinstance(name, str) or not isinstance(prof, dict):
+            continue
+        clean = {}
+        for key in known:
+            value = prof.get(key)
+            if key == "produces" and isinstance(value, (list, tuple)):
+                picked = tuple(str(v) for v in value if isinstance(v, str))
+                if picked:
+                    clean[key] = picked
+            elif key != "produces" and isinstance(value, str):
+                clean[key] = value
+        if clean:
+            _PROFILES[name] = {**(_PROFILES.get(name) or {}), **clean}
+    return len(_PROFILES)
+
+
 def _agent(url, specialty, cost, avg, wait, **overrides):
     base = {
         "url": url,
@@ -756,10 +896,15 @@ def resolve_agent(stage: str, name: str) -> dict | None:
     if entry is None:
         return None
     over = _OVERRIDES.get(name)
-    if not over:
+    prof = _PROFILES.get(name)
+    if not over and not prof:
         return entry
-    # A copy, so an override never mutates the shipped registry.
-    return {**entry, **over}
+    # A copy, so neither an override nor a profile mutates the shipped
+    # registry. The profile rides along here rather than being looked up at
+    # each call site, so everything that asks for a tool — the contract, the
+    # prompt composer, the plan screen — sees the same answer about what
+    # that tool can do (see _PROFILES).
+    return {**entry, **(prof or {}), **(over or {})}
 
 
 def alternatives_for(stage: str, tried: list | tuple = (),

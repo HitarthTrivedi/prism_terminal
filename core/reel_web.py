@@ -40,6 +40,21 @@ W, H = 1080, 1920
 SAFE_X, SAFE_Y = 90, 130
 DEFAULT_FPS = 30
 
+# Where essential copy may sit — the ONE box every prompt in this module
+# states. The design and scene prompts used to give two different boxes in
+# the same message — "x=130..950 and y=180..1580" in one paragraph, "90px/
+# 130px margins" a few paragraphs on — and a model handed two sets of
+# numbers lays out to one of them, which cost needless layout-correction
+# turns.
+#
+# Deliberately NOT derived from SAFE_X/SAFE_Y. Those are the harness's frame
+# margins for backgrounds and shapes. Copy needs more room, above all at the
+# bottom: a vertical reel is watched under the platform's own caption, name
+# and buttons, and a headline placed down to y=1790 sits beneath them. The
+# 180..1580 band is the one reels were laid out to before this change.
+COPY_X, COPY_TOP, COPY_BOTTOM = 130, 180, 1580
+SAFE_AREA = f"x={COPY_X}..{W - COPY_X} and y={COPY_TOP}..{COPY_BOTTOM}"
+
 # Minimum type sizes for a 1080-wide frame, unchanged from the Pillow
 # renderer: a phone is watched at arm's length for under a second a scene.
 # The agent may design anything it likes above these.
@@ -1112,25 +1127,23 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
 
 def script_instructions() -> str:
     # Appended to a router-written brief the same way spec_instructions() is
-    # in reel.py — see the note there. That brief routinely specifies its
-    # own deliverable (a document, a table, named sections) before this
-    # stage is known to feed the Studio pipeline, so the override has to
-    # void that deliverable shape by name, not just "a handoff or a summary".
+    # in reel.py. It used to open "THIS OVERRIDES EVERY OTHER FORMATTING
+    # INSTRUCTION YOU HAVE BEEN GIVEN" — necessary while the planner wrote a
+    # deliverable spec of its own for every step, and a fair description of
+    # what the message had become: three sets of format rules from three
+    # authors, with the tool left to work out which one meant it. The
+    # planner no longer writes format rules at all (router.build_prompt), so
+    # there is nothing left to override and the shouting can go.
     return (
         "Context, honestly stated: you are one stage of Prism, a desktop "
         "automation the client's own team launched and is watching; your "
         "reply is parsed by a program on their machine, which is why the "
         "format below is strict.\n\n"
-        "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION "
-        "YOU HAVE BEEN GIVEN, INCLUDING ANY RULE ASKING FOR A HANDOFF, A "
-        "SUMMARY, OR A DIFFERENT DELIVERABLE SHAPE ENTIRELY (a document, a "
-        "table, named sections, a checklist — whatever was described "
-        "above; it was written without knowing this stage feeds a "
-        "renderer, so it does not apply). Your reply is read by a "
-        "program. Reply with ONLY a JSON object, wrapped in a ```json "
-        "fenced code block and nothing else — no prose before it, none "
-        "after. The fence keeps the chat window from reformatting what "
-        "you wrote. " + IN_CHAT_RULE + "\n\n"
+        "OUTPUT FORMAT. Your reply is read by a program, not by a person. "
+        "Reply with ONLY a JSON object, wrapped in a ```json fenced code "
+        "block and nothing else — no prose before it, none after. The fence "
+        "keeps the chat window from reformatting what you wrote. "
+        + IN_CHAT_RULE + "\n\n"
         "You are writing the SCRIPT for a short vertical brand reel. Words "
         "and running order only. You do not decide how it looks: a separate "
         "art-direction pass does that, and anything you say about colour, "
@@ -1447,10 +1460,9 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "automation the client's own team launched and is watching; your "
         "reply is parsed by a program on their machine, which is why the "
         "format below is strict.\n\n"
-        "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION, "
-        "INCLUDING ANY RULE ASKING FOR A HANDOFF OR A SUMMARY. Reply with "
-        "ONLY a JSON object, wrapped in a ```json fenced code block and "
-        "nothing else — no prose before it, none after. The fence matters: "
+        "OUTPUT FORMAT. Reply with ONLY a JSON object, wrapped in a ```json "
+        "fenced code block and nothing else — no prose before it, none "
+        "after. The fence matters: "
         "outside one, the chat window eats the asterisks in your CSS and "
         "breaks long URLs across lines, and the design is lost. "
         + IN_CHAT_RULE + "\n\n"
@@ -1473,13 +1485,18 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "shape needs a job in the story or hierarchy. Use optical alignment, "
         "a small stroke scale (1px/2px/4px), intentional proportions, and "
         "controlled opacity. Avoid random circles, generic pills, arbitrary "
-        "solid rectangles, equal-weight decorations, and shapes that merely "
-        "fill empty space. Prefer one hero construction plus two quiet support "
-        "details per scene; keep the headline as the visual priority."
+        "solid rectangles, decorative counters and corner marks, equal-weight "
+        "decorations, and shapes that merely fill empty space. Geometry is "
+        "optional: a single well-spaced phrase with a purposeful reveal can "
+        "carry a beat. When used, prefer one hero construction plus two quiet "
+        "support details per scene; keep the headline as the visual priority. "
+        "Carry one meaningful visual idea through the reel and let its "
+        "transformation explain the next beat, rather than a new ring, panel "
+        "or graphic system for every scene."
         "\nCOMPOSITION SYSTEM — use a consistent 12-column grid and an 8px rhythm. "
         "Align type, rules, and shape edges to shared guides; vary the span and "
-        "offset, not the underlying grid. Keep essential copy inside x=130..950 "
-        "and y=180..1580 so captions and platform controls do not cover it. "
+        f"offset, not the underlying grid. THE SAFE AREA: keep essential copy "
+        f"inside {SAFE_AREA}. "
         "Use at most three typographic roles (display, support, micro-label) and "
         "no more than two families. Let negative space carry as much weight as "
         "the geometric mark."
@@ -1564,7 +1581,15 @@ def design_instructions(brand: dict | None = None, request: str = "",
             "Use a valid supplied logo on the last row when available. "
             "The scene prompts that follow hold you to this, row by row.\n\n")
            if _asset_names(assets) else "")
-        + "HOW MOTION WORKS — read this, it is the one unusual part:\n"
+        # From here to the end is the rulebook for every scene. build_spec()
+        # asks for the scenes in this same tab straight after this reply, so
+        # scene_instructions() names these sections instead of restating
+        # them; it used to restate every one of them in its own words on
+        # every turn (see the note there).
+        + "EVERYTHING FROM HERE DOWN APPLIES TO EVERY SCENE YOU WRITE LATER IN "
+        "THIS CONVERSATION. The scene prompts point back to these sections by "
+        "name rather than repeat them, so hold on to them.\n\n"
+        "HOW MOTION WORKS — read this, it is the one unusual part:\n"
         "· Write ordinary CSS @keyframes and animation declarations. The "
         "renderer PAUSES the page and sets each animation's time by hand for "
         "every frame, so the result is identical on every render.\n"
@@ -1572,10 +1597,17 @@ def design_instructions(brand: dict | None = None, request: str = "",
         f"(`animation: rise 900ms {EASE_MENU[0][1]} both`) or it will "
         "snap when the frame is seeked.\n"
         "· Animation time restarts at 0 for each scene. Stagger with "
-        "`animation-delay`.\n"
+        "`animation-delay` — things that arrive together read as one block, "
+        "things that arrive 80-120ms apart read as choreography.\n"
         "· Choose a coherent motion rhythm. Reuse easing for related elements; "
-        "change it only when the action or emphasis calls for it. Stillness "
-        f"and readable holds are valid. Available curves: {_ease_menu_text()}.\n"
+        "change it only when the action or emphasis calls for it. Available "
+        f"curves: {_ease_menu_text()}.\n"
+        "· Choreograph in phases: a short anticipation, the primary move, a "
+        "restrained settle, then a readable hold. Do not animate every object "
+        "at once. Finish essential copy entrances in the first 30 percent of "
+        "the scene and hold the complete message for at least one second "
+        "before it leaves. Stillness is valid; a slow secondary motion is "
+        "optional, and a headline never moves merely to keep pixels moving.\n"
         "· Never use transitions, JavaScript, `:hover`, or anything that "
         "depends on real time — none of it will be filmed.\n"
         "· Each scene element gets `--p` (0→1 through the scene) and `--ms` "
@@ -1603,18 +1635,21 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "WHAT THE RENDERER GUARANTEES, SO YOU DO NOT HAVE TO:\n"
         "the frame size, the seeking, the cuts' timing, and the encode. "
         "`.scene` is already a full-frame absolutely-positioned layer, and "
-        "`--safe-x`/`--safe-y` (90px/130px) are the margins to keep text "
-        "inside.\n\n"
+        "`--safe-x`/`--safe-y` are the frame margins for backgrounds and "
+        "shapes; essential copy stays inside the safe area given above.\n\n"
         "THE LAYER CONTRACT — obey this in every scene:\n"
-        "· Establish an explicit stack: background z-index 0; textures and "
-        "decorations 10; image assets 20; cards and colour panels 30; all "
-        "headlines, body copy and required script words 50; tiny labels, "
-        "counters and brand marks 60. Give positioned elements an explicit "
-        "z-index instead of relying on DOM order.\n"
-        "· Required words are always above decorative shapes and image assets. "
-        "A panel may sit behind copy, never across it. If copy sits over an "
-        "image, give it a solid or translucent backing with enough contrast "
-        "to read at arm's length.\n"
+        "· Add depth only when it clarifies the subject. A strong typographic "
+        "frame does not need a background illustration or a running label.\n"
+        "· When layers are needed, establish an explicit stack: background "
+        "z-index 0; textures and decorations 10; image assets 20; cards and "
+        "colour panels 30; all headlines, body copy and required script words "
+        "50; tiny labels, counters and brand marks 60. Give positioned "
+        "elements an explicit z-index instead of relying on DOM order.\n"
+        "· Required copy must be the top readable layer: required words are "
+        "always above decorative shapes and image assets. A panel may sit "
+        "behind copy, never across it. If copy sits over an image, give it a "
+        "solid or translucent backing with enough contrast to read at arm's "
+        "length.\n"
         "· Do not let a circle, rule, crop, image, card or entering scene "
         "cross a headline or support line unless the overlap is deliberate, "
         "brief, and the text remains fully readable.\n"
@@ -1634,7 +1669,24 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "cardiology clinic should not come out looking like the same film. "
         "Choose a background that means something — a deep field gradient, "
         "paper, a colour block, a fine rule system — and typography with a "
-        "point of view. Do not default to white with a grid."
+        "point of view. Do not default to white with a grid.\n"
+
+        # What actually separated a scene that worked from one that did not,
+        # on a reel this stage was rebuilt for. Both had the same words. The
+        # good one put the CUSTOMER'S OWN MATERIAL on screen — the real
+        # filenames out of a Gerber folder, the seven real drill sizes, one
+        # dot for each of 238 holes — and the flat one described the same
+        # facts in a sentence. Deliberately given across trades so it does
+        # not read as advice about circuit boards. It lived in every scene
+        # prompt; it is a rule for every scene, so it is said here, once.
+        "BUILD EACH SCENE FROM THE CUSTOMER'S OWN MATERIAL, not from "
+        "adjectives. The things they actually handle are the strongest thing "
+        "you can put on screen: the part numbers, the file names, the sizes, "
+        "the grades, the machines, the varieties, the test names, the routes. "
+        "A fabricator's real drill sizes set as chips; a seed company's actual "
+        "variety names in a column; a workshop's tolerances beside the part "
+        "they hold. If a scene names a count, consider DRAWING that many "
+        "things rather than only printing the number."
     )
 
 
@@ -1779,19 +1831,16 @@ def _scene_count(text: str) -> int:
     return n
 
 
-def _first_asset(assets: str) -> str:
-    """The first name on the asset list, for the usage example."""
-    m = re.search(r"asset:([A-Za-z0-9_-]+)", assets or "")
-    return m.group(1) if m else "logo"
-
-
 def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
                        assets: str = "") -> str:
     """The prompt for ONE scene, sent in the same tab as the design.
 
-    Short on purpose. The palette, the type scale and the storyboard are all
-    further up this same conversation — repeating them would spend the budget
-    this whole change exists to create.
+    Short on purpose. The palette, the type scale, the storyboard and the
+    rulebook every scene is written to — the layer contract, how motion
+    works, the safe area, what is rejected, the asset manifest — are all
+    further up this same conversation, typed straight before scene 1 is
+    asked for. Repeating them would spend the budget this whole change
+    exists to create.
     """
     line = line or {}
     script_scene = script_scene or {}
@@ -1820,140 +1869,72 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         if val:
             plan.append(f"  {key.upper()}: {val}")
     planned = planned_assets(line, assets)
+    names = _asset_names(assets)
 
+    # This prompt used to restate the design turn's rulebook in its own words
+    # on every turn: HOW MOTION WORKS again as MOTION, THE LAYER CONTRACT
+    # again as LAYER ORDER, WHAT WILL BE REJECTED again as a closing
+    # paragraph, the shape and grid rules, the customer's-material rule, and
+    # the whole asset manifest. With a four-picture list that was about 9,700
+    # characters a scene, so a six-scene reel typed some 72,000 characters
+    # into one chat tab, and in one place the two copies disagreed (two
+    # different safe areas). build_spec() asks for every scene in the same
+    # tab straight after the design turn, so the model has just read those
+    # rules. They are said once there; this names them and carries only what
+    # belongs to this scene — its number, its words, its storyboard row, its
+    # artwork by name, the safe area, and the shape of the reply.
     return (
-        f"SCENE {idx + 1} OF {total}"
-        + (f" — role: {role}" if role else "") + f", {seconds:g} seconds.\n\n"
+        f"THIS IS SCENE {idx + 1} OF {total}"
+        + (f" — role: {role}" if role else "") + f", {seconds:g} seconds. "
+        # Give each scene a full turn without rewarding DOM/CSS volume.
+        # Element and movement quotas produced decorative clutter.
+        "THIS WHOLE REPLY IS ONE SCENE: resolve it completely; there is no "
+        "minimum element count or animation count.\n\n"
         + ("YOUR OWN STORYBOARD FOR IT:\n" + "\n".join(plan) + "\n\n"
            if plan else "")
-        + (("ARTWORK THIS SCENE CARRIES — from your own storyboard: "
-            + ", ".join(f"asset:{n}" for n in planned)
-            + ". Each one must appear in this scene's markup or CSS; the "
-            "page is checked for it and the scene comes back without it.\n\n")
-           if planned else "")
-
-        # Written one turn at a time, a scene cannot see the others, and on
-        # the 2026-09-07 reel that showed: scenes 1-4 were numbered "/ 10"
-        # (the source document's page count) and 5-6 "/ 06", and the last
-        # two switched typeface family. The reel has one count and one look.
-        + f"THIS IS SCENE {idx + 1} OF {total}. If it shows a page or scene "
-          f"counter, it reads {idx + 1} / {total} — never a total taken from "
-          "the source material. Same reel, not a new one: use the typefaces, "
-          "the running header and footer, and the label scheme the shared "
-          "stylesheet and the earlier scenes established. A scene that "
-          "switches typeface family or renames the header reads as a "
-          "different film.\n\n"
         + ("THE WORDS, EXACTLY AS THE SCRIPT WROTE THEM — every one of these "
            "has to appear on screen:\n" + "\n".join(words) + "\n\n"
            if words else
            "This scene carries no text of its own — it is made of shape, "
            "colour and movement.\n\n")
 
-        # Give each scene a full turn without rewarding DOM/CSS volume.
-        # Element and movement quotas produced decorative clutter.
-        + "THIS WHOLE REPLY IS ONE SCENE. Resolve its composition completely. "
-        "There is no minimum element count or animation count. A single "
-        "well-spaced phrase with a purposeful reveal can carry a beat. Remove "
-        "decorative counters, corner marks, rings and bars unless the brief "
-        "gives them a role. Establish a compelling settled frame first.\n"
+        # Written one turn at a time, a scene cannot see the others, and on
+        # the 2026-09-07 reel that showed: scenes 1-4 were numbered "/ 10"
+        # (the source document's page count) and 5-6 "/ 06", and the last
+        # two switched typeface family. The reel has one count and one look.
+        + f"Same reel: any counter reads {idx + 1} / {total} (never a total "
+          "from the source material), and a scene that switches typeface "
+          "family, header or labels reads as a different film.\n\n"
 
-        # What actually separated a scene that worked from one that did not,
-        # on a reel this stage was rebuilt for. Both had the same words. The
-        # good one put the CUSTOMER'S OWN MATERIAL on screen — the real
-        # filenames out of a Gerber folder, the seven real drill sizes, one
-        # dot for each of 238 holes — and the flat one described the same
-        # facts in a sentence. Deliberately given across trades so it does
-        # not read as advice about circuit boards.
-        "BUILD IT FROM THE CUSTOMER'S OWN MATERIAL, not from adjectives. The "
-        "things they actually handle are the strongest thing you can put on "
-        "screen: the part numbers, the file names, the sizes, the grades, "
-        "the machines, the varieties, the test names, the routes. A "
-        "fabricator's real drill sizes set as chips; a seed company's actual "
-        "variety names in a column; a workshop's tolerances beside the "
-        "part they hold. If the scene names a count, consider DRAWING that "
-        "many things rather than only printing the number.\n"
+        + ((("ARTWORK THIS SCENE CARRIES (your storyboard): "
+             + ", ".join(f"asset:{n}" for n in planned)
+             + ". Each must appear in this scene's markup or CSS, or the "
+             "scene comes back.\n") if planned else "")
+           # Named off the real list rather than hard-coded. The example used
+           # to read `asset:logo` whether or not a logo existed, which is a
+           # picture of a mark being dangled in front of a reel that has
+           # none — and an unresolved reference leaves a hole in the frame.
+           + "Artwork names that exist: "
+           + ", ".join(f"asset:{n}" for n in names)
+           + f" — <img src='asset:{names[0]}' alt=''> or "
+             f"url(asset:{names[0]}); any other name leaves a hole.\n"
+           # The last scene is where a logo belongs, and the last scene is
+           # the one that knows it is last: a reel with a perfectly good
+           # logo attached once ended on a mark drawn out of CSS boxes.
+           + ("THE CLIENT'S OWN MARK IS AVAILABLE as `asset:logo` and this is "
+              "the last scene: place it, sized in CSS, with room. Never "
+              "redraw it or build one out of CSS shapes.\n"
+              if "logo" in names and idx == total - 1 else
+              "`asset:logo` is the client's mark; the last scene places it, "
+              "so it does not need to appear in every scene.\n"
+              if "logo" in names else "")
+           + "\n" if names else "")
 
-        "LAYER ORDER — add depth only when it clarifies the subject. A strong "
-        "typographic frame does not need a background illustration or a "
-        "running label. When layers are needed, use an explicit z-index for each "
-        "depth: background 0, artwork 20, panels 30, required copy 50, "
-        "labels 60. Required copy must be the top readable layer. Never let "
-        "a panel or image cover it; if text crosses artwork, add a solid or "
-        "translucent backing and verify contrast.\n\n"
-
-        "SHAPE CRAFT — use the storyboard's shape_language as a constraint. "
-        "Geometry is optional, not a requirement. If used, give it one clear "
-        "meaning connected to the message. Refine edges with consistent stroke weights, optical offsets, "
-        "intentional corner treatment and restrained opacity. Do not add a raw "
-        "rectangle, circle, bar or ring unless its relation to the copy is clear; "
-        "a shape that only fills space is a placeholder and must be removed.\n\n"
-
-        "GRID AND SAFE AREA — use shared alignment anchors and consistent "
-        "spacing, with optical corrections where needed. Default essential copy "
-        "to x=130..950 and y=180..1580; these are conservative working margins, "
-        "not a guarantee for every platform overlay. Use no more than three type roles and leave a readable "
-        "hold after each major entrance before the next beat.\n\n"
-
-        "VISUAL CONTINUITY — carry one meaningful visual idea through the reel. "
-        "Let its transformation explain the next beat. Do not choose an arbitrary "
-        "new ring, panel or graphic system for every scene.\n\n"
-
-        "MOTION — the part that makes it move rather than appear:\n"
-        "· Ordinary CSS @keyframes. The renderer pauses the page and sets "
-        "every animation's time by hand, so it films identically every run.\n"
-        "· Every animation MUST end in `both` "
-        f"(`animation: rise 800ms {ease_pick(idx)[1]} both`) or it snaps "
-        "when the frame is seeked.\n"
-        "· Time restarts at 0 for this scene. Stagger arrivals with "
-        "`animation-delay` — things that arrive together read as one block, "
-        "things that arrive 80-120ms apart read as choreography.\n"
-        "· Give related elements the same easing. Use a second curve only "
-        f"for a different action or emphasis. Available: {_ease_menu_text()}.\n"
-        "· Choreograph motion in phases: a short anticipation, the primary move, "
-        "a restrained settle, then a readable hold. Do not animate every object "
-        "at once; stagger related elements by 80–120ms and keep the hero type "
-        "legible for a beat before the handoff.\n"
-        "· Finish essential copy entrances early enough for reading: aim for "
-        "the first 30 percent of the scene, then hold the complete message "
-        "for at least one second before exit. A slow secondary motion is "
-        "optional; do not move the headline merely to keep pixels moving.\n"
-        "· No transitions, no JavaScript, no :hover — none of it is filmed.\n"
-        "· `--p` (0→1 through the scene) and `--ms` are set on the scene "
-        "element every frame if you would rather drive something directly.\n\n"
-
-        "YOUR CSS IS SCOPED TO THIS SCENE AUTOMATICALLY — every selector and "
-        "every @keyframes name is rewritten to this scene alone before the "
-        "page is built. Name things whatever is clearest; nothing you write "
-        "here can collide with another scene, and you never need a prefix.\n\n"
-
-        + (("ARTWORK YOU MAY USE — this is the complete list:\n" + assets +
-            # Named off the real list rather than hard-coded. The example used
-            # to read `asset:logo` whether or not a logo existed, which is a
-            # picture of a mark being dangled in front of a reel that has
-            # none — and an unresolved reference leaves a hole in the frame.
-            f"\n\nBy name, like a URL: <img src='asset:{_first_asset(assets)}' "
-            f"alt=''> or background-image: url(asset:{_first_asset(assets)}). "
-            "No other name exists; anything else leaves a hole in the "
-            "frame.\n"
-
-            # This guidance used to live in the art-direction prompt, which
-            # wrote every scene. Now that prompt writes none of them, and the
-            # instruction went with it — so a reel with a perfectly good logo
-            # attached ended on a mark drawn out of CSS boxes. The last scene
-            # is where it matters, and the last scene is the one that knows
-            # it is last.
-            + ("· THE CLIENT'S OWN MARK IS AVAILABLE as `asset:logo`. This is "
-               "the last scene, which is where a logo belongs — place it, "
-               "sized in CSS rather than trusting its pixel dimensions, and "
-               "give it room. Never redraw or approximate a mark you have "
-               "been given, and never build one out of CSS shapes when the "
-               "real one is right here.\n"
-               if "asset:logo" in assets and idx == total - 1 else
-               "· `asset:logo` is the client's own mark. Use it where a mark "
-               "belongs rather than as decoration; the last scene will place "
-               "it, so it does not need to appear in every scene.\n"
-               if "asset:logo" in assets else "")
-            + "\n") if assets else "")
+        + "Still in force from the design turn, not repeated here: THE LAYER "
+          "CONTRACT, HOW MOTION WORKS (every animation ends in `both`, e.g. "
+          f"`rise 800ms {ease_pick(idx)[1]} both`; time starts at 0 in this "
+          "scene), SHAPE DIRECTION and WHAT WILL BE REJECTED.\n"
+          f"THE SAFE AREA: essential copy inside {SAFE_AREA}.\n\n"
 
         + "REPLY WITH ONLY THIS JSON OBJECT, in a ```json fenced code block "
         "in this chat message itself (no artifact, canvas or file), "
@@ -1965,16 +1946,10 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         + '  "css": "…this scene\'s rules and @keyframes…",\n'
         '  "html": "<div class=\'…\'>…</div>"\n'
         '}\n\n'
-        "HTML ATTRIBUTES MUST USE SINGLE QUOTES — <div class='wrap'>. Your "
-        "markup lives inside a JSON string, and an unescaped double quote "
-        "makes the whole reply unparseable. This is the most common way this "
-        "step fails.\n\n"
-        "Keep every box inside 1080x1920 with 90px/130px margins, and no "
-        f"text under {T_LABEL}px — headlines want {T_HEADLINE}px+, supporting "
-        f"text {T_SUPPORT}px+. No two texts may overlap, and nothing may be "
-        "painted across copy — a header must leave room for its own date, a "
-        "footer for its own caption. The page is measured for all of this, "
-        "at the settled frame, before it is filmed."
+        "Your css is SCOPED TO THIS SCENE AUTOMATICALLY; no prefixes needed.\n"
+        "HTML ATTRIBUTES MUST USE SINGLE QUOTES (<div class='wrap'>): an "
+        "unescaped double quote inside the JSON string makes the reply "
+        "unparseable, the most common way this step fails."
     )
 
 
@@ -2324,8 +2299,8 @@ def followup_instructions(change: str, spec: dict, new_assets: str = "",
         "· Artwork by name only — the names listed here and nothing else; a "
         "name that does not exist leaves a hole.\n"
         f"· No two texts may overlap and nothing may sit across copy; every "
-        f"box inside 1080x1920 with 90px/130px margins; no text under "
-        f"{T_LABEL}px. The page is measured before it is filmed.\n"
+        f"box inside the {W}x{H} frame and essential copy inside {SAFE_AREA}; "
+        f"no text under {T_LABEL}px. The page is measured before it is filmed.\n"
         "· Preserve the existing visual system unless the owner explicitly "
         "asks for a whole-reel redesign. A follow-up should improve the named "
         "scene, not invent a new layout language for the film.\n"

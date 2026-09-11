@@ -14,6 +14,7 @@ against a reply it has moved past, it does not.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 from .. import reel_web as _web
@@ -36,7 +37,7 @@ or mid-tone ground, a bold saturated accent, a heavy display weight), or
 something else the brief itself suggests — pick the mood, then commit to a
 small NAMED set for the whole piece:
   project.palette: { bg_a, bg_b, ink, accent, accent2 } — bg_a/bg_b are the
-    two backgrounds scenes alternate between (see rule 8 below), ink is the
+    two backgrounds scenes alternate between (see rule 7 below), ink is the
     text colour that reads on whichever background is light, accent is the
     one colour used sparingly and consistently as the piece's signature.
   project.type: { display_font, body_font } — a real two-font pairing (a
@@ -100,7 +101,7 @@ _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
                       leaves — channels converging, a knowledge graph.
   image            — position, width, height, radius (corner rounding), anchor;
                       "src" is `asset:<name>` for one of the client's own images
-                      below (never write a real URL or invent a name) — a logo,
+                      the scene prompt names (never write a real URL or invent a name) — a logo,
                       a product photo, a screenshot. Drawn clipped to a rounded
                       rect; SVG marks work the same way as photos.
 
@@ -188,7 +189,7 @@ EASING VALUES (GSAP's own — the runtime hands these straight to the tween engi
   matter how many elements are on screen. `.out` curves for things
   ARRIVING, `.in` curves for things LEAVING, `sine.inOut`/`none` for
   motion still running when the scene hands over. Use at least two
-  distinct easings in this scene."""
+  distinct easings in every scene."""
 
 
 SCENE_ROLES = ("HOOK", "REVEAL", "PROOF", "SIGNOFF")
@@ -298,10 +299,99 @@ def _scene_handoff(scene: dict) -> dict | None:
     return best
 
 
+# The node type names alone, read off the catalogue, so the one-line list
+# each scene prompt carries cannot drift from the catalogue turn one sent.
+_NODE_TYPE_NAMES = tuple(re.findall(
+    r"^  ([a-z_]+)\s+—", _NODE_CATALOGUE.split("\n\n", 1)[0], re.M))
+
+
+def _scene_rules(skeleton: str | None) -> str:
+    """The rules every scene is written to, numbered once for the whole
+    conversation. _PALETTE_GUIDANCE points at rules 4 and 7 by number."""
+    rules = (
+        "SCENE RULES — every scene you write after this turn follows these:\n"
+        "1. 3-7 nodes. Do not overcrowd.\n"
+        "2. Vary the text mode — use at most 2 different modes.\n"
+        '3. Give at least one node a real "exit", not only "enter".\n'
+        "4. The most common way a scene ends up reading as a PowerPoint "
+        "slide, however busy it is, is every element using the same "
+        "easing curve. Treat that as the failure to design against.\n"
+        "5. Never use generic emojis in text content.\n"
+        "6. The brand's accent colour should recur, not repeat identically —\n"
+        "   the same one or two colours framing every single scene the same\n"
+        "   way (same white headline, same accent subtitle, same background)\n"
+        "   reads as one template stamped four times, not four scenes of one\n"
+        "   film. Let where and how the accent is used change: a highlighted\n"
+        "   word instead of a whole line, a filled shape instead of an\n"
+        "   outline, a background wash instead of just text — same brand,\n"
+        "   different weight each time.\n"
+        "7. Use the palette/type chosen in this turn BY NAME — a full-bleed "
+        "background node filled with project.palette.bg_a or bg_b (alternate "
+        "which one scene to scene rather than repeating the same one every "
+        "time), text filled with project.palette.ink or accent, "
+        'font_family "var(--motion-display-font)" for headlines/numbers and '
+        '"var(--motion-body-font)" for body/labels — never invent a fresh '
+        "hex or font mid-scene that ignores what this turn already chose.\n"
+        "8. A scene may name a \"transition_in\" (see TRANSITIONS above) "
+        "for how it cuts in from the one before it — pick one that fits "
+        "the beat, or leave it unset and a real one is still chosen for "
+        "you rather than a hard cut.\n"
+        "9. Before placing a text or image node, sketch its actual box — "
+        "position ± roughly half its width/height — against every OTHER "
+        "text/image node's box already placed in the same scene. Two photos, "
+        "or a headline and a photo, sharing the same region reads as debris, "
+        "not layout, no matter how good either looks alone. Give each one "
+        "its own clear region of the 1080x1920 frame (stack vertically, "
+        "or split left/right) rather than centering everything on the "
+        "same point. A shape_rect used as an intentional backdrop directly "
+        "behind one specific node (a badge behind its own label, a card "
+        "behind its own photo) is the one exception — that pairing is "
+        "supposed to share a position.\n"
+    )
+    if skeleton in ("brand_launch", "cinematic_glass"):
+        rules += ('10. Give every node a "layer" (see LAYERS above) — '
+                  "background and foreground are both required in every "
+                  "scene.\n")
+    if skeleton == "cinematic_glass":
+        rules += (
+            '11. Put a stable "continuity_key" on the hero/subject node; '
+            "reuse the same key in later scenes when that subject returns.\n"
+            "12. At least one camera or secondary motion must continue across "
+            "the handoff; the incoming pose must visibly pick up the outgoing "
+            "one.\n")
+    return rules
+
+
+def _rulebook(skeleton: str | None) -> str:
+    """The catalogue, the doctrines this profile uses and the scene rules,
+    stated once, in turn one.
+
+    scene_instructions() used to carry all of this itself: the catalogue
+    and doctrines in full with scene 1 (19,800 characters with a four-
+    picture asset list) and the rules again on every later scene (6,600
+    each), in a tab where a run on 10 Sep 2026 had already grown the page
+    until the kernel killed Chrome for memory. Every scene turn lands in
+    this same tab straight after turn one, so the model has read it by
+    then. Stated before the storyboard is planned, it also shapes the plan:
+    a row can only name a node the model has read about.
+    """
+    parts = [_NODE_CATALOGUE]
+    if skeleton in ("brand_launch", "cinematic_glass"):
+        parts.append(_LAYER_DOCTRINE)
+    if skeleton == "cinematic_glass":
+        parts.append(_CINEMATIC_GLASS_DOCTRINE)
+    parts.append(_scene_rules(skeleton))
+    return ("THE RULEBOOK FOR EVERY SCENE. You plan the storyboard with it, "
+            "and each scene you are asked for after this turn is written to "
+            "it. The scene prompts name these sections instead of repeating "
+            "them, so hold on to them.\n\n" + "\n\n".join(parts))
+
+
 def storyboard_instructions(request: str, brand: dict | None = None,
                             skeleton: str | None = None) -> str:
-    """Turn one: the look, the camera's overall intent, and a storyboard
-    row per scene. Mirrors core.reel_web.design_instructions()'s split.
+    """Turn one: the look, the camera's overall intent, a storyboard row
+    per scene, and the rulebook every scene after it is written to (see
+    _rulebook()). Mirrors core.reel_web.design_instructions()'s split.
 
     `brand`: colours already measured off the client's own artwork (see
     core.reel.sample_brand — the same pixel-level measurement Reel/Studio
@@ -324,6 +414,7 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         f"WHAT THE CLIENT ASKED FOR:\n{request}"
         + brand_note + "\n\n"
         + _PALETTE_GUIDANCE + "\n\n"
+        + _rulebook(skeleton) + "\n\n"
         "This is turn one of a conversation. Right now, name the project "
         "settings, the camera's overall intent, and a STORYBOARD — one row "
         "per scene, words only, no nodes yet. Each scene's actual content "
@@ -361,7 +452,8 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         "each one a different job and a different composition — several "
         "scenes that are all a centred headline over the same background "
         "is the failure this stage exists to prevent. `camera.tracks` is "
-        "for the WHOLE graphic — rule 3 below still applies.")
+        "for the WHOLE graphic; each scene's \"shot\" (see SHOT above) "
+        "carries on from it.")
     )
 
 
@@ -372,8 +464,8 @@ def _brand_launch_storyboard_close() -> str:
         "EXACTLY 4 scenes, in this fixed order, 8-14 seconds total — do "
         "not add, drop, reorder or rename them:\n" + roles + "\n\n"
         '"job" for each row IS its role above, in your own words for this '
-        "brand. `camera.tracks` is for the WHOLE graphic — rule 3 below "
-        "still applies."
+        "brand. `camera.tracks` is for the WHOLE graphic; each scene's "
+        "\"shot\" (see SHOT above) carries on from it."
     )
 
 
@@ -393,13 +485,14 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
                        skeleton: str | None = None,
                        handoff: dict | None = None) -> str:
     """Ask for ONE scene's nodes. The rest of the conversation already
-    knows the palette and camera from turn one; this only needs the row.
+    knows the palette, the camera and the rulebook from turn one (see
+    _rulebook()); this only needs the row.
 
-    `skeleton="brand_launch"` swaps the freeform node catalogue for the
-    layer doctrine (background/midground/foreground/accent/finish) and
-    pins this scene to its fixed HOOK/REVEAL/PROOF/SIGNOFF role.
-    `skeleton="cinematic_glass"` uses the same layer contract but adds a
-    persistent visual spine, continuity keys and explicit handoff guidance.
+    `skeleton="brand_launch"` pins this scene to its fixed HOOK/REVEAL/
+    PROOF/SIGNOFF role. `skeleton="cinematic_glass"` adds explicit handoff
+    guidance for the persistent visual spine. The layer doctrine, the
+    cinematic profile and the continuity-key rules those profiles are held
+    to were stated in storyboard_instructions() and are only named here.
     `handoff` is what core.motion.generate._scene_handoff() read off the
     PREVIOUS scene — how it exited — so this one can continue that motion
     or colour instead of cutting cold; None for the first scene.
@@ -411,63 +504,9 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
         seconds = float(row.get("seconds") or 3.0)
     except (TypeError, ValueError):
         seconds = 3.0
-    catalogue = _NODE_CATALOGUE
-    rules = (
-        "DESIGN RULES FOR THIS SCENE:\n"
-        "1. 3-7 nodes. Do not overcrowd.\n"
-        "2. Vary the text mode — use at most 2 different modes.\n"
-        '3. Give at least one node a real "exit", not only "enter".\n'
-        "4. The most common way a scene ends up reading as a PowerPoint "
-        "slide, however busy it is, is every element using the same "
-        "easing curve. Treat that as the failure to design against.\n"
-        "5. Never use generic emojis in text content.\n\n"
-        "6. The brand's accent colour should recur, not repeat identically —\n"
-        "   the same one or two colours framing every single scene the same\n"
-        "   way (same white headline, same accent subtitle, same background)\n"
-        "   reads as one template stamped four times, not four scenes of one\n"
-        "   film. Let where and how the accent is used change: a highlighted\n"
-        "   word instead of a whole line, a filled shape instead of an\n"
-        "   outline, a background wash instead of just text — same brand,\n"
-        "   different weight each time.\n"
-        "7. Use the palette/type chosen in turn one BY NAME — a full-bleed "
-        "background node filled with project.palette.bg_a or bg_b (alternate "
-        "which one scene to scene rather than repeating the same one every "
-        "time), text filled with project.palette.ink or accent, "
-        'font_family "var(--motion-display-font)" for headlines/numbers and '
-        '"var(--motion-body-font)" for body/labels — never invent a fresh '
-        "hex or font mid-scene that ignores what turn one already chose.\n"
-        "8. This scene may name a \"transition_in\" (see TRANSITIONS above) "
-        "for how it cuts in from the one before it — pick one that fits "
-        "the beat, or leave it unset and a real one is still chosen for "
-        "you rather than a hard cut.\n"
-        "9. Before placing a text or image node, sketch its actual box — "
-        "position ± roughly half its width/height — against every OTHER "
-        "text/image node's box already placed this scene. Two photos, or "
-        "a headline and a photo, sharing the same region reads as debris, "
-        "not layout, no matter how good either looks alone. Give each one "
-        "its own clear region of the 1080x1920 frame (stack vertically, "
-        "or split left/right) rather than centering everything on the "
-        "same point. A shape_rect used as an intentional backdrop directly "
-        "behind one specific node (a badge behind its own label, a card "
-        "behind its own photo) is the one exception — that pairing is "
-        "supposed to share a position.\n\n"
-    )
     role_header = ""
     if skeleton in ("brand_launch", "cinematic_glass"):
         role = _scene_role(idx)
-        catalogue = _NODE_CATALOGUE + "\n\n" + _LAYER_DOCTRINE
-        if skeleton == "cinematic_glass":
-            catalogue += "\n\n" + _CINEMATIC_GLASS_DOCTRINE
-            rules = rules + (
-                '10. Put a stable "continuity_key" on the hero/subject node; '
-                "reuse the same key in later scenes when that subject returns.\n"
-                "11. At least one camera or secondary motion must continue across "
-                "the handoff; the incoming pose must visibly pick up the outgoing one.\n"
-            )
-        rules = rules + (
-            '7. Give every node a "layer" (see LAYERS above) — background '
-            "and foreground are both required this scene.\n"
-        )
         role_header = ("PROFILE: CINEMATIC GLASS — one continuous visual spine.\n\n"
                        if skeleton == "cinematic_glass"
                        else f"ROLE: {role} — {_ROLE_BRIEF[role]}\n\n")
@@ -491,17 +530,34 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
                    if handoff.get("continuity_key") else "")
                 + "\n"
             )
-    # The catalogue and doctrines are sent in full with scene 1 and only
-    # named afterwards: every later turn lands in the same browser tab,
-    # and a run on 10 Sep 2026 grew that page until the kernel killed
-    # Chrome for memory. The rules block below stays on every turn.
-    if idx > 0:
-        catalogue = (
-            "NODE TYPES, TEXT MODES, ANIMATION, SHOT, TRANSITIONS, EASINGS"
-            + (", LAYERS and the CINEMATIC GLASS profile" if skeleton == "cinematic_glass"
-               else ", LAYERS" if skeleton == "brand_launch" else "")
-            + " are exactly as written in the scene 1 message above — reuse "
-            "them; they are not repeated here.")
+    # The catalogue, the doctrines and the scene rules used to travel with
+    # this prompt — in full with scene 1, the rules again on every turn —
+    # and are stated once now, in turn one (see _rulebook() for the run that
+    # made that matter). This names them and keeps what belongs to this
+    # scene alone: its row, its role or profile, the handoff from the scene
+    # before, the node names, its artwork, and the shape of the reply.
+    named = ("NODE TYPES, TEXT MODES, ANIMATION, SHOT, TRANSITIONS, EASING "
+             "VALUES"
+             + (", LAYERS, the CINEMATIC GLASS profile (its safe area "
+                "included)" if skeleton == "cinematic_glass"
+                else ", LAYERS" if skeleton == "brand_launch" else "")
+             + " and the SCENE RULES")
+    assets = assets or ""
+    names = _web._asset_names(assets)
+    if not assets.strip():
+        artwork = ""
+    elif idx == 0:
+        # Turn one is written before the artwork exists and takes no asset
+        # list, so scene 1 is the first place the model reads it: in full
+        # once, by name after that.
+        artwork = f"ARTWORK YOU MAY USE:\n{assets}\n\n"
+    elif names:
+        artwork = ("ARTWORK YOU MAY USE (described in scene 1's message): "
+                   + ", ".join(f"asset:{n}" for n in names)
+                   + ". No other name exists.\n\n")
+    else:
+        artwork = ("THERE ARE NO IMAGES (see scene 1's message): write no "
+                   "image node.\n\n")
     return (
         f"SCENE {idx + 1} of {total}.\n\n"
         + role_header
@@ -510,13 +566,16 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
         + (f"THE MOTION: {motion}\n" if motion else "")
         + f"\nDuration: {seconds:g} seconds. All this scene's animation "
         "times count from 0 at this scene's own start.\n\n"
-        + catalogue + "\n\n"
-        + rules
-        + (f"ARTWORK YOU MAY USE:\n{assets}\n\n" if assets else "")
+        + "Node types: " + ", ".join(_NODE_TYPE_NAMES) + ".\n"
+        + named + " are as the storyboard turn above set them out and still "
+        "apply; they are not repeated here.\n\n"
+        + artwork
         + "Reply with ONLY this JSON object, in a ```json fenced code "
         "block, nothing before or after it:\n"
         '{\n  "shot": {"intent": "...", "target": "<node id>"},\n'
-        '  "nodes": [ /* 3-7 node objects, as above */ ]\n}'
+        '  "nodes": [ /* 3-7 node objects, as NODE TYPES describes */ ]\n}\n'
+        '"transition_in" may sit next to "nodes" to name how this scene cuts '
+        "in (one of the TRANSITIONS)."
     )
 
 

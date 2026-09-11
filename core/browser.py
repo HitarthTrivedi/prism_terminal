@@ -43,6 +43,10 @@ import sys
 # called on the way into every render and every dialog that offers one.
 _UNSET = object()
 _cached_path: object = _UNSET
+# When a failed lookup may be tried again. 0 means never: a lookup that
+# simply found no browser is a real answer and stays cached.
+_retry_after: float = 0.0
+_RETRY_MISS_SECONDS = 60.0
 
 INSTALL_HINT = ("The web renderer needs Playwright:\n"
                 "    pip install playwright && playwright install chromium")
@@ -61,10 +65,14 @@ def chromium_path() -> str | None:
     `executable_path` handles all of that, and it stays right across a
     Playwright upgrade that moves things.
     """
-    global _cached_path
+    global _cached_path, _retry_after
+    import time as _time
     if _cached_path is not _UNSET:
-        return _cached_path  # type: ignore[return-value]
-    _cached_path = None
+        stale_miss = (_cached_path is None and _retry_after
+                      and _time.monotonic() >= _retry_after)
+        if not stale_miss:
+            return _cached_path  # type: ignore[return-value]
+    _cached_path, _retry_after = None, 0.0
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
@@ -72,7 +80,15 @@ def chromium_path() -> str | None:
         if path and os.path.exists(path):
             _cached_path = path
     except Exception:
-        pass
+        # A lookup that FAILED is not an answer, and it used to be cached as
+        # one for the life of the process. Playwright starts a node helper
+        # to answer this question, and on Windows the first start of that
+        # unsigned helper is exactly what antivirus scanning slows down or
+        # blocks. One such hiccup meant "Chromium isn't installed" for every
+        # run until Prism was restarted — Studio switched off, and with it
+        # the reel's artwork step. Now a failed lookup is tried again a
+        # minute later. A lookup that ran and found no browser still sticks.
+        _retry_after = _time.monotonic() + _RETRY_MISS_SECONDS
     return _cached_path  # type: ignore[return-value]
 
 

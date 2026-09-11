@@ -164,6 +164,32 @@ def _rows_from_csv(path: str) -> list[list[str]]:
         return [[(c or "").strip() for c in row] for row in csv.reader(f, dialect)]
 
 
+_CELL_SPLIT = re.compile(r"\t+|\s*\|\s*|\s{2,}")
+
+
+def _rows_from_document(path: str) -> list[list[str]]:
+    """Rows out of a PDF, Word or plain-text price list.
+
+    Uses core.files' text extraction (python-docx tables come out one row
+    per line, cells tab-separated; pypdf keeps a table's columns apart with
+    runs of spaces). A line with one cell is a heading or a paragraph and
+    is kept so _find_header can skip past it the way it skips a letterhead.
+    """
+    from . import files
+    text = files._extract_text(path, files._classify(path)) or ""
+    if not text.strip():
+        raise RateFileError(
+            "Prism couldn't read any text out of that file. A scanned PDF is "
+            "a picture -- export the list from Excel or Word instead.")
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rows.append([c.strip() for c in _CELL_SPLIT.split(line) if c.strip()])
+    return rows
+
+
 def _rows_from_xlsx(path: str) -> list[list[str]]:
     """Read the first sheet of an .xlsx, if openpyxl is installed.
 
@@ -210,6 +236,12 @@ def load_rates(path: str) -> list[RateItem]:
         raise RateFileError(
             "That is the old .xls format, which Prism can't read. Open it in "
             "Excel and use File → Save As → CSV.")
+    elif extension in (".pdf", ".docx", ".txt", ".md"):
+        # A price list that lives in a PDF or a Word file -- the way most
+        # small makers actually keep one. Word tables and PDF text come out
+        # as lines with the cells separated by tabs, pipes or runs of
+        # spaces; the same header finder then reads them like a CSV.
+        rows = _rows_from_document(path)
     else:
         rows = _rows_from_csv(path)
 
@@ -370,6 +402,88 @@ def match_item(query: str, items: list[RateItem], limit: int = 5) -> list[Match]
 
     results.sort(key=lambda m: -m.score)
     return results[:limit]
+
+
+# ── the codes a customer wrote, with their quantities ─────────────────────────
+# "Chair 1128K x 40, 1129K 10 nos" -- a customer who orders from a catalogue
+# writes the code, and a code is an exact thing, not a fuzzy one. This finds
+# every rate-list code the mail mentions, in the order written, and the
+# quantity beside each; a code with no readable quantity is returned with
+# quantity None so the caller can hold it for a person instead of guessing.
+
+_QTY_UNITS = (r"pcs?|pieces?|nos?|numbers?|units?|sets?|pairs?|packs?|boxes|"
+              r"box|kg|kgs|mtrs?|meters?|metres?|m|ltrs?|litres?|dozen|doz|qty")
+# "40 pcs of chair 1128K": the number, an optional unit, and up to two words
+# of product name between it and the code.
+_QTY_BEFORE = re.compile(
+    r"(\d[\d,]*(?:\.\d+)?)\s*(?:" + _QTY_UNITS + r")?\.?\s*(?:of\s+)?"
+    r"(?:[a-z]+\s+){0,2}$", re.I)
+_QTY_AFTER = re.compile(
+    r"^\s*(?:[-:–,]\s*)?(?:x|×|qty\.?|quantity|:|-)?\s*(\d[\d,]*(?:\.\d+)?)"
+    r"\s*(?:" + _QTY_UNITS + r")?\b", re.I)
+_PRICE_WORDS = re.compile(r"(?:₹|rs\.?|inr|price|rate|@|per|each)\s*$", re.I)
+
+
+@dataclass
+class Request:
+    item: RateItem
+    quantity: Decimal | None
+    evidence: str = ""              # the line of the mail it was read from
+
+    @property
+    def confident(self) -> bool:
+        """A code is exact; what makes the line quotable without a person is
+        a quantity that was actually written next to it."""
+        return self.quantity is not None and self.quantity > 0
+
+
+def _code_pattern(code: str):
+    parts = re.findall(r"[a-z]+|\d+", code.lower())
+    if not parts:
+        return None
+    body = r"[\s\-_/.]*".join(re.escape(p) for p in parts)
+    return re.compile(r"(?<![a-z0-9])" + body + r"(?![a-z0-9])", re.I)
+
+
+def _quantity_near(line: str, start: int, end: int) -> Decimal | None:
+    """The number written beside the code on this line: after it ("1128K x
+    40", "1128K - 40 nos") or before it ("40 pcs of 1128K"). Never a number
+    that follows a currency or price word, and never the code's own digits."""
+    after = _QTY_AFTER.match(line[end:end + 40])
+    if after:
+        return to_decimal(after.group(1))
+    before = _QTY_BEFORE.search(line[max(0, start - 40):start])
+    if before and not _PRICE_WORDS.search(line[max(0, start - 60):before.start()]):
+        return to_decimal(before.group(1))
+    return None
+
+
+def find_requests(text: str, items: list[RateItem]) -> list[Request]:
+    """Every rate-list code the text names, with the quantity beside it, in
+    the order they appear. An item named twice is one request (the first
+    quantity wins). Items without a code are never matched here -- that is
+    match_item's fuzzy job, for a customer who writes in words."""
+    found: list[tuple[int, Request]] = []
+    seen = set()
+    lines = text.splitlines() or [text]
+    offset = 0
+    for line in lines:
+        for item in items:
+            if not item.code or item.code in seen:
+                continue
+            pattern = _code_pattern(item.code)
+            if pattern is None:
+                continue
+            m = pattern.search(line)
+            if not m:
+                continue
+            seen.add(item.code)
+            found.append((offset + m.start(),
+                          Request(item, _quantity_near(line, m.start(), m.end()),
+                                  evidence=line.strip()[:160])))
+        offset += len(line) + 1
+    found.sort(key=lambda t: t[0])
+    return [r for _, r in found]
 
 
 def is_confident(matches: list[Match], margin: float = 1.6) -> bool:

@@ -51,3 +51,12 @@ playwright>=1.44
 # moulding) with a real B-rep kernel, offline — same rule as the
 # Gerber add-on: the design never leaves the machine.
 cadquery
+
+# ── Reading the text in a picture a customer sends (core/ocr.py) ─────────
+# A brochure crop with the product code printed under the photo is a
+# common inquiry. RapidOCR carries its own models (~15 MB) and runs on the
+# ONNX runtime (~15 MB wheel) -- the same on Windows, macOS and Linux, no
+# system install, nothing sent anywhere. Optional at runtime (core.ocr
+# falls back to the OS reader on a Mac and says what is missing elsewhere),
+# bundled in every build so a Windows customer never meets that fallback.
+rapidocr-onnxruntime

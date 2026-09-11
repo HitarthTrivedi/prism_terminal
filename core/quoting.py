@@ -483,7 +483,32 @@ def find_requests(text: str, items: list[RateItem]) -> list[Request]:
                                   evidence=line.strip()[:160])))
         offset += len(line) + 1
     found.sort(key=lambda t: t[0])
-    return [r for _, r in found]
+    requests = [r for _, r in found]
+    # One code, and its quantity written somewhere else in the mail -- "4
+    # nos of the locker in the picture" with the code in the picture, or a
+    # subject line naming the code and the body giving the count. With a
+    # single code there is nothing else the number could belong to.
+    if len(requests) == 1 and requests[0].quantity is None:
+        lone = _lone_quantity(text)
+        if lone is not None:
+            requests[0].quantity = lone
+    return requests
+
+
+_LONE_QTY = re.compile(
+    r"(?<![\w.])(\d[\d,]*(?:\.\d+)?)\s*(?:" + _QTY_UNITS + r")(?![\w])"
+    r"|\b(?:qty|quantity)\.?\s*[:\-]?\s*(\d[\d,]*)", re.I)
+
+
+def _lone_quantity(text: str) -> Decimal | None:
+    """A quantity written on its own anywhere in the text ("4 nos", "qty
+    25", "12 pieces"); None when there is none or more than one."""
+    seen = []
+    for m in _LONE_QTY.finditer(text):
+        raw = m.group(1) or m.group(2)
+        if raw and not _PRICE_WORDS.search(text[max(0, m.start() - 12):m.start()]):
+            seen.append(to_decimal(raw))
+    return seen[0] if len(seen) == 1 else None
 
 
 def is_confident(matches: list[Match], margin: float = 1.6) -> bool:

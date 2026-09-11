@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
-from . import history, inbox, register, sop, triage, ui, worklist
+from . import history, inbox, ocr, register, sop, triage, ui, worklist
 from .inbox import Message, State
 
 # Sub-folders under the company folder. Flat, obvious names — the owner will
@@ -364,6 +364,32 @@ _PO_LIKE = re.compile(
     re.I)
 
 
+def _read_pictures(files: list, folder: str) -> str:
+    """OCR every picture among the files just saved, append what it says to
+    the inquiry folder's image_text.txt (a reply's picture adds to the
+    first mail's), and return this batch's text. Never raises: a picture
+    that cannot be read is an inquiry with less in it, not a failed check."""
+    try:
+        text = ocr.read_files(files)
+    except Exception:                                   # noqa: BLE001
+        return ""
+    if not text:
+        return ""
+    earlier = ocr.recall(folder)
+    ocr.remember(folder, (earlier + "\n\n" + text).strip() if earlier else text)
+    return text
+
+
+def _picture_summary(text: str, limit: int = 140) -> str:
+    """The picture's words as a "Product asked" line: the lines of text,
+    file names dropped, joined with spaces, marked as read from a picture
+    so nobody mistakes it for something the customer typed."""
+    words = " ".join(ln.strip() for ln in text.splitlines()
+                     if ln.strip() and not ln.startswith("["))
+    words = words[:limit].rstrip()
+    return f"{words} (read from the picture)" if words else ""
+
+
 def _reads_as_an_order(message: Message) -> bool:
     """An attachment, or text that actually names a PO — not just any
     confirmation-shaped sentence."""
@@ -454,6 +480,7 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
             folder = existing.get("Folder") or paths.folder_for(
                 existing.get("Inquiry no", "unknown"))
             files = inbox.save_attachments(message, folder)
+            _read_pictures(files, folder)
             is_order = (verdict.category == triage.ORDER
                        and _reads_as_an_order(message))
             item = Item("order" if is_order else "reply",
@@ -484,6 +511,17 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
         files = inbox.save_attachments(message, folder)
         if files:
             row["Drawing"] = ", ".join(os.path.basename(f) for f in files)
+        # A customer who sends a picture instead of words: read the text in
+        # it (locally -- the picture never leaves the machine), keep it
+        # beside the picture, and let it stand in for "Product asked" when
+        # the mail itself said nothing. The quotation window and the
+        # code finder read the same file.
+        picture_text = _read_pictures(files, folder)
+        if picture_text and not (message.body or "").strip():
+            # No words in the mail at all: the picture IS the inquiry, and
+            # a "Product asked" of just the subject line ("Enquiry") would
+            # say nothing. Typed words are never overwritten.
+            row["Product asked"] = _picture_summary(picture_text) or row["Product asked"]
         rows.append(row)
         dirty = True
 

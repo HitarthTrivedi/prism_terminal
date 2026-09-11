@@ -46,6 +46,8 @@ per model under ~/Desktop/Prism Step.
 """
 from __future__ import annotations
 
+from . import skills as _SK
+
 import datetime as _dt
 import os
 import re
@@ -837,7 +839,7 @@ def auto_brief(report: dict) -> str:
         "finish that is not written above; general notes may only say the "
         "dimensions are in millimetres and hole positions are indicative.",
     ]
-    return "\n".join(lines)
+    return "\n".join(lines) + _SK.addendum("step.auto")
 
 
 # ── /step-ask: a question → Groq's advice → an agent's plan → applied ───────
@@ -878,7 +880,8 @@ def ask_prompt(report: dict, question: str) -> str:
         "suggestion is a hole size change or an overall scale change, state "
         "it precisely: which part, current Ø, new Ø (or scale factor), and "
         "why. Mark anything that would need the customer's designer (ribs, "
-        "draft, wall changes) as their decision, not ours.")
+        "draft, wall changes) as their decision, not ours."
+        + _SK.addendum("step.ask"))
 
 
 def plan_prompt(report: dict, question: str, suggestions: str) -> str:
@@ -904,7 +907,8 @@ def plan_prompt(report: dict, question: str, suggestions: str) -> str:
         "Rules: use only part names and hole diameters that appear in the "
         "measurements. A hole can only be enlarged, never shrunk. When no "
         "executable change is justified, return an empty changes list — an "
-        "honest empty list beats an invented edit.")
+        "honest empty list beats an invented edit."
+        + _SK.addendum("step.plan"))
 
 
 def _valid_change(ch) -> dict | None:

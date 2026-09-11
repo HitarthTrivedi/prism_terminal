@@ -129,6 +129,27 @@ def info(msg: str):
     say(f"[dim]{msg}[/dim]" if _RICH else msg, _level="info")
 
 
+def literal(text) -> str:
+    """Text that must print exactly as written.
+
+    rich reads anything in square brackets as a style tag and drops it --
+    on the console, and in the GUI's log too, because _strip_markup parses
+    with rich. A skill fault reads "[slide-deck] Placeholder text left in:
+    [client name]", and printed raw both the skill's name and the
+    placeholder it is complaining about vanished. Wrap any text that came
+    from somewhere else -- a checker, a model, a file -- in this before it
+    goes into an f-string for say/info/warn.
+    """
+    s = str(text)
+    if not _RICH:
+        return s
+    try:
+        from rich.markup import escape as _escape
+        return _escape(s)
+    except Exception:
+        return s.replace("[", "\\[")
+
+
 def banner():
     """The big Prism splash."""
     art = r"""

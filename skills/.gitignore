@@ -1,0 +1,3 @@
+# Loading a skill's checks.py leaves one of these beside it. It is never
+# shipped (packaging/prism.spec filters it) and never committed.
+__pycache__/

@@ -25,6 +25,8 @@ unchanged, so the two add-ons can never disagree about the numbers.
 """
 from __future__ import annotations
 
+from . import skills as _SK
+
 
 # Shared with core.boq.formatting_prompt — a stated "basis" does not stop a
 # model inventing a precise-but-impossible spec, and one impossible figure
@@ -90,6 +92,7 @@ def standards_prompt(user_request: str, project_context: str = "",
         "\n\nFormat it as a short, dense checklist of stated rules — each line "
         "usable as a spec a later stage can cite verbatim. Flag anything that is "
         "genuinely a judgement call rather than a standard."
+        + _SK.addendum("bom.standards")
     )
 
 
@@ -218,4 +221,7 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "or ordering, and that no prices are included."
     )
     tail = ("\n\nMEASURED QUANTITIES:\n" + quantities_text) if quantities_text.strip() else ""
-    return instructions + standards_block + brief_block + legend_block + tail
+    # House doctrine for a parts list, when a skill claims this job — see
+    # core/skills.py. Empty when none does, so the prompt is unchanged.
+    return (instructions + standards_block + brief_block + legend_block
+            + _SK.addendum("bom.format") + tail)

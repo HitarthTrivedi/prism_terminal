@@ -12,6 +12,8 @@ The CSV is never shown to any AI: recipients are parsed locally, so the
 address list never leaves this machine.
 """
 from __future__ import annotations
+
+from . import skills as _SK
 import csv
 import io
 import re
@@ -806,4 +808,5 @@ def draft_question(instruction: str) -> str:
         "{name}. Address the reader as {name} — it will be replaced with each "
         "recipient's real name before sending. Every character you output will "
         "be sent to real recipients exactly as written."
+        + _SK.addendum("email.blast")
     )

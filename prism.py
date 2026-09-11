@@ -298,6 +298,8 @@ HELP = """
                 from it. Needs FFmpeg; Prism Studio (which art-directs the
                 reel instead of using the house template) also needs
                 `playwright install chromium`
+  [teal]/skills[/teal]      the house doctrine Prism applies to each kind of job, and
+                where to add your own
   [teal]/exit[/teal]        quit
 
 Anything else you type is treated as a task and routed to your agents.
@@ -512,6 +514,21 @@ def cmd_detach(attachments):
     n = len(attachments)
     attachments.clear()
     ui.ok(f"Cleared {n} attachment(s).")
+
+
+def cmd_skills() -> None:
+    """What doctrine Prism has, where it applies, and how to change it."""
+    from core import skills as SK
+    ui.rule("Skills")
+    ui.say(SK.describe())
+    ui.say("")
+    ui.info(f"shipped with Prism:  {SK.shipped_dir()}")
+    ui.info(f"yours:               {SK.user_dir()}")
+    ui.say("")
+    ui.say("Put a SKILL.md in a folder of your own under the second path to "
+           "add a skill, or a notes.md beside a shipped one to add your own "
+           "notes to it. The format is in the README beside the shipped "
+           "skills.")
 
 
 def cmd_runs(cfg):
@@ -2188,6 +2205,8 @@ def _dispatch(cfg: dict, line: str, attachments: list) -> tuple[dict, bool]:
         cmd_detach(attachments)
     elif line == "/runs":
         cmd_runs(cfg)
+    elif line == "/skills":
+        cmd_skills()
     elif line.startswith("/remote"):
         cmd_remote(cfg, line[len("/remote"):].strip())
     elif line.startswith("/email"):

@@ -2735,6 +2735,22 @@ def _is_maker(agent_cfg: dict) -> bool:
     return bool((agent_cfg or {}).get("makes"))
 
 
+# Stages whose deliverable is a built thing, whichever tool runs them. The
+# router's own description of presentation is "building an actual slide deck /
+# PowerPoint". Given a deck to make on 2026-09-11, Claude -- not a registered
+# maker -- built the .pptx in its sandbox for 522 seconds and left 431
+# characters of build log in the chat. A skill's text layout typed there
+# argues with the file, and a checker reading the build log faults it.
+_BUILDING_STAGES = ("presentation",)
+
+
+def _builds_deliverable(agent_cfg: dict, stage: str) -> bool:
+    """True when this stage's deliverable is something the tool builds:
+    a registered maker, or a building stage on any tool."""
+    return (_is_maker(agent_cfg)
+            or (stage or "").strip().lower().split(" ")[0] in _BUILDING_STAGES)
+
+
 def _maker_brief(agent_name: str, agent_cfg: dict) -> str:
     """The opening of a maker's stage prompt: what it is for, in plain words.
 
@@ -4486,9 +4502,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         motion_design_stage: str = "", resume_urls: dict | None = None,
         skip_signal=None, skip_stages: list | None = None,
         min_wait: int = 0, image_stages=None, fallback_signal=None,
-        motion_skeleton: str = ""):
+        motion_skeleton: str = "", stage_skills: dict | None = None):
     """Execute the pipeline. Returns (responses, links).
 
+    stage_skills: {stage label: [skill key]} for a caller that built its own
+                 stages -- an add-on naming the doctrine its own prompt was
+                 written against. A routed run needs none: the planner puts
+                 the keys in the plan and they are read from there.
     fallback_signal: a threading.Event the screen sets for "Use fallback" —
                  stop waiting for the tool on the stage that is running and
                  hand that stage to the next tool in its category NOW, the
@@ -4575,6 +4595,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     from . import files as F
 
     from . import lang as L
+    from . import skills as SK
 
     attachments = attachments or []
 
@@ -5072,6 +5093,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     delivered: dict[str, int] = {}
 
     for stage_idx, (stage, agent_name, questions) in enumerate(stages):
+        # Per stage, never carried: see the skill check below.
+        skill_keys, skill_task_text = [], ""
         if stopped():
             ui.warn("Stopped at your request — keeping everything finished so far.")
             emit("cancelled", {"stage": stage, "done": len(all_responses)})
@@ -5452,6 +5475,31 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 suffix = _resolve_suffix(agent_cfg, stage, query)
                 if suffix:
                     questions = [q + "\n\n" + suffix for q in questions]
+
+                # House standards for this kind of deliverable — see
+                # core/skills.py. Typed after the task, next to the suffix.
+                # By the step's kind (core/contract.py): a text step gets the
+                # whole skill; a step that builds its deliverable -- a maker,
+                # the presentation stage, a file, image or video step -- gets
+                # the standards without the text layout, which would tell it
+                # to write the thing out; a data or links step, or any step a
+                # program reads, gets nothing, because a second author of
+                # format rules makes the model drop the JSON.
+                skill_keys = (list((stage_skills or {}).get(stage) or [])
+                              or SK.keys_for(routing, stage))
+                _skill_kind = stage_kinds.get(stage_idx, "text")
+                _skill_builds = (_builds_deliverable(agent_cfg, stage)
+                                 or _skill_kind in ("file", "image", "video"))
+                skill_text = (SK.block(skill_keys, "browser", maker=_skill_builds)
+                              if skill_keys and not machine_shaped
+                              and _skill_kind not in ("data", "links") else "")
+                # What the tool was shown for this task WITHOUT the skill's
+                # own text: a checker counts a figure as invented only when it
+                # appears nowhere in here.
+                skill_task_text = context + "\n".join(questions)
+                if skill_text:
+                    ui.info(f"   📘  skill: {', '.join(skill_keys)}")
+                    questions = [q + "\n\n" + skill_text.rstrip() for q in questions]
 
                 # Set when a prompt provably never reached the tool, so the
                 # stage does not then sit out its full wait_time cap watching
@@ -6087,6 +6135,48 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 if fixed["note"]:
                     stage_notes[stage] = fixed["note"]
                 short_of = fixed["missing"]
+
+            # THE SKILL CHECK, for a text step whose deliverable is there.
+            # A file, image or video step is judged by whether the thing
+            # exists (the contract above), a program-read step by its own
+            # parser, and a step whose deliverable the contract found missing
+            # has already had its one re-ask. So a step is asked again at
+            # most once. The faults that matter here -- a deck with no
+            # speaker notes, a figure with no source, a 250 mm emergency stop
+            # -- all read perfectly well, so the only way to catch them is to
+            # look.
+            if (skill_keys and stage_responses and not machine_shaped
+                    and kind_here == "text" and chat_tool and not short_of
+                    and not stopped()
+                    and not _builds_deliverable(agent_cfg, stage)):
+                faults = SK.check(skill_keys, stage_responses[-1],
+                                  {"stage": stage, "query": query,
+                                   "prompt": skill_task_text})
+                if faults:
+                    ui.warn(f"   the answer misses {len(faults)} point(s) of "
+                            f"the {', '.join(skill_keys)} skill — sending "
+                            "them back")
+                    for fault in faults[:6]:
+                        ui.info(f"   · {ui.literal(fault)}")
+                    emit("retry", {"stage": stage,
+                                   "reason": f"{len(faults)} skill fault(s)"})
+                    again = _reask(driver, agent_cfg, SK.repair_prompt(faults),
+                                   should_stop=stage_halt)
+                    better = [x for x in again if x and x.strip()]
+                    if better:
+                        left = SK.check(skill_keys, better[-1],
+                                        {"stage": stage, "query": query,
+                                         "prompt": skill_task_text})
+                        # Only if it is genuinely cleaner — a "fix" that
+                        # trades six faults for seven is not a fix.
+                        if len(left) < len(faults):
+                            stage_responses = [better[-1]]
+                            all_responses[stage] = stage_responses
+                            ui.ok(f"   fixed — {len(faults)} down to "
+                                  f"{len(left)}")
+                        else:
+                            ui.info("   the second attempt was no better — "
+                                    "keeping the first")
             if made_here:
                 if kind_here == "video":
                     # A browser video tool's output is harvested like a

@@ -41,6 +41,7 @@ import os
 from dataclasses import dataclass, field
 
 from . import ui
+from . import skills as _SK
 
 # Who to ask, in order of preference, when the customer has not assigned an
 # agent to the writing stage themselves. These are the tools whose long-form
@@ -111,7 +112,8 @@ def available(cfg: dict) -> tuple[bool, str]:
 
 def draft(cfg: dict, prompt: str, *, purpose: str = "draft",
           attachments: list | None = None, agent: str = "",
-          on_event=None, should_stop=None) -> Draft:
+          on_event=None, should_stop=None,
+          skill_feature: str = "inquiry.negotiation") -> Draft:
     """Ask one tool one question, in the browser, and bring the answer back.
 
     Deliberately a single stage. The pipeline in automation.run() is built for
@@ -139,6 +141,13 @@ def draft(cfg: dict, prompt: str, *, purpose: str = "draft",
             # The stage label keys the result. It only has to be unique within
             # this one-item list.
             custom_stages=[(purpose, name, [prompt])],
+            # The doctrine negotiation_prompt and followup_prompt append,
+            # handed to the check as well, so the reply is read against it:
+            # a discount given for nothing, a figure in neither the
+            # quotation nor the policy. "" turns it off for any other use.
+            stage_skills=({purpose: [s.key for s in
+                                     _SK.for_feature(skill_feature)]}
+                          if skill_feature else None),
             query=prompt[:200],
             # The file-analysis pre-stage exists for decks and reels built from
             # a folder of source material. Here the one attachment is the
@@ -302,7 +311,10 @@ def negotiation_prompt(*, quotation_text: str, customer_reply: str,
     if language:
         lines.append(f"Write the email in {language}.")
     lines.append(_NO_INVENTED_NUMBERS)
-    return "\n".join(lines)
+    # The negotiation doctrine, when a skill claims this job. After the hard
+    # rules on purpose: those are the floor and nothing may soften them.
+    lines.append(_SK.addendum("inquiry.negotiation").strip())
+    return "\n".join(x for x in lines if x)
 
 
 def followup_prompt(*, quotation_text: str, days_waiting: int,
@@ -349,7 +361,8 @@ def followup_prompt(*, quotation_text: str, days_waiting: int,
     if language:
         lines.append(f"Write the email in {language}.")
     lines.append(_NO_INVENTED_NUMBERS)
-    return "\n".join(lines)
+    lines.append(_SK.addendum("inquiry.followup").strip())
+    return "\n".join(x for x in lines if x)
 
 
 # ── the owner's pricing policy ───────────────────────────────────────────────

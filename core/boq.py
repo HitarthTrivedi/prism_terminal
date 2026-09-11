@@ -57,6 +57,8 @@ import subprocess
 import sys
 import tempfile
 
+from . import skills as _SK
+
 _CONVERTER_CANDIDATES = ["dwg2dxf", "ODAFileConverter", "ODAFileConverter.exe"]
 
 # An explicit path, for anyone who has a reason — same escape hatch
@@ -993,6 +995,7 @@ def standards_prompt(user_request: str, project_context: str = "",
         "\n\nFormat it as a short, dense checklist of stated rules — each "
         "line usable as a design assumption a later stage can cite verbatim. "
         "Flag anything that is genuinely a judgement call rather than a norm."
+        + _SK.addendum("boq.standards")
     )
 
 
@@ -1041,7 +1044,8 @@ def interpretation_prompt(user_request: str, quantities_text: str,
         "does NOT contain (e.g. they asked for cabling but no cable/conduit "
         "geometry exists in this drawing). Be explicit and specific: this "
         "warning is more useful to the user than a padded BOQ."
-        f"\n\nMEASURED QUANTITIES (ground truth, every layer in the drawing):\n{quantities_text}"
+        + _SK.addendum("boq.interpret")
+        + f"\n\nMEASURED QUANTITIES (ground truth, every layer in the drawing):\n{quantities_text}"
     )
 
 
@@ -1239,4 +1243,7 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
     # block name from the drawing could itself contain '{'/'}' and must not
     # be misread as a format field.
     tail = ("\n\nMEASURED QUANTITIES:\n" + quantities_text) if quantities_text.strip() else ""
-    return instructions + standards_block + brief_block + legend_block + tail
+    # House doctrine for a BOQ, when a skill claims this job — see
+    # core/skills.py. Empty when none does, so the prompt is unchanged.
+    return (instructions + standards_block + brief_block + legend_block
+            + _SK.addendum("boq.format") + tail)

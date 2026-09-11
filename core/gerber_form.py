@@ -33,6 +33,8 @@ Figures are written to 2 decimal places, same as every Gerber surface.
 """
 from __future__ import annotations
 
+from . import skills as _SK
+
 import datetime as _dt
 import os
 import re
@@ -573,7 +575,8 @@ def ai_fill_prompt(filled: list, blanks: list[str], note: str = "") -> str:
         "Rules: every value must come from the attached documents (or plain "
         "arithmetic on them). OMIT any field the documents do not answer — "
         "an omitted field beats a guess. Keep values short: a number, a "
-        "word, a short phrase. Never invent a rate, a quantity or a spec.")
+        "word, a short phrase. Never invent a rate, a quantity or a spec."
+        + _SK.addendum("gerber.form"))
 
 
 def parse_fills(texts: list[str], blanks: list[str]) -> tuple[dict, str]:

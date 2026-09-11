@@ -73,6 +73,8 @@ DISCLOSED LIMITATIONS (not hidden — a wrong number is worse than a gap)
 """
 from __future__ import annotations
 
+from . import skills as _SK
+
 import math
 import os
 import re
@@ -2383,7 +2385,8 @@ def agent_brief(job: dict, context: str = "") -> str:
         text += ("\nCaveats that must be repeated to the customer if they "
                  "affect the answer:\n  - "
                  + "\n  - ".join(job["warnings"]) + "\n")
-    return text
+    # House doctrine for a fabrication reply, when a skill claims this job.
+    return text + _SK.addendum("gerber.writeup")
 
 
 def _smt_text(a: dict) -> str:

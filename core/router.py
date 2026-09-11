@@ -15,6 +15,7 @@ import requests
 
 from . import agents as A
 from . import config as C
+from . import skills as SK
 from . import ui
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -558,8 +559,12 @@ def _stage_lines(agents: dict, premium: list | None = None) -> str:
         maker = (f"\n    MAKES: {makes}. Its stage's deliverable is the thing "
                  f"itself — brief it to BUILD that, never to write text about it."
                  if makes else "")
+        # The skills this step may use, by key; each is described once, in
+        # the "skills" rule under WHAT TO WRITE (core/skills.py).
+        skill_line = SK.stage_line(stage)
         lines.append(f"- {stage.upper()} → {name}: {spec}{star}{maker}\n"
-                     f"    USE FOR: {_STAGE_HELP.get(stage, '')}")
+                     f"    USE FOR: {_STAGE_HELP.get(stage, '')}"
+                     + (f"\n{skill_line}" if skill_line else ""))
     return "\n".join(lines)
 
 
@@ -580,8 +585,9 @@ def _schema_stub(agents: dict) -> str:
         # on every line, and a model that copies the example turns "Make the
         # images" into a text step — no image line, no image check.
         kind = _contract_kind(stage)
+        skilled = ', "skills": []' if SK.for_stage(stage) else ""
         parts.append(f'  "{stage}": {{ "needed": false, "kind": "{kind}", '
-                     '"questions": ["..."] }')
+                     f'"questions": ["..."]{skilled} }}')
     return "{\n" + ",\n".join(parts) + "\n}"
 
 
@@ -780,6 +786,28 @@ def _maker_rule(agents: dict) -> str:
         f"      (every slide present, headings exact, readable at a glance).\n")
 
 
+def _skills_rule(agents: dict) -> str:
+    """How to use the SKILLS keys named in the step list above.
+
+    A skill is house standards for a kind of deliverable, written by hand and
+    checked by Prism, which types its text into the step's message itself.
+    So the planner only NAMES one: in keeping with the rest of this prompt,
+    the brief stays about the task and carries no rules (core/skills.py).
+    """
+    stages = list(agents) + ["summary"]
+    if not SK.any_for_stages(stages):
+        return ""
+    return (
+        "- \"skills\" — house standards for a kind of deliverable. The steps "
+        "above name the ones each step may use; this is what each is for:\n"
+        + SK.catalogue_text(stages) + "\n"
+        "  Where one fits what a step is making, put its key in that step's "
+        "\"skills\" list (at most two, the closest first); leave it empty "
+        "when none fits. Prism types the skill's standards into that step's "
+        "message itself, so the brief stays about this task and does not "
+        "restate them.\n")
+
+
 def build_prompt(query: str, profile: str, agents: dict, attachments: list | None = None,
                  premium: list | None = None, brief: str = "") -> str:
     profile_line = (
@@ -809,6 +837,7 @@ def build_prompt(query: str, profile: str, agents: dict, attachments: list | Non
     )
     self_directing_block = _self_directing_rule(agents)
     maker_block = _maker_rule(agents)
+    skills_block = _skills_rule(agents)
     brief_block = (
         "\n═══ TASK BRIEF (auto-expanded from the raw request by a prompt-"
         "engineering pass; mine it for context, deliverable specs, quality "
@@ -869,7 +898,7 @@ named, and each receives the previous step's answer as its context:
   into a brief if the person gave it or an earlier step will really produce
   it — a brief that says "you have been given the brand colours" when nobody
   found any is worse than one that asks for them.
-{self_directing_block}{maker_block}{brief_block}
+{self_directing_block}{maker_block}{skills_block}{brief_block}
 The person's own request — authoritative on scope, and it wins over the
 brief wherever the two differ:
 {query}
@@ -1248,6 +1277,15 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     # Surface the enrichment brief so the UI can show the full transformation
     # chain (raw words → brief → stage prompts). Consumers iterate
     # PIPELINE_ORDER, so this extra key is invisible to them.
+    # Which skills each step actually runs with. The planner's pick is
+    # validated against what exists for that step; where it chose none and
+    # the step is running, the person's own words decide -- the same
+    # deterministic backstop as the make-step guardrail above.
+    picked = SK.assign(query, routing, list(A.PIPELINE_ORDER))
+    if picked:
+        for stage, keys in picked.items():
+            ui.info(f"📘  {stage}: skill(s) {', '.join(keys)}")
+
     routing["_brief"] = brief
     # The job's name, for the run folder, History, Home and every chat's
     # title. Same "invisible to consumers" convention as _brief.

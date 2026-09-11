@@ -419,7 +419,7 @@ _QTY_BEFORE = re.compile(
     r"(\d[\d,]*(?:\.\d+)?)\s*(?:" + _QTY_UNITS + r")?\.?\s*(?:of\s+)?"
     r"(?:[a-z]+\s+){0,2}$", re.I)
 _QTY_AFTER = re.compile(
-    r"^\s*(?:[-:–,]\s*)?(?:x|×|qty\.?|quantity|:|-)?\s*(\d[\d,]*(?:\.\d+)?)"
+    r"^\s*(?:[-:–,]\s*)?(?:x|×|qty\.?|quantity|for|:|-)?\s*(\d[\d,]*(?:\.\d+)?)"
     r"\s*(?:" + _QTY_UNITS + r")?\b", re.I)
 _PRICE_WORDS = re.compile(r"(?:₹|rs\.?|inr|price|rate|@|per|each)\s*$", re.I)
 
@@ -445,14 +445,16 @@ def _code_pattern(code: str):
     return re.compile(r"(?<![a-z0-9])" + body + r"(?![a-z0-9])", re.I)
 
 
-def _quantity_near(line: str, start: int, end: int) -> Decimal | None:
+def _quantity_near(line: str, start: int, end: int, floor: int = 0) -> Decimal | None:
     """The number written beside the code on this line: after it ("1128K x
     40", "1128K - 40 nos") or before it ("40 pcs of 1128K"). Never a number
-    that follows a currency or price word, and never the code's own digits."""
+    that follows a currency or price word, never the code's own digits, and
+    never anything before `floor` -- where the previous code on the line
+    ended, so "KJP-150 x 1, also KJP 128" cannot hand the 1 to KJP 128."""
     after = _QTY_AFTER.match(line[end:end + 40])
     if after:
         return to_decimal(after.group(1))
-    before = _QTY_BEFORE.search(line[max(0, start - 40):start])
+    before = _QTY_BEFORE.search(line[max(floor, start - 40):start])
     if before and not _PRICE_WORDS.search(line[max(0, start - 60):before.start()]):
         return to_decimal(before.group(1))
     return None
@@ -468,6 +470,7 @@ def find_requests(text: str, items: list[RateItem]) -> list[Request]:
     lines = text.splitlines() or [text]
     offset = 0
     for line in lines:
+        hits = []
         for item in items:
             if not item.code or item.code in seen:
                 continue
@@ -478,9 +481,14 @@ def find_requests(text: str, items: list[RateItem]) -> list[Request]:
             if not m:
                 continue
             seen.add(item.code)
-            found.append((offset + m.start(),
-                          Request(item, _quantity_near(line, m.start(), m.end()),
+            hits.append((m.start(), m.end(), item))
+        hits.sort()
+        floor = 0
+        for start, end, item in hits:
+            found.append((offset + start,
+                          Request(item, _quantity_near(line, start, end, floor),
                                   evidence=line.strip()[:160])))
+            floor = end
         offset += len(line) + 1
     found.sort(key=lambda t: t[0])
     requests = [r for _, r in found]

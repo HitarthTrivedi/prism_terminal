@@ -30,6 +30,7 @@ __all__ = [
     "continuity",
     "camera",
     "fixtures",
+    "spine",
     "studio",
     "beats",
     "review",

@@ -315,6 +315,16 @@ class TextNode extends Node {
       case "split_slide": {
         el.style.position = "relative";
         el.textContent = "";
+        // An in-flow, invisible copy keeps the line's own size: the two
+        // halves below are absolutely positioned and contribute nothing to
+        // layout, so without this the line — and the whole text box — is
+        // 0x0 and the halves are clipped to nothing. Every split_slide
+        // caption in the third Alphakore run (10 Sep 2026) vanished this way.
+        const ghost = document.createElement("span");
+        ghost.style.visibility = "hidden";
+        ghost.style.whiteSpace = "pre";
+        ghost.textContent = line;
+        el.appendChild(ghost);
         const mk = (side) => {
           const s = document.createElement("span");
           s.style.position = "absolute";
@@ -881,7 +891,9 @@ function _rand(seed, i, salt) {
   return (h % 100000) / 100000;
 }
 function _layoutPoint(layout, i, count, seed) {
-  const kind = (layout && layout.kind) || "scatter";
+  if (typeof layout === "string") layout = { kind: layout };
+  if (!layout || typeof layout !== "object") layout = {};
+  const kind = layout.kind || "scatter";
   const r = k => _rand(seed, i, k);
   if (kind === "band") {
     const rows = layout.rows || 6, cell = layout.cell || 26, x0 = layout.x0 !== undefined ? layout.x0 : 40;
@@ -924,7 +936,17 @@ class ParticleFieldNode extends Node {
     this.size = props.size || 14;
     this.palette = Array.isArray(props.palette) && props.palette.length ? props.palette : _FIELD_PALETTE;
     this.seed = props.seed !== undefined ? props.seed : this.id;
-    this.phases = Array.isArray(props.phases) && props.phases.length ? props.phases : [{ at: 0, layout: { kind: "scatter" } }];
+    // schema.py normalises these too; the runtime stays safe on its own so a
+    // saved spec from before that normalisation still plays.
+    const raw = Array.isArray(props.phases) && props.phases.length ? props.phases : [{ at: 0, layout: { kind: "scatter" } }];
+    this.phases = raw.map((ph, k) => {
+      if (typeof ph === "string") return { at: k * 1.2, layout: { kind: ph } };
+      if (!ph || typeof ph !== "object") return { at: k * 1.2, layout: { kind: "scatter" } };
+      const out = Object.assign({}, ph);
+      if (typeof out.layout === "string") out.layout = { kind: out.layout };
+      if (!out.layout || typeof out.layout !== "object") out.layout = { kind: out.kind || "scatter" };
+      return out;
+    });
     this.flicker = props.flicker !== undefined ? props.flicker : 0.35;
     this.blend = props.blend_mode || "normal";
     this._tiles = [];
@@ -940,11 +962,13 @@ class ParticleFieldNode extends Node {
       const depth = _rand(this.seed, i, 12);
       const colour = this.palette[Math.floor(_rand(this.seed, i, 13) * this.palette.length) % this.palette.length];
       const [x, y] = _layoutPoint(first, i, this.count, this.seed);
+      // `alpha` is the tile's resting opacity whatever the first layout —
+      // a field that starts hidden reveals to it, not to zero.
       const alpha = 0.55 + 0.45 * depth;
       el.style.cssText = `position:absolute;left:${-s / 2}px;top:${-s / 2}px;width:${s}px;height:${s}px;border-radius:2px;` +
         `background:${colour};opacity:${hidden ? 0 : alpha.toFixed(3)};mix-blend-mode:${this.blend};will-change:transform;`;
       box.appendChild(el);
-      this._tiles.push({ el, x, y, depth, alpha: hidden ? 0 : alpha });
+      this._tiles.push({ el, x, y, depth, alpha, hiddenAtStart: hidden });
       gsap.set(el, { x, y });
     }
   }
@@ -963,11 +987,17 @@ class ParticleFieldNode extends Node {
       });
     }
     if (this.flicker > 0) {
+      // The flicker starts only once the field is visible, or it would
+      // reveal a hidden-at-start field on its own schedule.
+      let visibleFrom = 0;
+      for (let k = 0; k < this.phases.length; k++) {
+        const lay = this.phases[k].layout || {};
+        if (lay.kind !== "hidden") { visibleFrom = (this.phases[k].at || 0) + (k ? (this.phases[k].duration || 1.0) + (this.phases[k].stagger || 0.35) : 0); break; }
+      }
       this._tiles.forEach((t, i) => {
-        if (t.alpha <= 0) return;
         const period = 0.9 + _rand(this.seed, i, 30) * 1.6;
         masterTl.to(t.el, { opacity: Math.max(0.05, t.alpha * (1 - this.flicker)), duration: period, ease: "sine.inOut", repeat: -1, yoyo: true },
-          _rand(this.seed, i, 31) * period);
+          visibleFrom + _rand(this.seed, i, 31) * period);
       });
     }
   }

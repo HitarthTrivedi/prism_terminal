@@ -92,9 +92,47 @@ def _pair(value: Any, default: Tuple[float, float]) -> Tuple[float, float]:
     return default
 
 
-def _pose(node: Dict[str, Any], parent_pos: Tuple[float, float]) -> Dict[str, float]:
-    """A node's settled, authored pose in scene (world) space."""
+def _layout_centre(layout: Any) -> Optional[Tuple[float, float]]:
+    """Where a particle_field layout puts its tiles, as one point."""
+    if not isinstance(layout, dict):
+        return None
+    kind = layout.get("kind")
+    if kind == "box" or kind == "scatter":
+        box = layout.get("box")
+        if isinstance(box, (list, tuple)) and len(box) == 4:
+            return ((_num(box[0]) + _num(box[2])) / 2, (_num(box[1]) + _num(box[3])) / 2)
+    if kind == "band":
+        return ((_num(layout.get("x0"), 0) + _num(layout.get("x1"), 1080)) / 2, _num(layout.get("y")))
+    if kind == "column":
+        return (_num(layout.get("x")), (_num(layout.get("y0"), 0) + _num(layout.get("y1"), 1920)) / 2)
+    if kind == "points":
+        pts = [p for p in (layout.get("points") or []) if isinstance(p, (list, tuple)) and len(p) == 2]
+        if pts:
+            return (sum(_num(p[0]) for p in pts) / len(pts), sum(_num(p[1]) for p in pts) / len(pts))
+    if kind == "ring":
+        c = layout.get("center") or layout.get("centre")
+        if isinstance(c, (list, tuple)) and len(c) == 2:
+            return (_num(c[0]), _num(c[1]))
+    return None
+
+
+def _pose(node: Dict[str, Any], parent_pos: Tuple[float, float],
+          at_start: bool = False) -> Dict[str, float]:
+    """A node's settled, authored pose in scene (world) space. A
+    particle_field sits at [0, 0] and lays its tiles out elsewhere, so its
+    pose is the centre of a layout — the last one when the field hands
+    off (`at_start` False), the FIRST one when it is handed to: a field
+    that arrives as a band and streams away as a column must be bridged
+    to the band, or the whole field slides in from the column's centre
+    (the composed reel's second scene, 11 Sep 2026)."""
     x, y = _pair(node.get("position"), (0.0, 0.0))
+    if node.get("type") == "particle_field":
+        phases = [ph for ph in (node.get("phases") or []) if isinstance(ph, dict)]
+        for phase in (phases if at_start else reversed(phases)):
+            centre = _layout_centre(phase.get("layout"))
+            if centre is not None:
+                x, y = x + centre[0], y + centre[1]
+                break
     sx, sy = _pair(node.get("scale"), (1.0, 1.0))
     return {
         "x": parent_pos[0] + x,
@@ -120,6 +158,7 @@ def _keyed_nodes(scene: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
                 "node": node,
                 "id": str(node.get("id", "")),
                 "pose": _pose(node, parent_pos),
+                "pose_in": _pose(node, parent_pos, at_start=True),
             })
         for child in node.get("children", []) or []:
             if isinstance(child, dict):
@@ -142,7 +181,7 @@ def _plan_bridge(out_inst: Dict[str, Any], in_inst: Dict[str, Any],
                  start: float, end: float,
                  diagonal: float) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """The delta one subject must travel across a cut, or why it cannot."""
-    a, b = out_inst["pose"], in_inst["pose"]
+    a, b = out_inst["pose"], in_inst.get("pose_in", in_inst["pose"])
     seconds = end - start
     if seconds < MIN_BRIDGE_SECONDS:
         return None, "the cut is too short to bridge"
@@ -217,6 +256,7 @@ def report(spec: Dict[str, Any]) -> Dict[str, Any]:
             threads.setdefault(key, []).append({
                 "scene": str(scene.get("id", "")), "scene_index": idx,
                 "node": inst["id"], "pose": inst["pose"],
+                "type": str(inst["node"].get("type", "")),
             })
 
     # Thread gaps: a subject that vanishes for a scene and then returns.
@@ -274,7 +314,34 @@ def report(spec: Dict[str, Any]) -> Dict[str, Any]:
             })
             bridges.append(plan)
 
+    # Text the CAMERA clips: the inspector checks authored boxes against the
+    # frame, but a shot that parks the camera off-centre moves the frame.
+    # Read the compiled camera at each scene's settled time and refuse a
+    # text node whose box falls outside what the camera shows.
+    errors.extend(_camera_clip_faults(spec, scenes))
+
     if cinematic and scenes:
+        # A spine has to TRANSFORM. The same node type at the same pose for
+        # three scenes running is a logo on a slide deck, not a subject
+        # changing state (the Alphakore run carried its mark that way for
+        # seven scenes). Reported once per thread, at the third scene.
+        for key, items in threads.items():
+            run = 1
+            for a, b in zip(items, items[1:]):
+                pa, pb = a["pose"], b["pose"]
+                same = (b["scene_index"] == a["scene_index"] + 1 and a["type"] == b["type"]
+                        and abs(pa["x"] - pb["x"]) < 8 and abs(pa["y"] - pb["y"]) < 8
+                        and abs(pa["scale_x"] - pb["scale_x"]) < 0.05)
+                run = run + 1 if same else 1
+                if run == 3:
+                    warnings.append({
+                        "scene_index": b["scene_index"], "key": key,
+                        "message": (f'continuity_key "{key}" is the same {a["type"]} at the '
+                                    f"same pose in scenes {b['scene_index'] - 1} to "
+                                    f"{b['scene_index'] + 1} — the subject never changes "
+                                    "state; a spine transforms from beat to beat (gathers, "
+                                    "streams, converges, opens, resolves), it does not sit")})
+                    break
         for idx, (scene, keyed) in enumerate(zip(scenes, per_scene)):
             if not keyed:
                 warnings.append({
@@ -297,6 +364,72 @@ def report(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     return {"threads": threads, "bridges": bridges,
             "errors": errors, "warnings": warnings}
+
+
+def _camera_clip_faults(spec: Dict[str, Any], scenes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    from . import camera as _camera
+    from .inspect import _node_bounds
+    project = spec.get("project") or {}
+    width = int(_num(project.get("width"), 1080)); height = int(_num(project.get("height"), 1920))
+    if not any(isinstance(s.get("shot"), dict) for s in scenes):
+        return []
+    # scene starts are scene-local here (build_spec's shape); lay them out
+    cursor, laid = 0.0, []
+    for s in scenes:
+        laid.append(dict(s, start=cursor)); cursor += _num(s.get("duration"), 0.0)
+    world = {}
+    for s in laid:
+        def visit(node, parent=(0.0, 0.0)):
+            pos = _pair(node.get("position"), (0.0, 0.0))
+            here = (parent[0] + pos[0], parent[1] + pos[1])
+            if node.get("id") and not node.get("_no_position"):
+                cx, cy = _camera.node_centre(node)
+                world[str(node["id"])] = (parent[0] + cx, parent[1] + cy)
+            for c in node.get("children") or []:
+                if isinstance(c, dict):
+                    visit(c, here)
+        for n in s.get("nodes") or []:
+            if isinstance(n, dict):
+                visit(n)
+    tracks = _camera.compile_tracks(laid, width, height, world) or []
+    out: List[Dict[str, Any]] = []
+    for idx, s in enumerate(laid):
+        settled = s["start"] + _num(s.get("duration"), 0.0) * 0.8
+        view = _camera.visible_rect(_camera.state_at(tracks, settled, width, height), width, height)
+        def check(node, parent=(0.0, 0.0), gone=False):
+            pos = _pair(node.get("position"), (0.0, 0.0))
+            here = (parent[0] + pos[0], parent[1] + pos[1])
+            # a node whose exit is over before the shot settles has left the
+            # frame on purpose (the composed reel's bubbles, still leaving
+            # across a cut): the settled camera cannot clip what is gone
+            anim = node.get("animation") if isinstance(node.get("animation"), dict) else {}
+            ex = anim.get("exit") if isinstance(anim.get("exit"), dict) else None
+            if ex and _num(ex.get("time"), 1e9) + _num(ex.get("duration"), 0.0) <= _num(s.get("duration"), 0.0) * 0.8:
+                gone = True
+            if not gone and node.get("type") == "text" and str(node.get("content") or "").strip():
+                shifted = dict(node, position=list(here))
+                b = _node_bounds(shifted, width, height)
+                if b:
+                    left, top, right, bottom = b
+                    ix = max(0.0, min(right, view[2]) - max(left, view[0]))
+                    iy = max(0.0, min(bottom, view[3]) - max(top, view[1]))
+                    area = max(1.0, (right - left) * (bottom - top))
+                    # a card cut by the frame edge is the reference's own
+                    # grammar; text is clipped when most of it is out of view
+                    if ix * iy / area < 0.6:
+                        out.append({"scene_index": idx, "key": "",
+                                    "message": (f'{_scene_label(idx, s)}: the camera shows x {view[0]:.0f}-{view[2]:.0f}, '
+                                                f'y {view[1]:.0f}-{view[3]:.0f} once its shot settles, and text node '
+                                                f'"{node.get("id")}" ({left:.0f},{top:.0f} to {right:.0f},{bottom:.0f}) '
+                                                "falls outside it — move the text into view, or give the shot a "
+                                                "target the text sits under")})
+            for c in node.get("children") or []:
+                if isinstance(c, dict):
+                    check(c, here, gone)
+        for n in s.get("nodes") or []:
+            if isinstance(n, dict):
+                check(n)
+    return out
 
 
 def faults(spec: Dict[str, Any]) -> List[str]:

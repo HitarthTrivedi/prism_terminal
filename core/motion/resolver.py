@@ -308,15 +308,42 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     node_registry: Dict[str, Dict[str, Any]] = {}
 
+    def _centre(node: Dict[str, Any]) -> Tuple[float, float]:
+        """Where a node visually IS, for camera targets: an arrow's
+        midpoint, a tree's hub, otherwise its position. (The Alphakore run
+        panned to the top-left corner for eleven seconds because a shot
+        targeted an arrow, whose defaulted position is the origin.)"""
+        pos = node.get("position", [0, 0])
+        try:
+            x, y = float(pos[0]), float(pos[1])
+        except (TypeError, ValueError, IndexError):
+            x, y = 0.0, 0.0
+        frm, to = node.get("from"), node.get("to")
+        if node.get("type") in ("shape_arrow", "arrow") and isinstance(frm, (list, tuple)) \
+                and isinstance(to, (list, tuple)) and len(frm) == 2 and len(to) == 2:
+            try:
+                return (x + (float(frm[0]) + float(to[0])) / 2, y + (float(frm[1]) + float(to[1])) / 2)
+            except (TypeError, ValueError):
+                pass
+        hub = node.get("hub")
+        if node.get("type") == "spline_tree" and isinstance(hub, (list, tuple)) and len(hub) == 2:
+            try:
+                return (x + float(hub[0]), y + float(hub[1]))
+            except (TypeError, ValueError):
+                pass
+        return (x, y)
+
     def _index(nodes: List[Dict[str, Any]], parent_pos: Tuple[float, float] = (0.0, 0.0)):
         for node in nodes:
             nid = node.get("id", "")
             pos = node.get("position", [0, 0])
             abs_x = parent_pos[0] + float(pos[0])
             abs_y = parent_pos[1] + float(pos[1])
+            cx, cy = _centre(node)
             node_registry[nid] = {
                 "node": node,
-                "world_pos": (abs_x, abs_y),
+                "world_pos": (parent_pos[0] + cx, parent_pos[1] + cy),
+                "targetable": not node.get("_no_position"),
             }
             if "children" in node and isinstance(node["children"], list):
                 _index(node["children"], (abs_x, abs_y))
@@ -333,7 +360,8 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     # The authored tracks are kept on `_authored_tracks` (their first entry
     # seeds the opening state) so the decision is visible in a saved spec.
     if not spec.get("_camera_resolved"):
-        world = {nid: entry["world_pos"] for nid, entry in node_registry.items()}
+        world = {nid: entry["world_pos"] for nid, entry in node_registry.items()
+                 if entry.get("targetable", True)}
         authored = camera.get("tracks") if isinstance(camera, dict) else None
         width = int((spec.get("project") or {}).get("width", 1080) or 1080)
         height = int((spec.get("project") or {}).get("height", 1920) or 1920)

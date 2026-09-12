@@ -54,7 +54,12 @@ _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
   text             — content, position, font_size, font_weight, fill, mode (see TEXT MODES).
                       A long headline may use "\\n" for a manual line break —
                       each line is centred and stacked automatically.
-  shape_rect       — position, width, height, radius, fill, is_glass (optional)
+  shape_rect       — position, width, height, radius, fill, is_glass (optional).
+                      For hairlines, pills, badges and chat bubbles. It is the
+                      WRONG primitive for a background or a card: a flat
+                      rectangle wider and taller than half the frame is sent
+                      back — a background is a light_field (or a gradient
+                      fill), a card is a glass_panel.
   shape_arrow      — from, to, curved, color, stroke_width, draw_start, draw_duration
   domain_chart     — chart_type (bar|line|ring|area|sparkline|metric), data, accent_color
   domain_ui_mockup — position, width, height, title, elements, cursor_actions
@@ -158,7 +163,14 @@ SHOT, on a SCENE (next to "nodes") — what the camera does for this beat. The
 shots of all scenes are compiled into ONE continuous camera curve for the
 whole film; a shot only says where the camera ends up, so it always starts
 wherever the previous shot left it (there is no per-scene camera reset):
-  "shot": {"intent": "push", "target": "<node id>" or [x, y], "zoom": 1.2}
+  "shot": {"intent": "push", "target": "<node id>" or [x, y], "zoom": 1.2, "duration": 0.6}
+  Optional "duration" (seconds the move takes; default most of the scene)
+  and "delay" (seconds into the scene before it starts, holding the previous
+  shot's end state — a scene that settles on its icons, then pans down to
+  the hub). A node target puts that node at the frame's centre.
+  ("duration" is optional: seconds the move takes; omit it and the move
+  spans the scene, right for a drift, wrong when copy must land on a
+  settled frame.)
   hold     — stay where the camera is.
   reveal   — settle out onto the target (an opening).
   push     — move in on the target (zoom ×1.15 unless "zoom" is given).
@@ -336,6 +348,11 @@ def _scene_rules(skeleton: str | None) -> str:
         "for how it cuts in from the one before it — pick one that fits "
         "the beat, or leave it unset and a real one is still chosen for "
         "you rather than a hard cut.\n"
+        "8b. Only the artwork listed under ARTWORK YOU MAY USE exists. A "
+        "screenshot, photo or device frame the list does not name must not "
+        "be drawn as an empty placeholder — an empty glass_panel or an image "
+        "with no src is sent back. Carry that beat's copy on a glass_panel "
+        "with the text inside it instead.\n"
         "9. Before placing a text or image node, sketch its actual box — "
         "position ± roughly half its width/height — against every OTHER "
         "text/image node's box already placed in the same scene. Two photos, "
@@ -358,7 +375,13 @@ def _scene_rules(skeleton: str | None) -> str:
             "reuse the same key in later scenes when that subject returns.\n"
             "12. At least one camera or secondary motion must continue across "
             "the handoff; the incoming pose must visibly pick up the outgoing "
-            "one.\n")
+            "one.\n"
+            "13. Build from the material primitives, not from rectangles: the "
+            "background layer is a light_field (or a gradient-filled rect), the "
+            "card that carries copy is a glass_panel, depth comes from "
+            "depth_layer, gathered tiles are a particle_field, a lit sphere is "
+            "an orb. A flat shape_rect covering more than half the frame is "
+            "checked for and sent back.\n")
     return rules
 
 
@@ -388,7 +411,7 @@ def _rulebook(skeleton: str | None) -> str:
 
 
 def storyboard_instructions(request: str, brand: dict | None = None,
-                            skeleton: str | None = None) -> str:
+                            skeleton: str | None = None, script: str = "") -> str:
     """Turn one: the look, the camera's overall intent, a storyboard row
     per scene, and the rulebook every scene after it is written to (see
     _rulebook()). Mirrors core.reel_web.design_instructions()'s split.
@@ -400,6 +423,8 @@ def storyboard_instructions(request: str, brand: dict | None = None,
     choice — so it's told to use them as ITS accent rather than inventing
     one, the same way Studio is told to.
     """
+    if skeleton == SPINE_SKELETON:
+        return copy_instructions(request, brand=brand, script=script)
     brand_note = ""
     if brand:
         brand_note = (
@@ -408,11 +433,32 @@ def storyboard_instructions(request: str, brand: dict | None = None,
             f"{brand.get('deep')}. Use these as the accent colour running "
             "through the piece rather than inventing your own — this is "
             "their actual brand, not a suggestion.")
+    from . import spine as _spine
+    spine_note = ""
+    if skeleton == "cinematic_glass":
+        n_rows = 7
+        if script and script.strip():
+            import re as _re
+            found = len(_re.findall(r"(?im)^\s*scene\s*0?(\d+)\b", script))
+            if found:
+                n_rows = max(4, min(10, found))
+        spine_note = "\n\n" + _spine.storyboard_text(n_rows)
+    script_note = ""
+    if script and script.strip():
+        script_note = (
+            "\n\nTHE SCRIPT — the copy stage already wrote what this piece "
+            "says, beat by beat. It is the story; do not write another one:\n"
+            + script.strip()[:6000]
+            + "\n\nOne storyboard row per beat of that script, in its order. "
+            'Each row\'s "caption" is that beat\'s on-screen line, VERBATIM — '
+            "the scene will carry it as its main text and is checked "
+            "against it. Rows without a caption are only allowed where the "
+            "script itself has no words for that beat.")
     return (
         "You are Prism's Senior Visual Director and Motion Designer, "
         "planning a short vertical motion graphic.\n\n"
         f"WHAT THE CLIENT ASKED FOR:\n{request}"
-        + brand_note + "\n\n"
+        + brand_note + script_note + spine_note + "\n\n"
         + _PALETTE_GUIDANCE + "\n\n"
         + _rulebook(skeleton) + "\n\n"
         "This is turn one of a conversation. Right now, name the project "
@@ -439,6 +485,9 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         '  "storyboard": [\n'
         '    {"scene": 1, "seconds": 2.5,\n'
         '     "job": "what this scene is FOR in the argument",\n'
+        '     "beat": "gather",\n'
+        '     "caption": "the on-screen words for this beat (the script\'s line, verbatim)",\n'
+        '     "subject": "what the carried subject IS and what STATE it is in here",\n'
         '     "look": "what is on screen and how it is composed — what is '
         'big, what is a supporting label, what kind of node carries it",\n'
         '     "motion": "what moves, in what order, from where — and what '
@@ -477,7 +526,11 @@ def _cinematic_glass_storyboard_close() -> str:
         "how each scene's final pose hands into the next scene's first pose. "
         "Use scene changes to reveal, transform or focus the same idea; "
         "reserve the final scene for a resolved logo/answer/CTA. `camera.tracks` "
-        "is for the WHOLE graphic and should also feel continuous."
+        "is for the WHOLE graphic and should also feel continuous. In each "
+        "row's `look`, name the material primitives that carry the scene "
+        "(light_field, glass_panel, depth_layer, particle_field, orb, "
+        "spline_tree, icon) — a scene described as rectangles and arrows "
+        "will be built from rectangles and arrows."
     )
 
 
@@ -498,6 +551,9 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
     or colour instead of cutting cold; None for the first scene.
     """
     job = str(row.get("job", "")).strip() or "carry the argument forward"
+    caption = str(row.get("caption", "")).strip()
+    subject = str(row.get("subject", "")).strip()
+    beat_name = str(row.get("beat", "")).strip()
     look = str(row.get("look", "")).strip()
     motion = str(row.get("motion", "")).strip()
     try:
@@ -562,6 +618,12 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
         f"SCENE {idx + 1} of {total}.\n\n"
         + role_header
         + f"ITS JOB: {job}\n"
+        + (f'ITS CAPTION: "{caption}" — this scene\'s main text node carries '
+           "exactly these words (a manual line break is fine); a scene "
+           "whose text says something else is sent back.\n" if caption else "")
+        + (f"ITS SUBJECT: {subject}\n" if subject else "")
+        + (("\n" + __import__("core.motion.spine", fromlist=["recipe_text"]).recipe_text(beat_name) + "\n")
+           if beat_name and skeleton == "cinematic_glass" else "")
         + (f"THE LOOK: {look}\n" if look else "")
         + (f"THE MOTION: {motion}\n" if motion else "")
         + f"\nDuration: {seconds:g} seconds. All this scene's animation "
@@ -577,6 +639,116 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
         '"transition_in" may sit next to "nodes" to name how this scene cuts '
         "in (one of the TRANSITIONS)."
     )
+
+
+STORYBOARD_EXPECT = ("storyboard", "project")
+
+
+def _words(text: str) -> list[str]:
+    import re
+    return re.findall(r"[a-z0-9]+", str(text or "").lower())
+
+
+def caption_faults(scene: dict, row: dict) -> list[str]:
+    """The one story check a program can make: when the storyboard row
+    has a caption (the script's line for this beat), some text node in
+    the scene must carry those words. Compared on lowercased word runs,
+    so a manual line break or a stray comma does not fail it; a scene
+    that says something else — or nothing — does."""
+    caption = str(row.get("caption", "")).strip() if isinstance(row, dict) else ""
+    if not caption:
+        return []
+    want = _words(caption)
+    if not want:
+        return []
+    texts: list[str] = []
+
+    def visit(node):
+        if isinstance(node, dict):
+            if node.get("type") == "text":
+                texts.append(str(node.get("content") or ""))
+            for child in node.get("children") or []:
+                visit(child)
+
+    for node in scene.get("nodes") or []:
+        visit(node)
+    joined = " ".join(_words(" ".join(texts)))
+    if " ".join(want) in joined:
+        return []
+    hit = max((sum(1 for w in want if w in _words(t)) / len(want) for t in texts), default=0.0)
+    return [f'the scene\'s caption is "{caption}" but ' +
+            ("no text node carries it" if hit < 0.5 else
+             "its text only partly matches it") +
+            ' — put the caption, verbatim, in the scene\'s main "text" node '
+            "(a manual line break is fine)"]
+
+
+REPAIR_ROUNDS = 2
+
+# What each fault family needs changed — added on the second round, when a
+# bare list of faults came back with the same scene.
+_REPAIR_MOVES = (
+    ("sits completely still", 'give the foreground node an "exit" block (time near the '
+                              'end, a real x/y/opacity change) or a "secondary_motion" '
+                              "wiggle — do not only re-send its enter"),
+    ("overlap by", "move one of the two nodes to its own region of the frame — "
+                   "stack them vertically or split left/right, and shrink the larger"),
+    ("names no \"shot\"", 'add "shot": {"intent": ..., "target": ...} next to "nodes"'),
+    ("caption is", 'put the caption, word for word, in the scene\'s main "text" node'),
+    ("runs off the edge", "pull the node inside the frame and check its anchor"),
+    ("platform's own UI", "move it below the top band, above the bottom band"),
+    ("no \"secondary_motion\"", 'add "secondary_motion" to the background node'),
+    ("flat shape_rect", "replace it with a light_field (background) or a glass_panel (card)"),
+    ("empty glass_panel", "put the copy inside it as children, or remove it"),
+    ("no \"content\"", 'put the words in "content"'),
+    ("beat \"", "build the primitives and phases the beat's recipe lists — the recipe is the scene"),
+    ("no \"src\"", 'use "src": "asset:<name>" from the list, or remove the image'),
+)
+
+
+def repair_prompt(idx: int, faults: list[str], round_no: int) -> str:
+    """The message a faulty scene is sent back with. Round one lists the
+    faults; round two adds the concrete change each one needs, and says
+    the last correction did not fix them."""
+    head = (f"Scene {idx + 1} was checked and these are wrong:\n\n" if round_no == 0 else
+            f"Scene {idx + 1} still has these problems after your correction — the "
+            "last reply came back with the same faults, so change the nodes "
+            "named here directly:\n\n")
+    lines = []
+    for n, fault in enumerate(faults[:8], 1):
+        line = f"{n}. {fault}"
+        if round_no > 0:
+            for key, move in _REPAIR_MOVES:
+                if key in fault:
+                    line += f"\n   → {move}"
+                    break
+        lines.append(line)
+    return (head + "\n".join(lines)
+            + "\n\nSend the corrected scene: ONLY the JSON object, same shape, "
+              "in a ```json fenced block."
+            + (" Keep every node that was not named." if round_no > 0 else ""))
+
+
+def beat_check(scene: dict, row: dict, skeleton: str | None) -> list[str]:
+    """The scene against its storyboard row's beat (core.motion.spine)."""
+    if skeleton != "cinematic_glass" or not isinstance(row, dict):
+        return []
+    from . import spine as _spine
+    return _spine.beat_faults(scene, str(row.get("beat", "")).strip())
+
+
+def shot_faults(scene: dict, skeleton: str | None, has_camera: bool = False) -> list[str]:
+    """Under the cinematic profile every scene names a shot; a scene
+    without one holds the previous camera state, which is how the second
+    Alphakore run (10 Sep 2026) held one push for its last five scenes.
+    A storyboard that authored its own `camera.tracks` is exempt — the
+    resolver plays that curve when no scene names a shot, and asking for
+    shots on top of it cost the third run two wasted repair rounds a scene."""
+    if skeleton != "cinematic_glass" or scene.get("shot") or has_camera:
+        return []
+    return ['the scene names no "shot" — add one (see SHOT: hold, reveal, push, '
+            'pull, orbit, parallax, macro, resolve) so the camera keeps moving '
+            "through the film"]
 
 
 def parse_storyboard(text: str) -> tuple[dict, dict, list[dict]]:
@@ -600,7 +772,11 @@ def parse_storyboard(text: str) -> tuple[dict, dict, list[dict]]:
         if isinstance(rows, list) and not board:
             board = [r for r in rows if isinstance(r, dict)]
         if not board and isinstance(got.get("scenes"), list):
-            board = [{"job": "", "look": "", "motion": "",
+            # Kept as a last resort — but flagged, so build_spec() asks for
+            # the real storyboard once before building on rows with no job,
+            # no caption and no subject (the Alphakore run built seven
+            # unconnected scenes on exactly such rows).
+            board = [{"job": "", "look": "", "motion": "", "_from_scenes": True,
                       "seconds": s.get("duration")}
                      for s in got["scenes"] if isinstance(s, dict)]
         if project and board:
@@ -763,6 +939,132 @@ def _repair_continuity(scenes: list[dict], project: dict, camera: dict,
             say(f"   scene {idx + 1}'s correction was no better — keeping the first")
 
 
+SPINE_SKELETON = "spine"
+COPY_EXPECT = '"copy"'
+
+
+def copy_instructions(request: str, brand: dict | None = None, script: str = "") -> str:
+    """Turn one of the composed path: the model writes the WORDS for the
+    reference's grammar — every slot the composer has, with its width —
+    and the palette. No storyboard, no scenes: the structure is
+    core.motion.compose's, and three generated reels (10-11 Sep 2026)
+    showed a model does not build the transformation however it is asked."""
+    from . import compose as _compose
+    brand_note = ""
+    if brand:
+        brand_note = (
+            f"\n\nThe brand colours were measured from the client's own artwork: "
+            f"accent {brand.get('accent')}, deep {brand.get('deep')}. Use the accent "
+            'as "accent" in the palette below.')
+    script_note = ""
+    if script and script.strip():
+        script_note = (
+            "\n\nTHE SCRIPT — the copy stage already wrote what this piece says. "
+            "Take the words from it; do not write another story:\n"
+            + script.strip()[:6000])
+    return (
+        "You are Prism's copywriter for a short vertical motion graphic. The "
+        "film's structure is already designed and built — a signal of tiles "
+        "gathers, streams into a hub, a bright sky sweeps in with a chat "
+        "exchange, cards on a tree, a knowledge card, a ring with a fact, an "
+        "orb, then the brand mark, tagline and call to action. Your job is "
+        "ONLY the words that go into its slots, fitted to the widths given.\n\n"
+        f"WHAT THE CLIENT ASKED FOR:\n{request}" + brand_note + script_note
+        + "\n\nReply with ONLY this JSON object, in a ```json fenced code block, "
+        "nothing before or after it:\n"
+        "{\n"
+        '  "project": {"palette": {"accent": "#hex — the brand accent", "accent2": "#hex — a second accent"}},\n'
+        '  "copy": ' + _compose.copy_slots_text().replace("\n", "\n  ") + "\n"
+        "}\n\n"
+        "RULES: every slot filled, in the brand's own voice, taken from the "
+        "script where the script has the line; character limits are hard "
+        "(what does not fit is cut); plain text only — no markdown, no "
+        "emoji; the three bubbles read as one real exchange with a customer "
+        "(reply, question, answer); \"fact\" is a number or two words; the "
+        '"captions" are optional one-liners for beats without their own words.'
+    )
+
+
+def parse_copy(text: str) -> tuple[dict, dict]:
+    """The copy turn's reply: (project, copy). Either may be empty."""
+    project: dict = {}
+    copy: dict = {}
+    for got in _web._json_objects(text):
+        p = got.get("project")
+        if isinstance(p, dict) and not project:
+            project = p
+        c = got.get("copy")
+        if isinstance(c, dict) and not copy:
+            copy = c
+        elif not copy and isinstance(got.get("brand"), str):
+            copy = got                                  # the slots at the top level
+        if project and copy:
+            break
+    return project, copy
+
+
+def _logo_from(assets_table: dict | None) -> dict | None:
+    """The client's own mark from the asset table, for the resolve beat —
+    a "logo" kind first, else the first transparent artwork."""
+    if not assets_table:
+        return None
+    ranked = sorted(assets_table.items(),
+                    key=lambda kv: (0 if kv[1].get("kind") == "logo" else 1,
+                                    0 if kv[1].get("alpha") else 1))
+    name, a = ranked[0]
+    return {"src": f"asset:{name}", "w": a.get("w"), "h": a.get("h")}
+
+
+def build_composed(first_reply: str, ask: Callable[..., str], assets_table: dict | None = None,
+                   check=None, log=None, on_scene=None) -> dict:
+    """The composed path: parse the copy (asking once more if none came),
+    compose the reference's grammar around it, report what the inspector
+    sees, and return the spec. Never asks for a scene."""
+    from . import compose as _compose
+
+    def say(msg):
+        if log:
+            log(msg)
+
+    project, copy = parse_copy(first_reply)
+    if not copy:
+        say("turn one carried no copy — asking for the slots again")
+        again = ask(
+            'Send ONLY the JSON object with "project" (its "palette") and "copy" — '
+            "every slot listed, fitted to its width — in a ```json fenced block.",
+            COPY_EXPECT) or ""
+        project2, copy = parse_copy(again)
+        project = project or project2
+    if not copy:
+        raise MotionValidationError("The copy turn returned no words to compose with.")
+    if on_scene:
+        try:
+            on_scene(0, 1)
+        except Exception:                        # noqa: BLE001
+            pass
+    palette = project.get("palette") if isinstance(project.get("palette"), dict) else {}
+    try:
+        fps = int(float(project.get("fps") or 30))
+    except (TypeError, ValueError):
+        fps = 30
+    spec = _compose.compose(copy, width=1080, height=1920, fps=max(12, min(60, fps)),
+                            logo=_logo_from(assets_table), palette=palette)
+    spec["_copy"] = copy
+    if assets_table:
+        spec["_assets"] = assets_table
+    if check:
+        try:
+            faults = check(spec)
+        except Exception as e:                   # noqa: BLE001
+            faults = [f"couldn't inspect the composed piece ({e})"]
+        if faults:
+            say(f"composed {len(spec['scenes'])} scenes; the inspector notes "
+                f"{len(faults)} thing(s): " + "; ".join(str(f) for f in faults[:4]))
+        else:
+            say(f"composed {len(spec['scenes'])} scenes — nothing to send back")
+    return spec
+
+
 def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
                assets_table: dict | None = None,
                check=None, log=None, should_stop=None, on_scene=None,
@@ -795,11 +1097,45 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
         if log:
             log(msg)
 
+    if skeleton == SPINE_SKELETON:
+        return build_composed(first_reply, ask, assets_table=assets_table, check=check,
+                              log=log, on_scene=on_scene)
+
     project, camera, board = parse_storyboard(first_reply)
+    if board and all(r.get("_from_scenes") for r in board):
+        # Turn one answered whole scenes instead of a storyboard. Those
+        # scenes carry no job, caption or subject — building on them is
+        # how a piece ends up with no connecting story. Ask once for the
+        # storyboard itself; fall back to the scene list only if that
+        # fails too.
+        say("turn one answered scenes, not a storyboard — asking for the "
+            "storyboard itself")
+        again = ask(
+            "That reply built the scenes. Before any scene is built, send "
+            "the STORYBOARD only: the same JSON object with \"project\", "
+            "\"camera\" and a \"storyboard\" list — one row per scene "
+            "with \"seconds\", \"job\", \"caption\", \"subject\", "
+            "\"look\" and \"motion\" — and NO \"scenes\" key. The "
+            "scenes are asked for one at a time after this.",
+            STORYBOARD_EXPECT) or ""
+        try:
+            project2, camera2, board2 = parse_storyboard(again)
+        except MotionValidationError:
+            project2, camera2, board2 = project, camera, []
+        if board2 and not all(r.get("_from_scenes") for r in board2):
+            project, camera, board = project2 or project, camera2 or camera, board2
+        else:
+            say("   no storyboard came back — building on the scene list")
     total = len(board)
     if not total:
         raise MotionValidationError(
             "The storyboard names no scenes — there is nothing to build.")
+    if skeleton == "cinematic_glass":
+        from . import spine as _spine
+        names = _spine.beats_for(total)
+        for i, row in enumerate(board):
+            if not _spine.beat(str(row.get("beat", "")).strip()):
+                row["beat"] = names[i]
 
     say(f"storyboard: {total} scene(s) — writing them one at a time")
     scenes: list[dict] = []
@@ -854,31 +1190,39 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
             except Exception as e:
                 say(f"couldn't check scene {i + 1} ({e})")
                 faults = []
+            faults = (caption_faults(scene, board[i]) + beat_check(scene, board[i], skeleton)
+                      + shot_faults(scene, skeleton, bool((camera or {}).get("tracks"))) + faults)
             if faults:
                 say(f"scene {i + 1} has {len(faults)} problem(s) — "
                     "sending them back")
+            # Up to two rounds. The second names the change each fault
+            # needs (the second Alphakore run's "held slide" faults came
+            # back unchanged after a single, unguided round). A correction
+            # is kept only if genuinely cleaner — same rule as reel_web: a
+            # "fix" trading four faults for five is not a fix.
+            for round_no in range(REPAIR_ROUNDS):
+                if not faults:
+                    break
                 fixed = parse_scene(ask(
-                    f"Scene {i + 1} was checked and these are wrong:\n\n"
-                    + "\n".join(f"{n}. {x}" for n, x in enumerate(faults[:8], 1))
-                    + "\n\nSend the corrected scene: ONLY the JSON object, "
-                      "same shape, in a ```json fenced block.",
-                    SCENE_EXPECT) or "")
-                if fixed:
-                    fixed["id"] = scene["id"]
-                    fixed["duration"] = scene["duration"]
-                    try:
-                        left = check({"project": project, "camera": camera,
-                                       "scenes": [fixed]})
-                    except Exception:
-                        left = []
-                    # Kept only if genuinely cleaner — same rule as reel_web:
-                    # a "fix" trading four faults for five is not a fix.
-                    if len(left) < len(faults):
-                        scene = fixed
-                        say(f"   fixed — {len(faults)} down to {len(left)}")
-                    else:
-                        say("   the correction was no better — keeping the "
-                            "first")
+                    repair_prompt(i, faults, round_no), SCENE_EXPECT) or "")
+                if not fixed:
+                    break
+                fixed["id"] = scene["id"]
+                fixed["duration"] = scene["duration"]
+                try:
+                    left = check({"project": project, "camera": camera,
+                                   "scenes": [fixed]})
+                except Exception:
+                    left = []
+                left = (caption_faults(fixed, board[i]) + beat_check(fixed, board[i], skeleton)
+                        + shot_faults(fixed, skeleton, bool((camera or {}).get("tracks"))) + left)
+                if len(left) < len(faults):
+                    scene = fixed
+                    say(f"   fixed — {len(faults)} down to {len(left)}")
+                    faults = left
+                else:
+                    say("   the correction was no better — keeping the first"
+                        + (" and saying what to change" if round_no + 1 < REPAIR_ROUNDS else ""))
         scenes.append(scene)
         if skeleton in ("brand_launch", "cinematic_glass"):
             handoff = _scene_handoff(scene) or handoff

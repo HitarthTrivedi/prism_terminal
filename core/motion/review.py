@@ -448,7 +448,13 @@ def review_sheet(spec: Dict[str, Any], out_dir: str, mp4: Optional[str] = None,
 
     faults: List[str] = []
     warnings: List[str] = []
-    for i, scene in enumerate(resolved["scenes"]):
+    # inspect() reads times as scene-local (that is how a scene is written
+    # and checked during generation); the resolved spec carries global
+    # times, so the layout pass runs on the scene-local spec instead.
+    from .schema import validate_motion_spec as _validate
+    from .studio import apply_edits as _apply
+    local = _validate(_apply(spec, spec.get(EDITS_KEY)))
+    for i, scene in enumerate(local["scenes"]):
         faults.extend(_inspect.inspect({"project": project, "scenes": [scene]}))
     faults.extend(hold_faults(resolved))
     faults.extend(cold_cut_faults(resolved))
@@ -464,7 +470,7 @@ def review_sheet(spec: Dict[str, Any], out_dir: str, mp4: Optional[str] = None,
     except Exception as e:                                # noqa: BLE001
         boxes = None
         warnings.append(f"contrast not measured — the runtime page could not be opened ({e})")
-    if boxes is not None:
+    if boxes:
         for fr in settled:
             with Image.open(fr["path"]) as img:
                 faults.extend(contrast_faults(img.convert("RGB"), boxes.get(fr["time"], {}),

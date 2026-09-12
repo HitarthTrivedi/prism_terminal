@@ -43,6 +43,13 @@ def _node_bounds(node: dict, canvas_w: int, canvas_h: int) -> tuple[float, float
         ax, ay = 0.5, 0.5
 
     node_type = node.get("type", "")
+    fill = node.get("fill")
+    if node.get("layer") == "background" or (
+            node_type in ("shape_circle", "circle") and (fill is None or str(fill).strip().lower() == "none")):
+        # A background wash or sky is meant to bleed past the frame, and a
+        # stroke-only ring is a decoration that does the same (the
+        # reference's great arc) — neither has a box worth clipping.
+        return None
     if node_type in ("light_field", "depth_layer", "particle_field", "spline_tree"):
         # A light field is meant to bleed past the frame; a depth layer is
         # a positioning group with no paint of its own. Neither has a box
@@ -201,6 +208,85 @@ def _entrance_faults(node: dict, scene_duration: float) -> list[str]:
     return faults
 
 
+def _luma(colour: str):
+    """Approximate luminance 0-255 of a #hex or rgb()/rgba() colour, or None."""
+    import re
+    c = colour.strip().lower()
+    m = re.match(r"^#([0-9a-f]{3}|[0-9a-f]{6})$", c)
+    if m:
+        h = m.group(1)
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    m = re.match(r"^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", c)
+    if m:
+        r, g, b = (int(m.group(i)) for i in (1, 2, 3))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return None
+
+
+def _material_faults(scene: dict, canvas_w: int, canvas_h: int) -> list[str]:
+    """Under the layer doctrine only: a flat-coloured shape_rect wider AND
+    taller than half the frame is a wash or a card built from the wrong
+    primitive — the catalogue's own words — so it is named, with the
+    primitive that should carry it. A gradient fill (a sky) and a glass
+    rect are not flagged; neither are pills, bubbles or hairlines, which
+    never reach half the frame both ways. A checkable fact about one node,
+    not a taste judgement about the composition.
+    """
+    nodes = [n for n in scene.get("nodes", []) or [] if isinstance(n, dict)]
+    if not any(n.get("layer") for n in nodes):
+        return []
+    faults: list[str] = []
+
+    def visit(node: dict) -> None:
+        if node.get("type") == "particle_field":
+            try:
+                size = float(node.get("size", 14) or 14)
+            except (TypeError, ValueError):
+                size = 14.0
+            if size < 10:
+                faults.append(
+                    f'node "{node.get("id", "?")}" is a particle_field with "size" {size:g} — '
+                    "dust, not tiles; the reference's tiles are 28-40 px, use 24 or more")
+        if node.get("type") == "light_field":
+            colour = str(node.get("color") or "")
+            if _luma(colour) is not None and _luma(colour) < 60:
+                faults.append(
+                    f'node "{node.get("id", "?")}" is a light_field whose "color" {colour} is '
+                    "nearly black — a light must be a bright colour (it is screen-blended "
+                    "over the background), e.g. rgba(124,156,255,0.6)")
+        if node.get("type") == "glass_panel" and not (node.get("children") or []):
+            faults.append(
+                f'node "{node.get("id", "?")}" is an empty glass_panel — a placeholder '
+                "frame with nothing in it; put the beat's copy inside it as children, "
+                "or remove it")
+        if node.get("type") == "shape_rect" and not node.get("is_glass"):
+            fill = str(node.get("fill") or "")
+            try:
+                w = float(node.get("width", 200) or 200)
+                h = float(node.get("height", 100) or 100)
+            except (TypeError, ValueError):
+                w, h = 200.0, 100.0
+            if "gradient(" not in fill and w >= canvas_w * 0.5 and h >= canvas_h * 0.5:
+                what = ("background" if node.get("layer") == "background"
+                        else "card")
+                faults.append(
+                    f'node "{node.get("id", "?")}" is a flat shape_rect '
+                    f"{w:.0f}x{h:.0f} covering most of the {canvas_w}x{canvas_h} "
+                    f"frame — the wrong primitive for a {what}: use a "
+                    + ("light_field, or give the rect a gradient fill"
+                       if what == "background" else "glass_panel"))
+        for child in node.get("children", []) or []:
+            if isinstance(child, dict):
+                visit(child)
+
+    for node in nodes:
+        visit(node)
+    return faults
+
+
 def _layer_faults(scene: dict) -> list[str]:
     """Only fires for scenes actually using the "layer" doctrine (the
     brand_launch skeleton in generate.py) — a plain freeform scene has no
@@ -322,12 +408,27 @@ def inspect(spec: dict[str, Any]) -> list[str]:
         except (TypeError, ValueError):
             duration = 0.0
         faults.extend(_layer_faults(scene))
+        faults.extend(_material_faults(scene, canvas_w, canvas_h))
         faults.extend(_overlap_faults(scene, canvas_w, canvas_h))
         faults.extend(_safe_area_faults(scene, canvas_w, canvas_h))
         for node in scene.get("nodes", []) or []:
             if not isinstance(node, dict):
                 continue
             nid = node.get("id", "?")
+            if node.get("type") == "text" and not str(node.get("content") or "").strip():
+                faults.append(f'node "{nid}" is a text node with no "content" — '
+                              "it renders nothing; put the words in \"content\"")
+            if node.get("type") == "image" and not str(node.get("src") or "").strip():
+                faults.append(f'node "{nid}" is an image with no "src" — it renders '
+                              'nothing; use "src": "asset:<name>" from the artwork list')
+            if node.get("_no_position") and node.get("type") not in (
+                    "group", "depth_layer", "particle_field", "light_field", "spline_tree",
+                    "shape_arrow", "arrow"):
+                # a field lays its tiles out itself, a tree has a hub, an
+                # arrow has from/to, a layer only groups — the origin is
+                # right for all of them
+                faults.append(f'node "{nid}" has no "position" — it is drawn at the '
+                              "top-left corner; give it a [x, y]")
             bounds = _node_bounds(node, canvas_w, canvas_h)
             if bounds:
                 left, top, right, bottom = bounds

@@ -2806,6 +2806,33 @@ _BROWSER_GONE = (
 )
 
 
+def motion_script(all_responses: dict) -> str:
+    """The copy stage's script from a run's responses so far, or "". The
+    content stage answers under its category label ("content"); a run may
+    also carry an explicit script stage. Newest text wins."""
+    if not isinstance(all_responses, dict):
+        return ""
+    for key in ("script", "content", "copy"):
+        texts = all_responses.get(key)
+        if isinstance(texts, list):
+            joined = "\n".join(str(t) for t in texts if str(t).strip())
+            if joined.strip():
+                return joined
+    return ""
+
+
+def motion_turn_one(query: str, skeleton: str, all_responses: dict) -> str:
+    """The motion writer's rebuilt first prompt — the storyboard turn with
+    the script threaded in — or "" when no script was written, in which
+    case the planned prompt stands."""
+    script = motion_script(all_responses)
+    if not script:
+        return ""
+    from .motion import generate as _motion_gen
+    return _motion_gen.storyboard_instructions(
+        query, skeleton=skeleton or "cinematic_glass", script=script)
+
+
 def _keep_failed_spec(sources) -> str:
     """Write the reply that would not parse to disk, and say where.
 
@@ -5105,6 +5132,17 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             skip_signal.clear()
         if fallback_requested():
             fallback_signal.clear()          # same rule for "use fallback"
+
+        if stage_idx == motion_feeder:
+            # The story contract: the copy stage's script IS the story, so
+            # the motion writer's first turn is rebuilt now, with the script
+            # that did not exist when the stages were planned. Without this
+            # the writer plans its own story (the Alphakore run, 10 Sep
+            # 2026, invented a slogan per scene while the script sat unused
+            # one stage earlier).
+            rebuilt = motion_turn_one(query, motion_skeleton, all_responses)
+            if rebuilt:
+                questions = [rebuilt]
 
         agent_cfg = A.resolve_agent(stage, agent_name)
         if not agent_cfg:

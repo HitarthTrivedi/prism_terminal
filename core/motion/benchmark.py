@@ -16,8 +16,13 @@ Metrics per sampled time, on band crops scaled to the same small size:
 
 - luminance: mean absolute luminance difference (0-255)
 - colour: distance between mean RGB (0-441)
-- structure: correlation of edge maps (-1..1) — is the same *kind* of
-  thing where the reference has it (a band, a card, a glow)
+- structure: correlation of coarse edge-DENSITY maps (-1..1) — is the same
+  *kind* of thing where the reference has it (a band, a card, a glow).
+  Measured on a 12x21 grid of the band, not pixel edges: the reference
+  against itself shifted four pixels scores 0.64 on raw edge correlation
+  (its sector could never reach 0.85 even for a perfect copy) and 0.90 on
+  the density grid, while an unrelated render stays near 0.25 on both.
+  The raw value is kept as `structure_raw`.
 - busyness: edge density of each — a sparse frame against a dense one
 
 Across time: the motion profile (frame-to-frame change per step) of
@@ -41,7 +46,8 @@ from . import review as _review
 # like/share column and the call-to-action.
 COMPARE_BAND = (0.04, 0.58)
 THUMB = (108, 192)      # 9:16 thumbnails for the sheet and the metrics
-EDGE_SIZE = (36, 64)    # coarse edge maps for structure correlation
+EDGE_SIZE = (36, 64)    # coarse edge maps for the raw structure correlation
+DENSITY_GRID = (12, 21) # edge density per cell — the structure sector proper
 
 
 def ad_region(width: int, height: int) -> Tuple[int, int, int, int]:
@@ -85,6 +91,13 @@ def _correlation(a, b) -> float:
     return cov / (va * vb)
 
 
+def _density_map(img):
+    """Mean edge strength per cell of DENSITY_GRID — where the structure
+    is, tolerant of a few pixels of offset."""
+    from PIL import Image
+    return _edges(img).resize(DENSITY_GRID, Image.BOX)
+
+
 def _density(edges) -> float:
     data = list(edges.getdata())
     return sum(1 for v in data if v > 40) / max(1, len(data))
@@ -102,7 +115,8 @@ def frame_metrics(ref, cand) -> Dict[str, float]:
     return {
         "luminance": round(lum, 2),
         "colour": round(colour, 2),
-        "structure": round(_correlation(ea, eb), 3),
+        "structure": round(_correlation(_density_map(a), _density_map(b)), 3),
+        "structure_raw": round(_correlation(ea, eb), 3),
         "busy_ref": round(_density(ea), 3),
         "busy_cand": round(_density(eb), 3),
         "ref_rgb": [round(v) for v in ra],

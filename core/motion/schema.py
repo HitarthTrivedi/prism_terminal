@@ -225,6 +225,143 @@ def _validate_animation_block(block: Any) -> Optional[dict]:
     return out
 
 
+_ANIM_BLOCK_KEYS = ("enter", "exit", "secondary_motion", "follow")
+
+
+def _block_from_from_to(block: dict) -> dict:
+    """A block a writer shaped as {at, duration, from: {channel: v},
+    to: {channel: v}} (a common Framer/GSAP habit) becomes the {time,
+    duration, tweens: [...]} shape the runtime plays. A channel present on
+    one side only holds its value — no motion, but no invented one."""
+    out = dict(block)
+    if "at" in out and "time" not in out:
+        out["time"] = out.pop("at")
+    frm, to = out.get("from"), out.get("to")
+    if isinstance(frm, dict) or isinstance(to, dict):
+        frm = frm if isinstance(frm, dict) else {}
+        to = to if isinstance(to, dict) else {}
+        ease = out.get("easing") or out.get("ease")
+        tweens = []
+        for ch in list(frm) + [c for c in to if c not in frm]:
+            a, b = frm.get(ch, to.get(ch)), to.get(ch, frm.get(ch))
+            tw = {"channel": ch, "from": a, "to": b}
+            if ease:
+                tw["easing"] = ease
+            tweens.append(tw)
+        out["tweens"] = tweens
+        out.pop("from", None)
+        out.pop("to", None)
+        out.pop("ease", None)
+    return out
+
+
+def normalize_aliases(node: dict) -> None:
+    """The writer's near-misses become the keys the runtime reads, in
+    place. Every rule here was seen in a real generated reel (10 Sep 2026,
+    the Alphakore run went blank for its last three scenes on exactly
+    these): x/y for position, text for content, source for src, stroke
+    for an arrow's color, glow/ring on an orb, animation blocks at the
+    node's top level, from/to dicts for tweens, and a shape_group made of
+    parts. Tolerance that DROPS a value silently is what let that reel
+    render empty; tolerance that maps it is what this is."""
+    if "position" not in node:
+        pos = None
+        if isinstance(node.get("x"), (int, float)) or isinstance(node.get("y"), (int, float)):
+            pos = [node.get("x", 0), node.get("y", 0)]
+        elif isinstance(node.get("pos"), (list, tuple)):
+            pos = list(node["pos"])
+        if pos is not None:
+            node["position"] = pos
+    elif isinstance(node.get("position"), dict):
+        d = node["position"]
+        node["position"] = [d.get("x", 0), d.get("y", 0)]
+    node.pop("x", None)
+    node.pop("y", None)
+    node.pop("pos", None)
+
+    node_type = node.get("type")
+    if node_type == "text" and "content" not in node:
+        for alt in ("text", "label", "value", "string"):
+            if isinstance(node.get(alt), (str, int, float)):
+                node["content"] = str(node.pop(alt))
+                break
+    if node_type == "text" and isinstance(node.get("content"), str):
+        # Markdown escapes travel from the copy stage into the scene
+        # ("www\\.alphakore\\.com" reached the screen with its backslashes).
+        node["content"] = re.sub(r"\\([.\-_*#()\[\]!])", r"\1", node["content"])
+    if node_type == "image" and "src" not in node:
+        for alt in ("source", "url", "asset", "path", "image"):
+            if isinstance(node.get(alt), str):
+                node["src"] = node.pop(alt)
+                break
+    if node_type in ("shape_arrow", "arrow", "spline_tree") and "color" not in node:
+        for alt in ("stroke", "fill", "colour"):
+            if isinstance(node.get(alt), str):
+                node["color"] = node[alt]
+                break
+    if node_type == "orb":
+        if "glow_color" not in node and isinstance(node.get("glow"), str):
+            node["glow_color"] = node.pop("glow")
+        ring = node.get("ring")
+        if "ring_radius" not in node and isinstance(ring, (int, float)):
+            node["ring_radius"] = node.pop("ring")
+        elif "ring_color" not in node and isinstance(ring, str):
+            node["ring_color"] = node.pop("ring")
+    if node_type in ("shape_group", "shapes") and isinstance(node.get("parts"), list):
+        node["type"] = "group"
+        parts = [dict(pt) for pt in node.pop("parts") if isinstance(pt, dict)]
+        for i, pt in enumerate(parts):
+            pt.setdefault("id", f"{node.get('id', 'group')}_part{i}")
+            for key in ("stroke", "stroke_width", "color"):
+                if key not in pt and key in node:
+                    pt[key] = node[key]
+        node["children"] = parts + [c for c in (node.get("children") or []) if isinstance(c, dict)]
+
+    if node_type == "particle_field":
+        # Phases written as bare kinds ("ring", "scatter"), as {kind: ...}
+        # without a "layout", or with a layout that is itself a string —
+        # the Alphakore story-contract run (10 Sep 2026) crashed the
+        # renderer on the first frame with ["ring", "scatter"].
+        phases = node.get("phases")
+        if isinstance(phases, str):
+            phases = [phases]
+        if isinstance(phases, list):
+            fixed = []
+            for k, ph in enumerate(phases):
+                if isinstance(ph, str):
+                    ph = {"at": round(k * 1.2, 2), "layout": {"kind": ph}}
+                if not isinstance(ph, dict):
+                    continue
+                ph = dict(ph)
+                lay = ph.get("layout")
+                if isinstance(lay, str):
+                    ph["layout"] = {"kind": lay}
+                elif not isinstance(lay, dict):
+                    kind = ph.pop("kind", None)
+                    ph["layout"] = ({"kind": kind, **{k2: v for k2, v in ph.items()
+                                                     if k2 in ("box", "y", "rows", "cell", "x0", "x1", "x",
+                                                               "spread", "y0", "y1", "center", "centre",
+                                                               "radius", "points", "jitter", "cluster")}}
+                                    if isinstance(kind, str) else {"kind": "scatter"})
+                ph.setdefault("at", round(k * 1.2, 2))
+                fixed.append(ph)
+            node["phases"] = fixed
+
+    anim = node.get("animation")
+    if not isinstance(anim, dict):
+        anim = {}
+    for key in _ANIM_BLOCK_KEYS:
+        if key in node and key not in anim and isinstance(node[key], dict):
+            anim[key] = node.pop(key)
+        else:
+            node.pop(key, None)
+    for key in ("enter", "exit"):
+        if isinstance(anim.get(key), dict):
+            anim[key] = _block_from_from_to(anim[key])
+    if anim:
+        node["animation"] = anim
+
+
 def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Validate raw JSON or dict against the Prism Motion Graphics Schema.
     Returns a cleaned, normalized specification dict or raises MotionValidationError.
@@ -393,11 +530,17 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
             else:
                 del node["continuity_key"]
 
-        node_type = str(node.get("type", "group"))
-        node["type"] = node_type
+        node["type"] = str(node.get("type", "group"))
+        normalize_aliases(node)
+        node_type = node["type"]
 
         _clamp_material_props(node)
 
+        # A node the writer gave no position at all (and that has no
+        # from/to or hub of its own) is drawn at the origin and must never
+        # be a camera target — resolver.py reads this flag.
+        if "position" not in node and not any(k in node for k in ("from", "to", "hub")):
+            node["_no_position"] = True
         node.setdefault("position", [0, 0])
         node.setdefault("scale",    [1.0, 1.0])
         node.setdefault("rotation", 0.0)
@@ -463,9 +606,45 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
             for c_idx, child in enumerate(node["children"]):
                 _validate_node(child, f"{path}.children[{c_idx}]")
 
+    # A colour written as a reference into the project palette
+    # ("project.palette.accent", "palette.ink", "$accent") is the palette's
+    # value; an unknown reference is dropped so CSS never sees it.
+    palette_values = {str(k): v for k, v in (project.get("palette") or {}).items()
+                      if isinstance(v, str)}
+
+    def _colour_ref(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        key = value.strip()
+        for prefix in ("project.palette.", "palette.", "$", "var(--motion-", "{{palette.", "{palette."):
+            if key.lower().startswith(prefix):
+                name = key[len(prefix):].strip("}) ")
+                return palette_values.get(name, None)
+        return value
+
+    def _resolve_colour_refs(node: dict) -> None:
+        for key in ("fill", "color", "colour", "tint", "stroke", "glow_color", "rim", "core", "shadow_color"):
+            if key in node:
+                got = _colour_ref(node[key])
+                if got is None:
+                    del node[key]
+                else:
+                    node[key] = got
+        pal = node.get("palette")
+        if isinstance(pal, list):
+            node["palette"] = [c for c in (_colour_ref(v) for v in pal) if isinstance(c, str)] or None
+            if node["palette"] is None:
+                del node["palette"]
+        for child in node.get("children") or []:
+            if isinstance(child, dict):
+                _resolve_colour_refs(child)
+
     for s_idx, scene in enumerate(scenes):
         if not isinstance(scene, dict):
             raise MotionValidationError(f"scenes[{s_idx}] must be an object.")
+        for node in scene.get("nodes") or []:
+            if isinstance(node, dict):
+                _resolve_colour_refs(node)
         scene.setdefault("id", f"scene_{s_idx}")
         scene.setdefault("start", 0.0)
         scene.setdefault("duration", duration)

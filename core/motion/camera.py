@@ -99,10 +99,52 @@ def normalize_shot(shot: Any) -> Optional[Dict[str, Any]]:
         out["target"] = [_num(target[0], 0.0), _num(target[1], 0.0)]
     if shot.get("zoom") is not None:
         out["zoom"] = max(ZOOM_MIN, min(ZOOM_MAX, _num(shot["zoom"], 1.0)))
+    if shot.get("duration") is not None:
+        # how long the move takes, in seconds; clamped to the scene later.
+        # Without it a move spans the scene, which is right for a drift and
+        # wrong for a camera that must settle before the copy arrives. A
+        # value that is not a number is dropped, not defaulted.
+        dur = _num(shot["duration"], float("nan"))
+        if dur == dur:
+            out["duration"] = max(0.05, dur)
+    if shot.get("delay") is not None:
+        # seconds into the scene before the move starts; the camera holds
+        # the previous shot's end state until then. The reference's
+        # channel scene holds on the icons, then pans down to the hub.
+        delay = _num(shot["delay"], float("nan"))
+        if delay == delay:
+            out["delay"] = max(0.0, delay)
     easing = shot.get("easing")
     if isinstance(easing, str) and easing.strip():
         out["easing"] = easing.strip()
     return out
+
+
+def node_centre(node: Dict[str, Any]) -> Tuple[float, float]:
+    """Where a node visually IS, in its parent's space, for camera targets
+    and camera-view checks: an arrow's midpoint, a tree's hub, otherwise
+    its position. (The Alphakore run of 10 Sep 2026 panned to the
+    top-left corner for eleven seconds because a shot targeted an arrow,
+    whose defaulted position is the origin.)"""
+    pos = node.get("position", [0, 0])
+    try:
+        x, y = float(pos[0]), float(pos[1])
+    except (TypeError, ValueError, IndexError):
+        x, y = 0.0, 0.0
+    frm, to = node.get("from"), node.get("to")
+    if node.get("type") in ("shape_arrow", "arrow") and isinstance(frm, (list, tuple)) \
+            and isinstance(to, (list, tuple)) and len(frm) == 2 and len(to) == 2:
+        try:
+            return (x + (float(frm[0]) + float(to[0])) / 2, y + (float(frm[1]) + float(to[1])) / 2)
+        except (TypeError, ValueError):
+            pass
+    hub = node.get("hub")
+    if node.get("type") == "spline_tree" and isinstance(hub, (list, tuple)) and len(hub) == 2:
+        try:
+            return (x + float(hub[0]), y + float(hub[1]))
+        except (TypeError, ValueError):
+            pass
+    return (x, y)
 
 
 def _resolve_target(target: Any, world_pos: Dict[str, Tuple[float, float]],
@@ -154,6 +196,22 @@ def compile_tracks(scenes: Sequence[Dict[str, Any]], width: int, height: int,
     for scene in scenes:
         shot = scene.get("shot")
         if not isinstance(shot, dict):
+            # A scene that names no shot must not inherit a corner: the
+            # second Alphakore run pushed onto a tree at x=790 in scene 2,
+            # then wrote no shot for scenes 3-7, and every caption after
+            # 3.5 s was clipped at the left edge. Missing means "settle":
+            # ease back to the centre at 1.0 over the scene.
+            start = _num(scene.get("start"), 0.0)
+            seconds = max(0.0, _num(scene.get("duration"), 0.0))
+            if abs(pos[0] - centre[0]) < 1e-6 and abs(pos[1] - centre[1]) < 1e-6 \
+                    and abs(zoom - 1.0) < 1e-6 and abs(rot) < 1e-6:
+                continue
+            pos, zoom, rot = centre, 1.0, 0.0
+            tracks.append({
+                "time": round(start, 3), "duration": round(min(seconds, max(0.4, seconds * 0.7)), 3),
+                "position": [round(pos[0], 2), round(pos[1], 2)],
+                "zoom": 1.0, "rotation": 0.0, "easing": "power2.inOut", "_shot": "settle",
+            })
             continue
         start = _num(scene.get("start"), 0.0)
         seconds = max(0.0, _num(scene.get("duration"), 0.0))
@@ -208,14 +266,53 @@ def compile_tracks(scenes: Sequence[Dict[str, Any]], width: int, height: int,
             duration = seconds * 0.85
             easing = easing or "power2.inOut"
         new_zoom = max(ZOOM_MIN, min(ZOOM_MAX, new_zoom))
+        delay = 0.0
+        if shot.get("delay") is not None:
+            delay = min(max(0.0, seconds - 0.05), _num(shot["delay"], 0.0))
+        if shot.get("duration") is not None:
+            duration = min(seconds, _num(shot["duration"], duration))
+        duration = min(duration, max(0.0, seconds - delay))
         tracks.append({
-            "time": round(start, 3), "duration": round(max(0.0, duration), 3),
+            "time": round(start + delay, 3), "duration": round(max(0.0, duration), 3),
             "position": [round(new_pos[0], 2), round(new_pos[1], 2)],
             "zoom": round(new_zoom, 4), "rotation": round(new_rot, 3),
             "easing": easing, "_shot": intent,
         })
         pos, zoom, rot = new_pos, new_zoom, new_rot
     return tracks
+
+
+def state_at(tracks: Sequence[Dict[str, Any]], time: float, width: int, height: int
+             ) -> Dict[str, float]:
+    """The camera's position/zoom at `time`, walking the tracks the way
+    runtime.js's Camera.evaluate() does (linear in this Python mirror —
+    the easing only changes WHEN a value is reached, not where it ends,
+    and the review points are read at settled times)."""
+    x, y, zoom = width / 2.0, height / 2.0, 1.0
+    for tr in sorted(tracks or [], key=lambda t: _num(t.get("time"), 0.0)):
+        start = _num(tr.get("time"), 0.0)
+        dur = _num(tr.get("duration"), 0.0)
+        pos = tr.get("position") if isinstance(tr.get("position"), (list, tuple)) else None
+        tz = _num(tr.get("zoom"), zoom) if tr.get("zoom") is not None else zoom
+        if time >= start + dur:
+            if pos:
+                x, y = _num(pos[0], x), _num(pos[1], y)
+            zoom = tz
+        elif time > start:
+            p = (time - start) / max(0.001, dur)
+            if pos:
+                x, y = x + (_num(pos[0], x) - x) * p, y + (_num(pos[1], y) - y) * p
+            zoom = zoom + (tz - zoom) * p
+            break
+        else:
+            break
+    return {"x": x, "y": y, "zoom": zoom}
+
+
+def visible_rect(state: Dict[str, float], width: int, height: int) -> Tuple[float, float, float, float]:
+    """(left, top, right, bottom) of the world the camera shows."""
+    half_w, half_h = width / (2.0 * state["zoom"]), height / (2.0 * state["zoom"])
+    return (state["x"] - half_w, state["y"] - half_h, state["x"] + half_w, state["y"] + half_h)
 
 
 def is_continuous(tracks: Sequence[Dict[str, Any]]) -> bool:

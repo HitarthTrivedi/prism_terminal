@@ -100,7 +100,8 @@ CATEGORIES = {
         "color": "media",
         "desc": "Generated footage, reels from your own clips & AI avatars",
         "agents": ["Prism Studio", "Prism Reel", "Prism Motion", "Google Flow",
-                   "Claude Design", "InVideo AI", "Runway", "Pika Labs", "HeyGen"],
+                   "Claude Design", "InVideo AI", "Runway", "Pika Labs", "HeyGen",
+                   "NotebookLM"],
     },
     # Split out from video on purpose: a voice-over and a reel are different
     # jobs with different tools, and a run often needs BOTH — one stage each,
@@ -164,6 +165,8 @@ _MAKES = {
     "Runway": "a generated video",
     "Pika Labs": "a generated video",
     "Google Flow": "a generated video",
+    "NotebookLM": "a Video Overview (or an Audio Overview) rendered in "
+                  "NotebookLM from the sources it is given",
     "InVideo AI": "a finished promo video cut from the uploaded footage",
     "HeyGen": "an AI-avatar video",
     "ElevenLabs": "a voice-over audio file",
@@ -314,6 +317,24 @@ _APOLLO_HANDOFF = (
     "shares and mean nothing to Apollo. Translate them into the HEADCOUNT "
     "ranges above."
 )
+
+
+# ── the plain name of each step ──────────────────────────────────────────────
+#
+# What a person sees a step called: in the chat header ("Prism · <job> ·
+# Write it up"), in the line above an earlier step's hand-off, and in the
+# floor prompt for a step nobody wrote one for. CATEGORIES has the working
+# labels ("Orchestration & Brains"); these are the words.
+STEP_NAMES = {
+    "brains": "Think it through", "research": "Look things up",
+    "leads": "Find the people", "content": "Write it up",
+    "visual": "Make the images", "media": "Make the video",
+    "audio": "Record the voice", "development": "Build the tool",
+    "presentation": "Build the slides", "design": "Design the reel",
+    "artwork": "Make the artwork", "script": "Write the script",
+    "analysis": "Read the files", "summary": "Sum it up",
+    "motion_plan": "Plan the motion", "format": "Format it",
+}
 
 
 # ── how each tool thinks ─────────────────────────────────────────────────────
@@ -650,13 +671,24 @@ AGENT_REGISTRY = {
         textarea_selector="input[type='search'], input[name='q'], textarea",
     ),
     "NotebookLM": _agent(
-        "https://notebooklm.google.com",
+        # notebooklm.google.com redirects here now; the page calls itself
+        # "Gemini Notebook" (read live, 13 Sep 2026 — see automation.py's
+        # NotebookLM notes).
+        "https://notebook.google.com",
         "grounding AI in your own uploaded documents for faithful synthesis; "
         "handles LARGE volumes of source material (many long docs/videos/notes "
         "at once) and turns them into explainer output via its built-in Video "
-        "Overview and Audio Overview (podcast-style) generators — the best fit "
-        "for 'explain everything we have' style requests, not just Q&A",
+        "Overview (a long-form Explainer or a Short) and Audio Overview "
+        "(podcast-style) generators — the best fit for 'explain everything "
+        "we have' and 'make a video/podcast from all this' requests",
         "Free", "10–20s", 45,
+        textarea_selector="textarea[aria-label='Query box']",
+        # No <input type=file> anywhere on the page: its "Upload files" is
+        # the OS picker. "" tells _upload_files not to look; the runner
+        # pastes every readable attachment in as a source instead.
+        upload_selector="",
+        # A Video Overview is a multi-minute render.
+        generate_wait=1500,
     ),
 
     # ── Content, Post & Documentation ─────────────────────────────────────────

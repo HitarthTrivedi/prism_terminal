@@ -238,6 +238,7 @@ def _tool_notes() -> str:
     return "\n\n".join(parts)[:_NOTES_MAX_CHARS]
 
 
+
 #: A tool's own heading in the notes file: "Perplexity:", "Kimi 2.6:". The
 #: sub-headings inside one ("Pros:", "Cons:", "My recommendation:") match the
 #: same shape, so they are listed out rather than guessed at.
@@ -886,14 +887,16 @@ named, and each receives the previous step's answer as its context:
     links   companies, contacts or rows
   If the person asked for a .docx, a PDF, a spreadsheet, a deck "as a file"
   or anything to download, that step's kind is "file", never "text".
-- "questions" — ONE brief of 40–80 words in plain language: what this step
-  is to do, the facts and constraints it needs, and what a good answer
-  contains. Write it the way one competent colleague briefs another.
+- "questions" — ONE line of at most 25 words, in plain language, saying
+  what this step does towards the person's request ("For this step: …").
+  The tool is sent the person's own words, their files and the earlier
+  step's hand-off beside it, so the line only has to say which part of the
+  job is this step's. Nothing else.
 - Do NOT write a role to play ("act as a senior…"), a section list, a word
-  count, a quality bar, non-goals, formatting rules, or anything about
-  handing over to the next step. Prism adds what it needs itself, and a
-  second set of instructions in the same message is what makes a tool answer
-  ABOUT the instructions instead of doing the work.
+  count, a quality bar, non-goals, formatting rules, background facts, or
+  anything about handing over to the next step. Prism adds what it needs
+  itself, and a second set of instructions in the same message is what
+  makes a tool answer ABOUT the instructions instead of doing the work.
 - Never assert something the step will not actually have. Only write a fact
   into a brief if the person gave it or an earlier step will really produce
   it — a brief that says "you have been given the brand colours" when nobody
@@ -1087,16 +1090,11 @@ def plan_changed(planned: list, confirmed: list) -> bool:
 def passthrough_prompt(query: str, stage: str, brief: str = "") -> str:
     """The floor under a step with no prompt: the person's own words,
     scoped to that step's job. Never a great prompt, always a real one."""
-    meta = A.CATEGORIES.get(stage) or {}
-    job = meta.get("desc") or meta.get("label") or stage
-    text = (f"Your ONLY task is: {job[0].lower() + job[1:]}, for the request "
-            "below. Do that part of the job and nothing else — other steps "
-            "handle the rest.\n\n"
-            f"The request:\n{query.strip()}\n")
-    if (brief or "").strip():
-        text += f"\nWhat the job is about, in more detail:\n{brief.strip()}\n"
-    return text + ("\nDeliver the finished result for this step, ready to "
-                   "use, and do not ask questions back.")
+    job = A.STEP_NAMES.get(stage) or stage.replace("_", " ")
+    job = job[0].lower() + job[1:]
+    # `brief` (the 220-word engineered task brief) is deliberately not
+    # carried: the person's words are the prompt now (Round 31).
+    return f"For this step: {job.rstrip('.')} — {query.strip()}"
 
 
 def brief_confirmed_plan(query: str, cfg: dict, steps: list,
@@ -1160,21 +1158,18 @@ THE CONFIRMED PLAN:
 {chr(10).join(lines)}
 
 ═══ RULES ═══
-- One prompt per step, in the order above. The drafts hold the substance —
-  keep every fact, constraint and deliverable in them — but the TOOL and the
-  ORDER above are the truth: name the tool the step actually runs on, never
-  another one, and hand off to the step that actually follows.
-- HAND-OFF: every step except the last says its answer is not for the user —
-  it goes to the next step as that step's working brief — and ends with a
-  section titled 'HANDOFF FOR <NEXT TOOL IN CAPITALS>' summarising every
-  fact, decision and constraint the next step needs.
-- FINAL STEP: the last step says the opposite — it is the last step, deliver
-  the finished result for the person, no hand-off.
-{maker_block}- PROMPT CRAFT: after the opener "Your ONLY task is:", each prompt has
-  ROLE (a specific senior expert), CONTEXT (every relevant fact and
-  constraint), DELIVERABLE SPEC (the exact output; for a maker, the built
-  thing), QUALITY BAR (2–3 concrete criteria) and NON-GOALS. 120–250 words.
-- Each prompt is COMPLETE and self-contained.
+- One prompt per step, in the order above. A prompt is ONE line of at most
+  25 words, in plain language, saying what this step does towards the
+  person's request ("For this step: …"). The drafts say what each step is
+  for — keep that; drop everything else in them.
+- The TOOL and the ORDER above are the truth: a line that names a tool
+  names the one the step actually runs on, never another.
+- The tool is sent the person's own words, their files and the earlier
+  step's hand-off beside the line, and Prism itself says what to hand back
+  and how to hand over. So: no role to play, no section list, no word count,
+  no quality bar, no non-goals, no formatting rules, no background facts,
+  nothing about the next step or about being the last step.
+{maker_block}
 
 Return ONLY this JSON (no markdown, no commentary):
 {{"steps": [{{"stage": "<stage>", "questions": ["<prompt>"]}}, ...]}}"""

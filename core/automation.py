@@ -83,7 +83,21 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # Cap on how much of the previous stage's output is forwarded. The tail is
 # kept (not the head) because that's where the HANDOFF summary lives.
-_MAX_FORWARD_CHARS = 8000
+# How much of the previous step's answer travels to the next tool. Since
+# Round 31 (owner, 11 Sep 2026) that is the HANDOFF block -- at most
+# _MAX_HANDOFF_LINES lines -- and this is only the ceiling under it, or the
+# tail of an answer that wrote no such block. It was 8,000 characters of the
+# whole previous answer, which is how a Perplexity research report became
+# most of the message Claude was sent and ran the chat out of tokens.
+_MAX_FORWARD_CHARS = 1200
+_MAX_HANDOFF_LINES = 4
+
+#: The one sentence that closes the last step's message. When a file, a
+#: picture or a video is what the step hands back, contract.deliverable_line
+#: already says "give me the finished result as a file", so the closing
+#: shrinks to the half that line does not say.
+_FINAL_CLOSING = "\n\nGive me the finished result — no questions back."
+_FINAL_CLOSING_AFTER_DELIVERABLE = "\n\nNo questions back."
 
 # The live browser, kept across runs. A slow producer (deck/video/app builder)
 # often keeps rendering its result server-side after Prism gives up waiting on
@@ -1206,6 +1220,66 @@ def _reel_imagery_on(routing: dict, cfg: dict) -> bool:
     return bool(cfg.get("reel_imagery", True))
 
 
+# Buttons a chat composer puts on a staged attachment chip. Generic on
+# purpose: the tools rename their classes weekly, but a remove control keeps
+# an accessible name, and "remove" / "delete" / "dismiss" is what it says.
+_STAGED_REMOVE_JS = """
+const sel = arguments[0];
+const box = (() => {
+  const ta = sel ? document.querySelector(sel) : null;
+  let el = ta;
+  while (el && el !== document.body) {
+    if (el.querySelector && el.querySelector("input[type='file']")) return el;
+    el = el.parentElement;
+  }
+  return ta ? (ta.closest('form') || ta.parentElement) : null;
+})();
+if (!box) return -1;
+const pat = /(remove|delete|dismiss|clear)\\b/i;
+const send = /(send|submit)/i;
+const hits = [];
+for (const b of box.querySelectorAll('button, [role="button"]')) {
+  const name = (b.getAttribute('aria-label') || b.getAttribute('title') ||
+                b.getAttribute('data-testid') || '').trim();
+  if (!name || send.test(name) || !pat.test(name)) continue;
+  if (b.offsetParent === null && !b.getClientRects().length) continue;
+  hits.push(b);
+}
+for (const b of hits) { try { b.click(); } catch (e) {} }
+return hits.length;
+"""
+
+
+def _clear_staged_attachments(driver, agent_cfg, agent_name: str = "") -> int:
+    """Take off whatever the composer already holds before this stage's own
+    files go up. Returns how many chips were removed (-1: no composer found).
+
+    The owner's run of 11 Sep 2026: one PDF attached in Prism, and Claude's
+    message went out with that PDF AND a deck outline from a reel run days
+    earlier. Nothing in Prism sent the deck -- the content step only ever
+    uploads the person's own files -- but claude.ai keeps an unsent draft,
+    attachments included, and shows it again on the next new chat. A run
+    that staged a file and never sent (a stop, a crash, a timeout) leaves
+    that chip behind for the next run to send along. So: look for the
+    remove control on every chip inside the composer and press it, before
+    the upload, every time. A tool with no chips answers 0 and nothing
+    happens; a tool with no composer answers -1 and nothing happens.
+    """
+    try:
+        n = driver.execute_script(_STAGED_REMOVE_JS,
+                                  agent_cfg.get("textarea_selector") or "")
+    except Exception:                                   # noqa: BLE001
+        return -1
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return -1
+    if n > 0:
+        ui.warn(f"   🧹  removed {n} attachment(s) that {agent_name or 'the tool'} "
+                "still had staged from an earlier run — only this task's files go up")
+    return n
+
+
 def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
     """Push any attached files into the tool's <input type='file'>, if present.
 
@@ -1223,6 +1297,11 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
 
     who = agent_name or "this tool"
     sel = agent_cfg.get("upload_selector", "input[type='file']")
+    if not sel:
+        # The tool takes its files another way — NotebookLM pastes them in
+        # as sources itself (_nb_sources) — and says so with "" here, so
+        # this is not the "answer blind" warning below.
+        return 0
 
     # WAIT for it, don't just look once. run() navigates to the tool and
     # sleeps `page_wait` (4 seconds by default) before getting here, and four
@@ -2128,16 +2207,21 @@ def _click_download_control(driver, agent_cfg: dict) -> bool:
     return _click_by_text(driver, ["download"], timeout=4)
 
 
-def _harvest_via_download(driver, agent_cfg, stage: str) -> list[dict]:
-    """Capture a file that is only reachable by CLICKING a download control —
-    the sibling of _harvest_files' fetch path, for tools that hand the file
-    over through JS rather than a fetchable link. Point Chrome's download at a
+def _capture_download(driver, stage: str, click, *, wait: float = 45,
+                      menu_words=("pdf", "download")) -> list[dict]:
+    """Capture a file that is only reachable by CLICKING something — the
+    sibling of _harvest_files' fetch path, for tools that hand the file over
+    through JS rather than a fetchable link. Point Chrome's download at a
     scratch folder we own (so our file is distinguishable from the user's own
-    ~/Downloads traffic), click the control, and harvest whatever lands.
+    ~/Downloads traffic), run `click`, and harvest whatever lands within
+    `wait` seconds. When nothing lands and nothing is in flight after a few
+    seconds, one menu item named in `menu_words` is tried — the first click
+    may have opened a "Download as…" menu.
 
     Best-effort and never raises: if the download can't be redirected, or
     nothing lands, or a plain link navigates instead of downloading, it gives
-    back an empty list and restores the chat tab, leaving the run unharmed."""
+    back an empty list and restores the tab, leaving the run unharmed.
+    """
     from . import files as F
 
     folder = os.path.join(tempfile.gettempdir(),
@@ -2155,14 +2239,14 @@ def _harvest_via_download(driver, agent_cfg, stage: str) -> list[dict]:
     except Exception:
         pass
     before = set(os.listdir(folder))
-    if not _click_download_control(driver, agent_cfg):
+    if not click():
         _restore_downloads(driver, folder)
         return []
 
     # Wait for a COMPLETE file — Chrome writes *.crdownload while in flight, and
     # a big PDF from a code tool can take a while to serialise and stream.
     start, tried_menu, target = time.time(), False, None
-    while time.time() - start < 45:
+    while time.time() - start < wait:
         time.sleep(1)
         now = set(os.listdir(folder)) - before
         fresh = [f for f in now
@@ -2185,7 +2269,7 @@ def _harvest_via_download(driver, agent_cfg, stage: str) -> list[dict]:
             # Nothing landed and nothing is downloading — the first click may
             # have opened a "Download as…" menu instead. Try a menu item once.
             tried_menu = True
-            _click_by_text(driver, ["pdf", "download"], timeout=2)
+            _click_by_text(driver, list(menu_words), timeout=2)
 
     # A plain link (no Content-Disposition) navigates instead of downloading —
     # put the chat tab back so the saved stage URL and any later step are intact.
@@ -2210,6 +2294,13 @@ def _harvest_via_download(driver, agent_cfg, stage: str) -> list[dict]:
         return []          # _harvest_images already owns real pictures
     att["_generated"] = True
     return [att]
+
+
+def _harvest_via_download(driver, agent_cfg, stage: str) -> list[dict]:
+    """The generic click-to-download harvest: whatever download control the
+    reply or the page shows (_click_download_control), captured."""
+    return _capture_download(driver, stage,
+                             lambda: _click_download_control(driver, agent_cfg))
 
 
 def _restore_downloads(driver, folder: str, keep: str = "") -> None:
@@ -2285,7 +2376,6 @@ _PROMPT_ECHO_MARKERS = (
     "<one subject line>",
     "<the full email body>",
     "your output will be passed directly to",
-    "context from the previous pipeline stage",
 )
 
 #: Lines of Prism's own composed message that a tool might reasonably QUOTE
@@ -2295,9 +2385,9 @@ _PROMPT_ECHO_MARKERS = (
 #: first version counted any one of them, and would have discarded exactly
 #: that hand-off.)
 _PROMPT_ECHO_SOFT = (
-    "what the person actually asked for — in their own words",
-    "where this goes: your answer passes straight to",
-    "below is prism's engineered summary of that request",
+    "from the earlier step (",
+    "at the end add a section headed 'handoff for",
+    "give me the finished result",
 )
 
 
@@ -2871,16 +2961,10 @@ def _browser_is_gone(error: object) -> bool:
 
 # What a step is called to a person — the plan screen's words, so the chat a
 # step opens is titled the way the timeline names it.
-STEP_NAMES = {
-    "brains": "Think it through", "research": "Look things up",
-    "leads": "Find the people", "content": "Write it up",
-    "visual": "Make the images", "media": "Make the video",
-    "audio": "Record the voice", "development": "Build the tool",
-    "presentation": "Build the slides", "design": "Design the reel",
-    "artwork": "Make the artwork", "script": "Write the script",
-    "analysis": "Read the files", "summary": "Sum it up",
-    "motion_plan": "Plan the motion", "format": "Format it",
-}
+# The plain name of each step, as the chat header and the one-line prompts
+# say it. Lives in agents.py so the router can use it without importing
+# this module.
+STEP_NAMES = A.STEP_NAMES
 
 
 def _chat_header(title: str, stage: str) -> str:
@@ -2896,47 +2980,71 @@ def _chat_header(title: str, stage: str) -> str:
 
 
 def _intent_block(query: str) -> str:
-    """The user's own words, verbatim, at the top of every stage prompt.
+    """The user's own words, verbatim, at the top of every stage prompt --
+    and since Round 31 (owner, 11 Sep 2026) nothing else around them.
 
-    The failure this fixes, in full, because it is not obvious and it cost a
-    whole reel:
+    The failure the block itself fixes, in full, because it cost a whole
+    reel: Prism expanded a request into a professional brief and the router
+    wrote each stage prompt FROM that brief. A customer asked for a reel
+    about "Consiz, a mouse with a middle button that summarises whatever you
+    have selected"; the brief said "showcase the mouse, demonstrate its
+    features", and Claude wrote an excellent script about a generic mouse.
+    Nothing downstream can recover from that, so the raw request rides
+    along, first.
 
-    Prism expands a request into a professional task brief, and the router
-    writes each stage prompt FROM that brief. The router itself is given the
-    raw request and told it wins on scope — but the STAGE PROMPTS it produces
-    were only as good as what it chose to carry across, and the agents never
-    saw the original at all.
-
-    A customer asked for a reel about "Consiz, a mouse with a middle button
-    that summarises whatever you have selected and lets you ask questions
-    about it". The brief came back as "showcase the mouse, demonstrate its
-    features, explain its benefits" — every specific, mechanical fact gone.
-    Claude then wrote an excellent script about a generic productivity mouse,
-    because a generic productivity mouse is all it was ever told about.
-
-    Nothing downstream can recover from that. The brief is a summary, and a
-    summary that drops the one fact the whole video is about is indetectable
-    to everything after it: the words that came through read perfectly well.
-
-    So the raw request rides along, first, marked as the human's own and
-    authoritative over anything that follows. It costs a few hundred tokens a
-    stage and removes a whole class of quietly-wrong output.
+    What was taken away: the banner "WHAT THE PERSON ACTUALLY ASKED FOR",
+    the dashes, and a paragraph explaining that summaries lose things and
+    the words above win. The owner put the same request to Claude by hand as
+    one line with the PDF attached and got the BOQ in a fraction of the
+    tokens; the Prism message for the same file exhausted the chat. The
+    tools do not need to be told whose words these are or to rank them --
+    they need the words. So: the words.
     """
     text = (query or "").strip()
     if not text:
         return ""
     if len(text) > _MAX_INTENT_CHARS:
         text = text[:_MAX_INTENT_CHARS].rstrip() + " […]"
-    return (
-        "WHAT THE PERSON ACTUALLY ASKED FOR — in their own words:\n"
-        "---\n"
-        f"{text}\n"
-        "---\n"
-        "Below is Prism's engineered summary of that request. Summaries lose "
-        "things: where the two differ, the words above win, and every "
-        "specific fact above (how a product works, what a button does, what "
-        "to avoid) must survive into your answer.\n\n"
-    )
+    return text + "\n\n"
+
+
+_HANDOFF_HEADING = re.compile(
+    r"^\W*HANDOFF FOR [A-Z0-9][A-Z0-9 .&'()\-]*\W*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _handoff_of(texts, *, lines: int | None = _MAX_HANDOFF_LINES) -> str:
+    """What travels from one step to the next: the lines under the previous
+    answer's 'HANDOFF FOR <tool>' heading, at most `lines` of them.
+
+    The whole previous answer used to go (its last 8,000 characters), on the
+    theory that a summary loses things. It does -- and a research report
+    pasted whole into a writing step lost the run instead: the owner's BOQ
+    request of 10 Sep 2026 sent Claude a message that was 90% Perplexity's
+    report and the chat ran out of tokens before the document existed. The
+    person still gets every step's full answer in the run's output; the
+    NEXT TOOL gets the hand-off it was asked to write, which is the part the
+    earlier tool judged worth carrying.
+
+    Last heading wins (a tool that restates its block puts the considered
+    one at the end). `lines=None` keeps every line under the heading -- for
+    a tool with its own filter block (Apollo), whose fields must all
+    arrive. An answer with no heading at all falls back to its tail, capped
+    hard, so a tool that ignored the request still hands something on.
+    """
+    text = "\n\n".join(t for t in (texts or []) if t and t.strip()).strip()
+    if not text:
+        return ""
+    hits = list(_HANDOFF_HEADING.finditer(text))
+    if hits:
+        body = text[hits[-1].end():].strip()
+        kept = [ln.rstrip() for ln in body.splitlines() if ln.strip()]
+        if lines is not None:
+            kept = kept[:lines]
+        body = "\n".join(kept)
+        return body[:_MAX_FORWARD_CHARS].rstrip()
+    if len(text) > _MAX_FORWARD_CHARS:
+        text = "[…] " + text[-_MAX_FORWARD_CHARS:].lstrip()
+    return text
 
 
 def _context_header(agent_cfg: dict, prev_stage: str) -> str:
@@ -2944,40 +3052,34 @@ def _context_header(agent_cfg: dict, prev_stage: str) -> str:
     if _is_natural(agent_cfg) or _is_maker(agent_cfg):
         return ("Here's what I've got so far on this — use whatever is useful "
                 "and ignore the rest:\n\n")
-    return (f"Context from the previous pipeline stage ({prev_stage.upper()}) — "
-            "it already includes the distilled findings of every stage "
-            "before it. Build directly on this brief:\n\n")
+    step = STEP_NAMES.get(prev_stage) or prev_stage.replace("_", " ")
+    return f"From the earlier step ({step}):\n"
 
 
 def _context_footer(agent_cfg: dict) -> str:
     if _is_natural(agent_cfg) or _is_maker(agent_cfg):
         return "\n\nWith that in mind:\n\n"
-    return "\n\nNow continue the pipeline and complete the following:\n\n"
+    return "\n\n"
 
 
 def _natural_handoff(nxt_agent: str, final: bool) -> str:
-    """A request, not a rule sheet.
+    """A request, not a rule sheet -- and since Round 31, a short one.
 
     Deliberately says nothing about performing only the task, nothing about
-    the reader being a machine, and nothing about not asking questions. Those
-    three are what suppress a self-directing tool. What it does keep is the
-    one thing the pipeline genuinely cannot work without: a short summary at
-    the end that the next tool can read on its own.
+    the reader being a machine, and nothing about not asking questions.
+    Those three are what suppress a self-directing tool. What it keeps is
+    the one thing the pipeline cannot work without: a hand-off at the end
+    that the next tool reads on its own -- and it is now told how long that
+    is, because only those lines travel (_handoff_of).
     """
     if final:
-        return ("\n\nGo as deep as you think it needs — research it properly, "
-                "check what you find, and give me the finished piece rather "
-                "than an outline. Please don't finish by asking me what I'd "
-                "like next; just give me your best work.")
+        return ("\n\nGo as deep as it needs and give me the finished piece, "
+                "not an outline — and don't end by asking what I'd like next.")
     return (
-        "\n\nTake your time with this one — research it properly and use your "
-        "own judgement about what matters. Depth is welcome.\n\n"
-        f"One thing I need at the end: I'm passing your answer straight to "
-        f"{nxt_agent}, and it won't see any of this conversation. So finish "
-        f"with a short section headed 'HANDOFF FOR {nxt_agent.upper()}' — just "
-        f"the key facts, figures and decisions it would need to carry on "
-        f"without me explaining anything. Keep it brief; the detailed work "
-        f"goes above it.")
+        "\n\nGo as deep as it needs. At the end add a short section headed "
+        f"'HANDOFF FOR {nxt_agent.upper()}': at most {_MAX_HANDOFF_LINES} "
+        f"lines with the facts, figures and decisions {nxt_agent} needs — "
+        "I'm passing only those lines on.")
 
 
 def _resolve_suffix(agent_cfg: dict, stage: str, query: str) -> str:
@@ -3582,101 +3684,469 @@ def _run_canva(driver, agent_cfg: dict, stage: str, prompt: str,
                 "the design may still be there."]
 
 
-def _run_notebooklm(driver, agent_cfg: dict, stage: str, prompt: str) -> list[str]:
-    """NotebookLM is not a chat box — it's a 'sources' notebook. This drives
-    its multi-step UI as best-effort automation:
-      1. start a fresh notebook (so this run's source doesn't mix with old ones)
-      2. add a "Copied text" source and paste the engineered prompt/context —
-         NotebookLM's only free-text input surface
-      3. wait for that source to finish processing
-      4. MEDIA stage → open Studio and trigger the Video Overview generator
-         (a real, multi-minute async render — this only REQUESTS it and
-         returns; the finished video appears in the notebook afterwards)
-         any other stage → ask the actual question in NotebookLM's chat and
-         scrape its answer
+# ── NotebookLM (Google's "Gemini Notebook") ──────────────────────────────────
+#
+# Read off the live page on 13 Sep 2026 by attaching Playwright to Prism's
+# own signed-in Chrome (the run's Chrome keeps a debugging port open; the
+# probes are devtools/nb_probe*.py's siblings in the session scratchpad).
+# notebooklm.google.com now redirects to notebook.google.com and the page
+# calls itself "Gemini Notebook". What is there:
+#
+#   home      button[aria-label='Create new notebook']
+#   notebook  button[aria-label='Add source'] opens a dialog with "Upload
+#             files" (the OS file picker -- there is NO <input type=file>
+#             on the page, which is why the generic upload path reports
+#             "no file-upload field"), "Websites", "Drive", "Copied text".
+#             "Copied text" shows textarea[aria-label='Pasted text'] and an
+#             "Insert" button that enables once there is text.
+#             chat      textarea[aria-label='Query box'] + Submit
+#             Studio    [role=button][aria-label='Video Overview'], 'Audio
+#                       Overview', 'Slide Deck', … Each card carries a
+#                       pencil (.option-icon) that opens "Customize …":
+#                         Video: Format {Short, Explainer}, a focus box
+#                               "What should the video focus on?",
+#                               "Generate later" / "Generate now".
+#                         Audio: Format {Deep Dive, Brief, Critique,
+#                               Debate}, Length {Short, Default, Long},
+#                               a focus box, the same two buttons.
+#                       Clicking the card itself generates with defaults.
+#
+# The first version of this runner looked for "Copied text" without ever
+# pressing "Add source", so on a fresh notebook it searched a dialog that
+# was not open and gave up -- the owner's run of 13 Sep 2026 ("generate me
+# a google notebook lm video") typed nothing into NotebookLM at all.
+#
+# What a finished Video/Audio Overview looks like in the Studio list was
+# NOT seen (nothing was generated during the probe), so _nb_wait_generated
+# and _nb_download are best effort and say so when they fail.
 
-    UNVERIFIED against a live session — Google's Material UI class names
-    churn often and this environment has no live browser to test against, so
-    every step is wrapped to fail soft with a clear message instead of
-    hanging or crashing the whole pipeline run. Expect to need real-world
-    iteration on the exact button/label text if Google changes the UI."""
+_NB_NOTEBOOK_URL = re.compile(r"/notebook/[0-9a-f-]{16,}")
+_NB_SOURCE_MAX = 300_000          # characters per pasted source
+_NB_SOURCES_MAX = 20              # sources per notebook, keeps the run bounded
+_NB_LONG_WORDS = re.compile(
+    r"\b(long[- ]?form|long|full|detailed|comprehensive|in[- ]depth|"
+    r"documentary)\b", re.I)
+_NB_SHORT_WORDS = re.compile(
+    r"\b(short|shorts|reel|bite[- ]?sized|brief|quick|teaser|"
+    r"\d{2}[- ]?sec(?:ond)?s?)\b", re.I)
+_NB_AUDIO_WORDS = re.compile(
+    r"\b(audio|podcast|voice[- ]?over|narration|narrated|episode)\b", re.I)
+_NB_VIDEO_WORDS = re.compile(r"\b(video|reel|film|explainer)\b", re.I)
+
+
+def _nb_wants(stage: str, line: str, query: str = "") -> str:
+    """What to make in NotebookLM: "video", "audio" or "chat".
+
+    The person's own words win over the step: the owner's run had
+    NotebookLM on the AUDIO step ("create a clear voice-over audio file")
+    for a request that said "generate me a google notebook lm video".
+    """
+    asked_video = bool(_NB_VIDEO_WORDS.search(query or ""))
+    asked_audio = bool(_NB_AUDIO_WORDS.search(query or ""))
+    if asked_video and not asked_audio:
+        return "video"
+    if asked_audio and not asked_video:
+        return "audio"
+    if stage == "media":
+        return "video"
+    if stage == "audio":
+        return "audio"
+    words = line or ""
+    if _NB_VIDEO_WORDS.search(words):
+        return "video"
+    if _NB_AUDIO_WORDS.search(words):
+        return "audio"
+    return "chat"
+
+
+def _nb_format(make: str, line: str, query: str = "") -> tuple[str, str]:
+    """(format label, length label) for the Customize dialog. Long-form is
+    the default the owner asked for: a video is an Explainer unless the
+    words say short; an audio is a Deep Dive, Long when the words say so."""
+    words = f"{query or ''} {line or ''}"
+    short = bool(_NB_SHORT_WORDS.search(words)) and not _NB_LONG_WORDS.search(words)
+    if make == "video":
+        return ("Short" if short else "Explainer", "")
+    if make == "audio":
+        if short:
+            return ("Deep Dive", "Short")
+        return ("Deep Dive", "Long" if _NB_LONG_WORDS.search(words) else "")
+    return ("", "")
+
+
+def _nb_focus(line: str, query: str = "") -> str:
+    """The Customize dialog's focus text: the person's words first, then
+    the step's one line without its 'For this step:' prefix."""
+    step = re.sub(r"^\s*for this step\s*:\s*", "", (line or "").strip(), flags=re.I)
+    parts = [p for p in ((query or "").strip(), step) if p]
+    return "\n".join(parts)[:1500]
+
+
+def _nb_sources(prior, attachments) -> tuple[list[tuple[str, str]], list[str]]:
+    """What goes into the notebook as sources: every earlier step's FULL
+    answer (NotebookLM is a source tool -- it wants the material, not the
+    four-line hand-off), then every attachment Prism could read text out
+    of. Returns (sources, names of attachments with no text to give)."""
+    out: list[tuple[str, str]] = []
+    for stage, texts in prior or []:
+        text = "\n\n".join(t for t in (texts or []) if t and t.strip()).strip()
+        if text:
+            out.append((f"Prism — {A.STEP_NAMES.get(stage, stage)}", text))
+    unreadable: list[str] = []
+    for att in attachments or []:
+        if not isinstance(att, dict):
+            continue
+        text = (att.get("text") or "").strip()
+        name = att.get("name") or os.path.basename(att.get("path") or "") or "attachment"
+        if text:
+            out.append((name, text))
+        else:
+            unreadable.append(name)
+    return out[:_NB_SOURCES_MAX], unreadable
+
+
+def _nb_el(driver, css: str, timeout: float = 10, visible: bool = True):
+    """The first element matching `css` (visible unless told otherwise),
+    polled up to `timeout`; None when nothing shows up."""
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
+    deadline = time.time() + max(timeout, 0)
+    while True:
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, css):
+                if not visible or el.is_displayed():
+                    return el
+        except Exception:                               # noqa: BLE001
+            pass
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.5)
 
-    try:
-        # 1) Fresh notebook.
-        _click_by_text(driver, ["create new", "new notebook", "+ new"], timeout=15)
+
+def _nb_click(driver, css: str = "", texts=(), timeout: float = 10) -> bool:
+    """Click by selector first, by visible text second. Never raises."""
+    el = _nb_el(driver, css, timeout) if css else None
+    if el is not None:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        except Exception:                               # noqa: BLE001
+            pass
+        for attempt in (lambda: el.click(),
+                        lambda: driver.execute_script("arguments[0].click();", el)):
+            try:
+                attempt()
+                return True
+            except Exception:                           # noqa: BLE001
+                continue
+    return _click_by_text(driver, list(texts), timeout=timeout) if texts else False
+
+
+def _nb_click_xpath(driver, xpath: str, timeout: float = 10) -> bool:
+    from selenium.webdriver.common.by import By
+    deadline = time.time() + timeout
+    while True:
+        try:
+            for el in driver.find_elements(By.XPATH, xpath):
+                if el.is_displayed() and el.is_enabled():
+                    el.click()
+                    return True
+        except Exception:                               # noqa: BLE001
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def _nb_dialog(driver, timeout: float = 1):
+    return _nb_el(driver, "[role='dialog']", timeout)
+
+
+def _nb_wait_dialog_closed(driver, timeout: float = 15) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline and _nb_dialog(driver, 0.2) is not None:
+        time.sleep(0.5)
+
+
+def _nb_new_notebook(driver, timeout: float = 30) -> bool:
+    """A fresh notebook, so this run's sources never mix with old ones."""
+    if not _nb_click(driver, "button[aria-label='Create new notebook']",
+                     ("create new notebook", "create new"), timeout=15):
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if _NB_NOTEBOOK_URL.search(driver.current_url or ""):
+                time.sleep(2)
+                return True
+        except Exception:                               # noqa: BLE001
+            pass
+        time.sleep(1)
+    return False
+
+
+def _nb_add_text_source(driver, title: str, text: str) -> bool:
+    """Add sources → Copied text → paste → Insert. A fresh notebook may open
+    the dialog on its own; an existing one needs the button pressed."""
+    if _nb_el(driver, "[role='dialog'] textarea[aria-label='Pasted text']", 1) is None:
+        if _nb_dialog(driver, 1) is None:
+            if not _nb_click(driver, "button[aria-label='Add source']",
+                             ("add source",), timeout=10):
+                return False
+        if not _nb_click(driver, "", ("copied text",), timeout=10):
+            return False
+    box = _nb_el(driver, "[role='dialog'] textarea[aria-label='Pasted text'], "
+                         "[role='dialog'] textarea", 10)
+    if box is None:
+        return False
+    body = f"{title}\n\n{text}"[:_NB_SOURCE_MAX]
+    if not _fast_type(driver, box, body):
+        try:
+            box.send_keys(body)
+        except Exception:                               # noqa: BLE001
+            return False
+    time.sleep(0.5)
+    if not _nb_click_xpath(driver, "//*[@role='dialog']//button[normalize-space(.)='Insert']",
+                           timeout=10):
+        return False
+    _nb_wait_dialog_closed(driver, 20)
+    return True
+
+
+def _nb_wait_sources(driver, cap: float = 120) -> None:
+    """Sources are read in the background; a Studio request before that
+    finishes is refused. Spinner-based, capped."""
+    start = time.time()
+    time.sleep(2)
+    while time.time() - start < cap:
+        try:
+            busy = driver.execute_script(
+                "return !!document.querySelector(\"[role='progressbar'], "
+                "mat-progress-bar, mat-spinner, [aria-busy='true']\");")
+        except Exception:                               # noqa: BLE001
+            busy = False
+        if not busy:
+            return
         time.sleep(3)
 
-        # 2) Add a "Copied text" source with the engineered prompt as its content.
-        if not _click_by_text(driver, ["copied text", "paste text"], timeout=15):
-            return ["NotebookLM: couldn't find the 'Add source → Copied text' "
-                    "option — the UI may have changed. Check the open tab; the "
-                    "notebook may still be usable manually from here."]
-        time.sleep(1)
-        try:
-            box = WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "textarea")))
-        except Exception:
-            return ["NotebookLM: the paste-text box never appeared — check "
-                    "the open tab and add the source manually if needed."]
-        if not _fast_type(driver, box, prompt):
-            box.send_keys(prompt)
-        time.sleep(1)
-        _click_by_text(driver, ["insert", "add source", "add"], timeout=10)
 
-        # 3) Wait for the source to finish processing (spinner-based, capped).
-        start = time.time()
-        while time.time() - start < 90:
+_NB_STUDIO_JS = """
+const h = [...document.querySelectorAll('h2')].find(e => /^\\s*Studio\\s*$/.test(e.innerText || ''));
+if (!h) return null;
+let p = h;
+for (let i = 0; i < 6 && p.parentElement && p.parentElement !== document.body; i++) {
+  p = p.parentElement;
+  if ((p.innerText || '').length > 400) break;
+}
+const text = p.innerText || '';
+const named = [...p.querySelectorAll("button[aria-label], [role='button'][aria-label], a[aria-label]")]
+  .map(b => b.getAttribute('aria-label') || '');
+return {
+  generating: /generating|creating|in progress|this (?:may|can|will) take|loading/i.test(text),
+  menus: named.filter(n => /more|option|menu/i.test(n)).length,
+  downloads: named.filter(n => /download/i.test(n)).length,
+  text: text.slice(0, 400),
+};
+"""
+
+_NB_OPEN_MENU_JS = """
+const h = [...document.querySelectorAll('h2')].find(e => /^\\s*Studio\\s*$/.test(e.innerText || ''));
+if (!h) return false;
+let p = h;
+for (let i = 0; i < 6 && p.parentElement && p.parentElement !== document.body; i++) {
+  p = p.parentElement;
+  if ((p.innerText || '').length > 400) break;
+}
+const dl = [...p.querySelectorAll("button[aria-label], a[aria-label]")].filter(b => /download/i.test(b.getAttribute('aria-label') || ''));
+if (dl.length) { dl[dl.length - 1].click(); return 'download'; }
+const menus = [...p.querySelectorAll("button[aria-label], [role='button'][aria-label]")].filter(b => /more|option|menu/i.test(b.getAttribute('aria-label') || ''));
+if (!menus.length) return false;
+menus[menus.length - 1].click();
+return 'menu';
+"""
+
+
+def _nb_studio_state(driver) -> dict:
+    try:
+        return driver.execute_script(_NB_STUDIO_JS) or {}
+    except Exception:                                   # noqa: BLE001
+        return {}
+
+
+def _nb_generate(driver, make: str, fmt: str, length: str, focus: str) -> str:
+    """Open the card's Customize dialog, set format/length/focus, press
+    Generate now. "" on success, else what could not be found."""
+    card = "Video Overview" if make == "video" else "Audio Overview"
+    pencil = f"[role='button'][aria-label='{card}'] .option-icon"
+    if not _nb_click(driver, pencil, (), timeout=15):
+        # No pencil: the card itself generates with the defaults.
+        if not _nb_click(driver, f"[role='button'][aria-label='{card}']",
+                         (card.lower(),), timeout=10):
+            return f"the Studio → {card} card couldn't be found"
+        return ""
+    if _nb_dialog(driver, 10) is None:
+        return f"the Customize {card} dialog never opened"
+    if fmt:
+        _nb_click_xpath(driver, "//*[@role='dialog']//label[starts-with(normalize-space(.), "
+                                f"'{fmt}')]", timeout=5)
+    if length:
+        _nb_click_xpath(driver, "//*[@role='dialog']//button[@role='radio']"
+                                f"[normalize-space(.)='{length}']", timeout=5)
+    if focus:
+        box = _nb_el(driver, "[role='dialog'] textarea", 5)
+        if box is not None and not _fast_type(driver, box, focus):
             try:
-                busy = driver.execute_script(
-                    "return !!document.querySelector("
-                    "\"[role='progressbar'], .animate-spin, [aria-busy='true']\");")
-            except Exception:
-                busy = False
-            if not busy:
-                break
-            time.sleep(3)
+                box.send_keys(focus)
+            except Exception:                           # noqa: BLE001
+                pass
+    if not _nb_click_xpath(driver, "//*[@role='dialog']//button[normalize-space(.)='Generate now']",
+                           timeout=10):
+        return "no 'Generate now' button in the Customize dialog"
+    _nb_wait_dialog_closed(driver, 20)
+    return ""
 
-        if stage == "media":
-            # 4a) Request the Video Overview — this is a long async render;
-            # we trigger it and move on rather than blocking the whole
-            # pipeline for the many minutes it can take.
-            _click_by_text(driver, ["studio"], timeout=10)
-            time.sleep(1)
-            got = _click_by_text(
-                driver, ["video overview", "generate video overview"], timeout=10)
-            if not got:
-                return ["NotebookLM: the source was added, but the Studio → "
-                        "Video Overview button couldn't be found automatically "
-                        "— open the tab and click Generate manually."]
-            return ["NotebookLM Video Overview requested. Generation takes "
-                    "several minutes — check the notebook tab afterwards for "
-                    "the finished video."]
 
-        # 4b) Any other stage: ask the actual question in NotebookLM's chat.
+def _nb_wait_generated(driver, cap: float, halted, baseline_menus: int = 0,
+                       poll: float = 10) -> bool:
+    """Watch the Studio panel until the render is done: it says it is
+    generating and then stops saying so, or a new menu/download control
+    appears on the list. False on the cap or a Stop."""
+    start, seen = time.time(), False
+    while time.time() - start < cap:
+        if halted():
+            return False
+        st = _nb_studio_state(driver)
+        if st.get("generating"):
+            seen = True
+        elif seen or st.get("downloads") or st.get("menus", 0) > baseline_menus:
+            return True
+        time.sleep(poll)
+    return False
+
+
+def _nb_download(driver, stage: str, wait: float = 600) -> list[dict]:
+    """The finished overview as a file: the newest Studio item's menu →
+    Download (or its own Download control), captured into a scratch
+    folder the way every click-to-download file is."""
+    def click() -> bool:
         try:
-            chat = WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "textarea, div[contenteditable='true']")))
-        except Exception:
-            return ["NotebookLM: the source was added, but no chat box was "
-                    "found to ask the question — check the open tab."]
-        if not _fast_type(driver, chat, prompt):
-            chat.send_keys(prompt)
-        chat.send_keys(Keys.ENTER)
-        time.sleep(agent_cfg.get("wait_time", 45))
-        texts = [e.text.strip() for e in driver.find_elements(
-            By.CSS_SELECTOR, ".prose, .markdown, [role='article']") if e.text.strip()]
-        texts = [t for t in texts if len(t) > 50]
-        return texts or ["NotebookLM answered, but no response text could be "
-                          "scraped automatically — check the open tab."]
-    except Exception as e:
-        return [f"NotebookLM automation stopped early at an unverified UI "
-                f"step ({e}). Check the open tab — your source/prompt may "
-                f"still be usable manually from here."]
+            how = driver.execute_script(_NB_OPEN_MENU_JS)
+        except Exception:                               # noqa: BLE001
+            how = False
+        if how == "download":
+            return True
+        if how == "menu":
+            time.sleep(1)
+            if _click_by_text(driver, ["download"], timeout=5):
+                return True
+        return _click_by_text(driver, ["download"], timeout=3)
+    return _capture_download(driver, stage, click, wait=wait,
+                             menu_words=("mp4", "m4a", "download"))
+
+
+def _nb_chat(driver, agent_cfg: dict, prompt: str) -> list[str]:
+    """Any other step: ask the notebook and read what it says."""
+    from selenium.webdriver.common.keys import Keys
+    box = _nb_el(driver, agent_cfg.get("textarea_selector")
+                 or "textarea[aria-label='Query box'], textarea", 15)
+    if box is None:
+        return ["NotebookLM: the sources were added, but no chat box was "
+                "found to ask the question — check the open tab."]
+    try:
+        before = driver.execute_script("return document.body.innerText || '';")
+    except Exception:                                   # noqa: BLE001
+        before = ""
+    if not _fast_type(driver, box, prompt):
+        box.send_keys(prompt)
+    try:
+        box.send_keys(Keys.ENTER)
+    except Exception:                                   # noqa: BLE001
+        _nb_click(driver, "button[type='submit'], button[aria-label='Submit']", ("submit",), 5)
+    time.sleep(int(agent_cfg.get("wait_time", 45) or 45))
+    try:
+        after = driver.execute_script("return document.body.innerText || '';")
+    except Exception:                                   # noqa: BLE001
+        after = ""
+    fresh = after[len(before):] if after.startswith(before) else after
+    fresh = fresh.replace(prompt, "").strip()
+    if len(fresh) > 50:
+        return [fresh]
+    return ["NotebookLM answered, but no response text could be read off the "
+            "page — check the open tab."]
+
+
+def _run_notebooklm(driver, agent_cfg: dict, stage: str, line: str, *,
+                    sources=(), unreadable=(), query: str = "",
+                    should_stop=None) -> tuple[list[str], list[dict]]:
+    """Drive NotebookLM for one step. Returns (texts, files).
+
+      1. a fresh notebook;
+      2. every source pasted in as "Copied text" -- the earlier steps' full
+         answers and the readable attachments (see _nb_sources);
+      3. wait for the sources to be read;
+      4. what the step wants (_nb_wants): a Video Overview or an Audio
+         Overview through the card's Customize dialog, then wait for the
+         render and download it; or, on an ordinary step, a question in
+         the chat.
+    """
+    halted = (lambda: bool(should_stop and should_stop()))
+    where = ""
+    try:
+        if not _nb_new_notebook(driver):
+            return (["NotebookLM: couldn't create a notebook — the 'Create new "
+                     "notebook' button was not found. Check the open tab."], [])
+        where = driver.current_url
+        added = 0
+        for title, text in sources:
+            if halted():
+                return (["NotebookLM: stopped while adding sources."], [])
+            if _nb_add_text_source(driver, title, text):
+                added += 1
+                ui.info(f"   📚  source {added}: {title[:60]}")
+            else:
+                ui.warn(f"   couldn't add source '{title[:60]}' — the Add "
+                        "source → Copied text path did not go through")
+                break
+        if not added:
+            return ([f"NotebookLM: no source could be added to the notebook "
+                     f"({where}). Check the open tab — the notebook is there, empty."], [])
+        if unreadable:
+            ui.warn("   these attachments have no text Prism could paste in "
+                    "and NotebookLM has no upload field on the page: "
+                    + ", ".join(list(unreadable)[:4]))
+        _nb_wait_sources(driver)
+
+        make = _nb_wants(stage, line, query)
+        if make == "chat":
+            return (_nb_chat(driver, agent_cfg, line or query), [])
+
+        fmt, length = _nb_format(make, line, query)
+        focus = _nb_focus(line, query)
+        baseline = int(_nb_studio_state(driver).get("menus", 0) or 0)
+        why = _nb_generate(driver, make, fmt, length, focus)
+        label = ("Video Overview" if make == "video" else "Audio Overview") + \
+                (f" ({fmt}{', ' + length if length else ''})" if fmt else "")
+        if why:
+            return ([f"NotebookLM: {added} source(s) added to {where}, but the "
+                     f"{label} could not be requested — {why}. Open the tab and "
+                     "press Generate yourself."], [])
+        cap = int(agent_cfg.get("generate_wait", 1500) or 1500)
+        ui.info(f"   🎬  {label} requested — waiting up to {cap // 60} min for "
+                "NotebookLM to render it")
+        if not _nb_wait_generated(driver, cap, halted, baseline):
+            return ([f"NotebookLM {label} requested from {added} source(s) — "
+                     f"still rendering when Prism stopped waiting. It finishes "
+                     f"in the notebook: {where}"], [])
+        files = _nb_download(driver, stage)
+        if files:
+            ui.ok(f"   ✅  {label} downloaded: {files[0].get('name')}")
+            return ([f"NotebookLM {label} generated from {added} source(s) and "
+                     f"saved as {files[0].get('name')}. Notebook: {where}"], files)
+        return ([f"NotebookLM {label} generated from {added} source(s) — it is "
+                 f"in the notebook's Studio panel ({where}); Prism could not "
+                 "find its Download control to save a copy."], [])
+    except Exception as e:                              # noqa: BLE001
+        return ([f"NotebookLM automation stopped early ({e}). Check the open "
+                 f"tab{' — ' + where if where else ''}; the notebook may be "
+                 "usable from there."], [])
 
 
 # Words that only appear on a page asking you to identify yourself. Matched
@@ -4253,6 +4723,20 @@ def _web_token() -> str:
     return reel_web.ASSET_TOKEN
 
 
+def _brand_from_images(files: list) -> dict:
+    """The client's accent colour, sampled from whichever entries in `files`
+    are images. {} when none are, or none of them yield a usable palette.
+    Shared by the design conversation's early look (before scenes are
+    written) and _run_studio()'s own render-time fallback, so the same rule
+    decides both -- see the note above where the design-stage call is made.
+    """
+    from . import reel as _pillow
+    imgs = [str(a.get("path", "")) for a in (files or [])
+            if str(a.get("path", "")).lower().endswith(
+                (".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
+    return (_pillow.sample_brand(imgs) or {}) if imgs else {}
+
+
 def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
                 studio: dict | None = None):
     """Film the page the art-direction stage wrote.
@@ -4305,8 +4789,7 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
     if brand:
         spec["brand"] = dict(brand)
     elif imgs and not spec.get("brand"):
-        from . import reel as _pillow
-        sampled = _pillow.sample_brand(imgs)
+        sampled = _brand_from_images(attachments or [])
         if sampled:
             spec["brand"] = sampled
 
@@ -5245,6 +5728,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             send_files = (attachments if include_attachment else []) + \
                          (pipeline_files if producer else [])
             went_up = 0
+            # A chip left in the composer by an earlier run would go out
+            # with this message -- see _clear_staged_attachments. Done on
+            # every stage, files to send or not: a stale chip on a step
+            # with no upload is still a stale chip.
+            _clear_staged_attachments(driver, agent_cfg, agent_name)
             if send_files:
                 went_up = _upload_files(driver, agent_cfg, send_files, agent_name)
 
@@ -5286,13 +5774,30 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 prior = []
 
             if prior:
-                prev_stage, prev_texts = prior[-1]
-                prev_text = "\n\n".join(t for t in prev_texts if t.strip())
-                if len(prev_text) > _MAX_FORWARD_CHARS:
-                    prev_text = prev_text[-_MAX_FORWARD_CHARS:]
-                context += (_context_header(agent_cfg, prev_stage)
-                            + prev_text
-                            + _context_footer(agent_cfg))
+                # Only the hand-off lines travel (Round 31). A tool with its
+                # own filter block (Apollo) needs every line of it, so the
+                # line cap is lifted for that one; the summary step is the
+                # one reader that wants every earlier step, so it gets each
+                # step's hand-off rather than the last step's alone.
+                own_block = bool(agent_cfg.get("handoff_spec"))
+                cap = None if own_block else _MAX_HANDOFF_LINES
+                if stage == "summary" and len(prior) > 1:
+                    blocks = []
+                    for prev_stage, prev_texts in prior:
+                        got = _handoff_of(prev_texts, lines=cap)
+                        if got:
+                            blocks.append(_context_header(agent_cfg, prev_stage)
+                                          + got)
+                    if blocks:
+                        context += ("\n\n".join(blocks)
+                                    + _context_footer(agent_cfg))
+                else:
+                    prev_stage, prev_texts = prior[-1]
+                    prev_text = _handoff_of(prev_texts, lines=cap)
+                    if prev_text:
+                        context += (_context_header(agent_cfg, prev_stage)
+                                    + prev_text
+                                    + _context_footer(agent_cfg))
 
             # The stage feeding a LOCAL renderer is machine-read, so it gets
             # the final-stage rules even though a stage follows it. The normal
@@ -5350,18 +5855,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 handoff = (
                     _natural_handoff(nxt_agent, final=False)
                     if _is_natural(agent_cfg) else
-                    "\n\nWHERE THIS GOES: your answer passes straight to "
-                    f"{nxt_agent} for the '{nxt_stage}' step, which sees "
-                    "nothing else from this run. Do the task above and "
-                    "nothing else, then finish with a short section headed "
-                    f"'HANDOFF FOR {nxt_agent.upper()}' carrying the facts, "
-                    "decisions and constraints it needs — last thing in your "
-                    "answer, and no questions back.")
+                    "\n\nAt the end add a section headed "
+                    f"'HANDOFF FOR {nxt_agent.upper()}': at most "
+                    f"{_MAX_HANDOFF_LINES} lines with the facts and decisions "
+                    f"{nxt_agent} needs for the '{nxt_stage}' step — only "
+                    "those lines go forward. No questions back.")
             else:
-                handoff = _natural_handoff("", final=True) if _is_natural(agent_cfg) else (
-                    "\n\nThis is the last step, so your answer goes to the "
-                    "person. Give the finished result — no handoff section, "
-                    "no summary for a next step, and no questions back.")
+                handoff = _natural_handoff("", final=True) if _is_natural(agent_cfg) else _FINAL_CLOSING
             if _is_maker(agent_cfg) and stage_idx not in machine_stages \
                     and stage_idx != spec_feeder:
                 # A maker is never asked for a handoff section: what it
@@ -5381,6 +5881,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     _kind, agent_name, agent_cfg,
                     ext=_contract.wanted_ext(query))
                 if _line:
+                    if handoff == _FINAL_CLOSING:
+                        handoff = _FINAL_CLOSING_AFTER_DELIVERABLE
                     handoff = "\n\n" + _line + handoff
             elif _kind == "text" and not machine_shaped:
                 # This tool's own known drift, one line, and only where it
@@ -5407,6 +5909,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # actively stopping document stages — the BOQ especially — from
             # producing the very PDF the customer wants.)
 
+            nb_files: list = []          # what NotebookLM downloaded itself
             if agent_cfg.get("search_tool") == "apollo":
                 # Deliberately does NOT get `context`. That blob opens with
                 # "Context from the previous pipeline stage (RESEARCH) —" and
@@ -5428,14 +5931,17 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 stage_responses = _run_canva(driver, agent_cfg, stage,
                                              canva_prompt, should_stop=stage_halt)
             elif agent_name == "NotebookLM":
-                # NotebookLM is not a chat box — it's a "sources" notebook
-                # (add a source, then either ask about it or generate a
-                # Video/Audio Overview). Best-effort automation driven by
-                # visible button TEXT rather than CSS classes, since
-                # Google's Material UI class names churn too often to
-                # hard-code reliably — see _run_notebooklm()'s docstring.
-                nb_prompt = _bmp_safe((context + "\n\n".join(questions) + handoff))
-                stage_responses = _run_notebooklm(driver, agent_cfg, stage, nb_prompt)
+                # NotebookLM is not a chat box — it's a "sources" notebook.
+                # It is handed the earlier steps' FULL answers and the
+                # readable attachments as sources (a source tool wants the
+                # material, not the four-line hand-off), and the step's
+                # line plus the person's words as the overview's focus.
+                # See _run_notebooklm and the notes above it.
+                nb_sources, nb_unreadable = _nb_sources(prior, send_files)
+                stage_responses, nb_files = _run_notebooklm(
+                    driver, agent_cfg, stage, _bmp_safe("\n\n".join(questions)),
+                    sources=nb_sources, unreadable=nb_unreadable, query=query,
+                    should_stop=stage_halt)
             else:
                 if stage_idx == design_feeder:
                     # Two things this prompt could not know when the plan was
@@ -5483,6 +5989,30 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         else:
                             ui.info("   no brand colours came back — the "
                                     "design will choose its own")
+                    if not studio_brand:
+                        # The reason a reel could pass every per-scene brand
+                        # check and still fail brand_faults() at render: the
+                        # colour Prism actually films in comes from
+                        # _run_studio()'s OWN fallback sample of
+                        # attachments + pipeline_files — which, on an artwork
+                        # stage ordered before design, includes pictures that
+                        # do not exist until now. Sampled here too, from the
+                        # SAME set (_brand_from_images), so the design
+                        # conversation is told the real colour and the
+                        # per-scene check (build_spec's brand argument, just
+                        # below) can actually catch a scene that ignores it
+                        # — instead of the colour being discovered for the
+                        # first time after every scene is already written
+                        # and filmed (the owner's run of 15 Sep 2026: accent
+                        # #4ab50a, sampled from artwork the design
+                        # conversation never saw).
+                        studio_brand = _brand_from_images(
+                            (attachments or []) + pipeline_files)
+                        if studio_brand:
+                            ui.info(f"   🎨  brand colours read from the "
+                                    f"artwork — accent "
+                                    f"{studio_brand.get('accent')}, deep "
+                                    f"{studio_brand.get('deep')}")
                     questions = [q.replace(_web.BRAND_TOKEN,
                                            _web.brand_block(studio_brand))
                                  for q in questions]
@@ -5853,7 +6383,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             first_reply, _ask,
                             script=script_txt, assets=listing,
                             assets_table=design_assets,
-                            check=_web.inspect,
+                            check=_web.inspect, brand=studio_brand,
                             log=lambda m: ui.info(f"   {m}"),
                             should_stop=stage_halt,
                             on_scene=lambda i, n: emit(
@@ -6138,6 +6668,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             "file(s) for the next stages")
                     _save_artifacts(made_files, query, stage, link=all_links.get(stage, ""))
                     made_here = made_files
+
+            if nb_files:
+                # NotebookLM saved its own overview (see _nb_download); it
+                # travels and is kept the same way a harvested file is.
+                pipeline_files[:] = (pipeline_files + nb_files)[-6:]
+                _save_artifacts(nb_files, query, stage, link=all_links.get(stage, ""))
+                made_here = list(made_here) + nb_files
 
             # Did this step produce what it owed? A `file` step that came
             # back as chat text is asked once for the file, and if it still

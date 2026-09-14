@@ -386,7 +386,31 @@ window.__check = function () {
           out.push('an image failed to load — replace the missing asset or remove the image slot');
         }
       }
-      if (r.left < -2 || r.right > %d + 2 || r.top < -2 || r.bottom > %d + 2) {
+      const frameW = %d, frameH = %d;
+      // A moving picture -- a slow zoom, a pan -- legitimately overshoots its
+      // own box mid-animation; the whole point of the CSS trick that makes
+      // that safe is a clipping wrapper (overflow:hidden) that masks the
+      // overshoot, so nothing the viewer ever actually sees leaves the
+      // frame. Checked against that wrapper's OWN box instead, which does
+      // not move with the animation: an image is only flagged when no such
+      // wrapper contains it, or the wrapper itself sits off frame -- a real
+      // mistake, not a settling entrance animation ("an image (img,
+      // 719x1937) runs off the frame" on a scene whose .s1-photo wrapper,
+      // overflow:hidden, sat exactly at 367,0,713,1920 -- the owner's run
+      // of 15 Sep 2026, after the mid-animation scale(1.00868) on the img
+      // inside it was measured directly instead).
+      let bound = r;
+      for (let p = el.parentElement; p && p !== scene; p = p.parentElement) {
+        const pcs = getComputedStyle(p);
+        if (pcs.overflow === 'hidden' || pcs.overflow === 'clip' ||
+            pcs.overflowX === 'hidden' || pcs.overflowX === 'clip' ||
+            pcs.overflowY === 'hidden' || pcs.overflowY === 'clip') {
+          bound = p.getBoundingClientRect();
+          break;
+        }
+      }
+      if (bound.left < -2 || bound.right > frameW + 2 ||
+          bound.top < -2 || bound.bottom > frameH + 2) {
         const what = el.getAttribute('alt') || el.tagName.toLowerCase();
         const key = 'img|' + what + Math.round(r.left);
         if (!seen.has(key)) {
@@ -2010,7 +2034,7 @@ def fallback_scene(script_scene: dict, seconds: float = 4.0) -> dict:
 
 def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
                assets_table: dict | None = None, check=None, log=None,
-               should_stop=None, on_scene=None) -> dict:
+               should_stop=None, on_scene=None, brand: dict | None = None) -> dict:
     """Run the rest of the design conversation and return the finished spec.
 
     `ask(prompt, expect) -> str` sends a follow-up in the tab the design stage
@@ -2027,6 +2051,21 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
     Nothing here raises once turn one has parsed. A scene that will not come
     back is replaced by a plain one built from the script: a reel with one
     dull scene ships, and a reel with a hole in it does not.
+
+    `brand` is the client's measured colours, the same dict render() is
+    given later. Without it here, the only place the accent-colour rule was
+    ever actually checked was the final render — after every scene had
+    already been written AND filmed, minutes of work in, with no chance to
+    correct it: "the client's accent colour #3a713a appears nowhere in the
+    design" (the owner's run, 14 Sep 2026). The rule is stated in turn one
+    (brand_block) and the prompt SAYS "the design is checked for this
+    before it is filmed" — but nothing had ever actually run that check
+    until the render gate. Checked here too, cumulatively, once the last
+    scene is written (not every scene — the rule only needs the colour to
+    appear somewhere in the reel, matching what render()'s own brand_faults
+    requires), it goes through the same one-shot correction every other
+    layout fault already gets. render()'s hard gate stays as the backstop:
+    a correction that doesn't take still stops a flawed MP4 from shipping.
     """
     def say(msg):
         if log:
@@ -2101,6 +2140,13 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
         planned = [name for name in planned_assets(board[i], assets)
                    if name not in _blocked_assets(design)]
         check_state = "not run"
+        # Only worth judging once the reel is about to finish -- brand_faults
+        # asks whether the colour appears ANYWHERE in the design, and an
+        # early scene legitimately may not carry it (a full-bleed picture, a
+        # kicker-only card). Checked against every scene written so far plus
+        # the one being judged, so it reflects the reel as it will actually
+        # ship, not just this one card.
+        last_scene = (i == total - 1)
 
         def _faults(sc, _i=i):
             nonlocal check_state
@@ -2113,9 +2159,12 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
                 except Exception as e:
                     check_state = "unavailable — export preflight still required"
                     say(f"couldn't lay scene {_i + 1} out ({e})")
-            return missing_planned(sc, planned) + found
+            colour = (brand_faults({"design": design, "brand": brand,
+                                    "scenes": scenes + [sc]})
+                      if brand and last_scene else [])
+            return missing_planned(sc, planned) + found + colour
 
-        if check or planned:
+        if check or planned or (brand and last_scene):
             faults = _faults(scene)
             original_check_state = check_state
             if faults:

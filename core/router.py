@@ -458,6 +458,69 @@ def apply_studio_guardrail(query: str, routing: dict, agents: dict) -> str:
             "Studio instead for this run")
 
 
+# Trigger words for the guardrail below — every way people write "BOQ" or
+# "BOM" in a chat message, forgiving of the slash and the missing space.
+_BOQ_FILE_TERMS = [
+    "boq", "bom", "bill of quantities", "bill of quantity",
+    "bill of materials", "bill of material",
+]
+
+# Stages this guardrail turns off outright. "research" is deliberately not
+# here: whether it runs is the planner's own call (or the person's, if they
+# asked for it), and forcing it off would undo a "and research the company"
+# request the same breath asked for the BOQ. Everything else answers a
+# question nobody asked -- there is one document to write, from one file.
+_BOQ_FILE_OFF = ("brains", "leads", "visual", "summary", "development",
+                 "presentation", "media", "audio", "design", "artwork")
+
+
+def apply_boq_file_guardrail(query: str, routing: dict, agents: dict,
+                             attachments: list | None = None) -> bool:
+    """A BOQ or BOM asked for against an attached file is one document step,
+    not a plan.
+
+    The owner's report (11 Sep 2026): the same request -- a drawing
+    attached, "make a BOQ/BOM for this" -- typed to Claude by hand got the
+    document in a fraction of the tokens a routed Prism run spent, because
+    the routed run also turned on Think-it-through and Sum-it-up, neither
+    of which the request had any use for. Deterministic for the same reason
+    apply_make_guardrail is: whether a BOQ needs a planning pass and a
+    round-up is not a judgement call worth leaving to however an LLM router
+    reads the brief that day -- it never does, so it is never asked for.
+
+    Mutates `routing`: forces every stage in `_BOQ_FILE_OFF` off, and -- when
+    a content agent is configured -- turns CONTENT on as the one document
+    step, kind "file", briefed with the attached file's name and the format
+    asked for (`contract.wanted_ext`, default .docx). RESEARCH is left
+    exactly as the planner decided; see `_BOQ_FILE_OFF`'s docstring note.
+    Returns whether anything was changed.
+    """
+    if not attachments:
+        return False
+    if not _mentions(query.lower(), _BOQ_FILE_TERMS):
+        return False
+    changed = False
+    for stage in _BOQ_FILE_OFF:
+        data = routing.get(stage)
+        if isinstance(data, dict) and data.get("needed"):
+            data["needed"] = False
+            data["questions"] = []
+            changed = True
+    if agents.get("content"):
+        from . import contract as _contract
+        names = ", ".join(str(a.get("name") or "") for a in attachments
+                          if isinstance(a, dict) and a.get("name"))
+        ext = _contract.wanted_ext(query) or ".docx"
+        line = (f"For this step: make the BOQ/BOM for the attached "
+                f"{names or 'file'} as a {ext} file.")
+        c = routing.get("content") or {}
+        if not (c.get("needed") and c.get("questions")):
+            changed = True
+        routing["content"] = {"needed": True, "kind": "file",
+                              "questions": [line]}
+    return changed
+
+
 def apply_reel_imagery_guardrail(query: str, routing: dict,
                                  agents: dict) -> str:
     """Does this reel get generated pictures? Decided once, here.
@@ -1269,6 +1332,11 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     elif imagery == "off":
         ui.info("🖼️   type and colour only, as asked — no pictures will be "
                 "generated for the reel")
+    # Before the skills pass, so a skill is only ever offered a stage that
+    # is actually going to run.
+    if apply_boq_file_guardrail(query, routing, agents, attachments):
+        ui.info("🛡️  guardrail: a BOQ/BOM from an attached file is one "
+                "document step, not a plan")
     # Surface the enrichment brief so the UI can show the full transformation
     # chain (raw words → brief → stage prompts). Consumers iterate
     # PIPELINE_ORDER, so this extra key is invisible to them.

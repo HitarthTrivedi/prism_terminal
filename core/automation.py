@@ -948,10 +948,40 @@ _CFT_ZIP = ("https://storage.googleapis.com/chrome-for-testing-public/{}/"
             "mac-arm64/chromedriver-mac-arm64.zip")
 
 
+def _trusted_ssl_context():
+    """An SSL context that verifies against certifi's own certificate
+    bundle, not Python's default lookup.
+
+    A frozen build's OpenSSL has its default cert PATH compiled in at
+    build time -- the machine that ran PyInstaller, never the customer's.
+    `ssl.get_default_verify_paths()` on a client Mac with no Python of its
+    own points at a file that is not there, so the plain default context
+    finds nothing to verify against and every HTTPS request fails with
+    "[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer
+    certificate" -- reproduced by hand (SSL_CERT_FILE/DIR pointed at a
+    path that does not exist, the same shape a frozen app's baked-in path
+    takes on a different machine) against this file's own chromedriver
+    fetch, 16 Sep 2026. certifi ships its own cacert.pem as a package
+    file, found the same way on every machine regardless of what built
+    the app, which is the whole reason it is bundled (PyInstaller's own
+    hook does that automatically once certifi is imported anywhere) --
+    nothing here previously told Python's ssl module to use it instead of
+    its own guess. Falls back to the plain default context if certifi is
+    somehow unavailable, so this can only make a request MORE likely to
+    verify, never less."""
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:                                       # noqa: BLE001
+        return ssl.create_default_context()
+
+
 def _http_get(url: str, timeout: float = 60.0) -> bytes:
     import urllib.request
     req = urllib.request.Request(url, headers={"User-Agent": "Prism"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:      # noqa: S310
+    with urllib.request.urlopen(                              # noqa: S310
+            req, timeout=timeout, context=_trusted_ssl_context()) as r:
         return r.read()
 
 

@@ -95,8 +95,13 @@ CATEGORIES = {
         # Canva is first because most business visual work is a post or a
         # brochure the customer will want to tweak later, and it is the only
         # tool here that hands back something still editable.
-        "agents": ["Canva", "Leonardo.ai", "Adobe Firefly", "Midjourney",
-                   "ChatGPT"],
+        # Google Gemini sits second, not last: alternatives_for() offers the
+        # first TWO untried tools in this order when one fails, so parked at
+        # the end it would never actually be reached. This is what makes it
+        # the real fallback for ChatGPT -- the tool that has hit its own
+        # free-tier image limit twice in one afternoon on this account.
+        "agents": ["Canva", "Google Gemini", "Leonardo.ai", "Adobe Firefly",
+                   "Midjourney", "ChatGPT"],
     },
     "media": {
         "label": "Video & Reels",
@@ -166,6 +171,7 @@ _MAKES = {
     "Leonardo.ai": "generated images",
     "Adobe Firefly": "generated images",
     "Midjourney": "generated images",
+    "Google Gemini": "generated images",
     "Runway": "a generated video",
     "Pika Labs": "a generated video",
     "Google Flow": "a generated video",
@@ -412,6 +418,7 @@ _PROFILES: dict[str, dict] = {
     "Midjourney": {"produces": ("image",), "file_hint": "", "avoid": ""},
     "Leonardo.ai": {"produces": ("image",), "file_hint": "", "avoid": ""},
     "Adobe Firefly": {"produces": ("image",), "file_hint": "", "avoid": ""},
+    "Google Gemini": {"produces": ("image",), "file_hint": "", "avoid": ""},
     "Runway": {"produces": ("video",), "file_hint": "", "avoid": ""},
     "Pika Labs": {"produces": ("video",), "file_hint": "", "avoid": ""},
     "Google Flow": {"produces": ("video",), "file_hint": "", "avoid": ""},
@@ -750,6 +757,23 @@ AGENT_REGISTRY = {
         "https://www.midjourney.com/imagine",
         "the gold standard for cinematic photorealism (web alpha)",
         "Paid", "30–60s", 100,
+    ),
+    "Google Gemini": _agent(
+        # Read live on 15 Sep 2026 by attaching Playwright to Prism's own
+        # signed-in Chrome (the pattern this file's NotebookLM notes use):
+        # a plain chat prompt -- "Generate an image: a stainless steel shoe
+        # rack product photo, industrial style, teal accent lighting,
+        # vertical 9:16 composition" -- produced a clean 572x1024 image in
+        # about 15 seconds, with a working "Download full size image"
+        # control once it settled. No custom selectors needed: the
+        # composer is a plain contenteditable div the generic textarea
+        # selector already matches, and the image is a plain large <img>
+        # the generic harvest (_harvest_images) already finds by shape.
+        "https://gemini.google.com/app",
+        "Google's Nano Banana model (Gemini 2.5 Flash Image), free and "
+        "fast — a clean product or scene photo in seconds, generated "
+        "straight in the chat",
+        "Free", "10–20s", 45,
     ),
     # Sits in BOTH visual and presentation: the same Magic Studio prompt makes
     # a post or a deck, and the reason to pick it is the same either way.

@@ -782,6 +782,9 @@ def _maker_rule(agents: dict) -> str:
         f"    • Never ask for \"plain text\", a \"text format\", a description,\n"
         f"      an outline, or an export file, and never say \"do not generate\n"
         f"      files\" -- the tool would obey and hand back words.\n"
+        f"    • For AUDIO/VOICE tools (e.g. ElevenLabs, Suno): supply only the clean\n"
+        f"      spoken voiceover narration lines to synthesize. Never include visual\n"
+        f"      directions, sound-effect tags, JSON keys, metadata, or conversational handoffs.\n"
         f"    • DELIVERABLE SPEC = the built thing; QUALITY BAR = about the thing\n"
         f"      (every slide present, headings exact, readable at a glance).\n")
 

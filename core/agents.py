@@ -29,9 +29,13 @@ PIPELINE_ORDER = [
     "leads",          # real companies & verified contacts to approach
     "brains",         # strategy, reasoning, architecture
     "content",        # copy, docs, scripts
+    # Narration must exist before the video is assembled. Keeping audio after
+    # media produced a silent MP4 first and an orphaned ElevenLabs file later.
+    # It also belongs before visual so it receives the script directly rather
+    # than image-maker chatter as its handoff.
+    "audio",          # voice-over, music, narration
     "visual",         # images
     "media",          # video
-    "audio",          # voice-over, music, narration
     "development",    # build & deploy apps, UIs, tools
     "presentation",   # slide decks & pitch presentations
     "summary",        # final synthesis (uses the 'brains' agent)
@@ -345,7 +349,8 @@ _PROFILES: dict[str, dict] = {
         "produces": ("text", "image", "file", "data"),
         "file_hint": "Use your own tools to build it and give me the "
                      "download link in this chat.",
-        "avoid": "Do not put this in a canvas — answer in the chat itself.",
+        "avoid": "Do not put this in a canvas — answer in the chat itself. "
+                 "Do not generate images or call image tools unless this specific step explicitly asks for images.",
     },
     "Claude": {
         "produces": ("text", "file", "data"),
@@ -357,7 +362,7 @@ _PROFILES: dict[str, dict] = {
     "Claude Design": {
         "produces": ("text", "file", "image"),
         "file_hint": "Build the design here and leave the export in the chat.",
-        "avoid": "",
+        "avoid": "Do not generate images or call image tools unless this specific step explicitly asks for images.",
     },
     "Perplexity": {
         "produces": ("text",),
@@ -760,6 +765,9 @@ AGENT_REGISTRY = {
         "https://elevenlabs.io/app/speech-synthesis",
         "industry-leading emotive voice cloning and text-to-speech",
         "Freemium", "5–15s", 45,
+        runner="elevenlabs",
+        textarea_selector=("textarea, [contenteditable='true'][role='textbox'], "
+                           "[contenteditable='true']"),
     ),
     # Runs INSIDE Prism — no browser, no account, no upload. Marked local so
     # automation.py renders it here instead of driving a Chrome tab.

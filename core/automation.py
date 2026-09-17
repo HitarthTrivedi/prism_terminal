@@ -107,6 +107,65 @@ def _get_driver(cfg: dict):
     return _active_driver, True
 
 
+def _driver_has_live_tab(driver) -> bool:
+    """Return whether Chrome kept at least one WebDriver-controlled tab.
+
+    A successful ``uc.Chrome(...)`` constructor only proves Chrome started.
+    It does *not* prove the initial renderer survived: on some Linux Chrome
+    builds the process starts, reports a session, then drops its sole tab a
+    moment later.  Detect that at launch so the normal one-time driver retry
+    can recover before a customer waits on an empty Content card.
+
+    Tiny test doubles intentionally expose no ``window_handles`` property;
+    they stand in for a successful driver and remain valid here.
+    """
+    if not hasattr(driver, "window_handles"):
+        return True
+    try:
+        return bool(driver.window_handles)
+    except Exception:
+        return False
+
+
+def _ensure_active_window(driver) -> bool:
+    """Ensure driver is pointing to a live window handle.
+
+    If driver.current_window_handle raises NoSuchWindowException or is not in
+    driver.window_handles, switch to the latest available handle in
+    driver.window_handles. If no handles exist, try creating a new window.
+    Returns True if an active window handle is established, False otherwise.
+    """
+    if not hasattr(driver, "window_handles"):
+        return True
+    try:
+        handles = list(driver.window_handles)
+    except Exception:
+        return False
+    if not handles:
+        try:
+            if hasattr(driver, "switch_to") and hasattr(driver.switch_to, "new_window"):
+                driver.switch_to.new_window("tab")
+                return bool(driver.window_handles)
+        except Exception:
+            return False
+        return False
+
+    try:
+        cur = driver.current_window_handle
+        if cur in handles:
+            return True
+    except Exception:
+        pass
+
+    for h in reversed(handles):
+        try:
+            driver.switch_to.window(h)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _open_tab(driver, agent_name: str = "") -> bool:
     """Put the next stage in a NEW tab, leaving every finished one on screen.
 
@@ -135,15 +194,27 @@ def _open_tab(driver, agent_name: str = "") -> bool:
     earlier answer from the screen is bad, but refusing to run the stage at
     all would be worse.
     """
-    before = set(driver.window_handles)
+    _ensure_active_window(driver)
+    before = set()
+    try:
+        before = set(driver.window_handles)
+    except Exception:
+        pass
     try:
         driver.switch_to.new_window("tab")
-        if set(driver.window_handles) - before:
+        current_handles = set(driver.window_handles)
+        new = current_handles - before
+        if new:
+            driver.switch_to.window(new.pop())
+            return True
+        elif driver.window_handles:
+            driver.switch_to.window(driver.window_handles[-1])
             return True
     except Exception:
         pass
 
     try:                                # older drivers, or a refusal above
+        _ensure_active_window(driver)
         driver.execute_script("window.open('');")
         for _ in range(20):             # up to ~4s, checked rather than assumed
             time.sleep(0.2)
@@ -154,6 +225,7 @@ def _open_tab(driver, agent_name: str = "") -> bool:
     except Exception:
         pass
 
+    _ensure_active_window(driver)
     ui.warn(f"   ⚠️   couldn't open a new tab for {agent_name or 'this step'} — "
             f"reusing the current one, so the previous answer will be replaced. "
             f"Its text is still saved in this run.")
@@ -178,6 +250,10 @@ def shutdown() -> None:
         pass
     finally:
         _active_driver = None
+        # uc's quit() can leave Chrome renderer/GPU children behind on Linux.
+        # They keep Prism's profile locked and make the next controlled tab
+        # close as soon as Chrome hands its command line to that old process.
+        _release_profile()
 
 
 def _bmp_safe(text: str) -> str:
@@ -623,18 +699,36 @@ def _reset_to_blank_tab(driver) -> None:
     makes Chrome reopen every tab left over from the last time Prism quit,
     and stage one relies on a freshly launched browser opening on exactly
     one blank tab (see `first_tab` in run())."""
-    handles = driver.window_handles
-    if len(handles) <= 1:
+    try:
+        handles = list(driver.window_handles)
+    except Exception:
         return
+    if len(handles) <= 1:
+        if handles:
+            try:
+                driver.switch_to.window(handles[0])
+                driver.get("about:blank")
+            except Exception:
+                pass
+        return
+
+    keep_handle = handles[0]
     for h in handles[1:]:
         try:
             driver.switch_to.window(h)
             driver.close()
         except Exception:
             pass
+
     try:
-        driver.switch_to.window(handles[0])
-        driver.get("about:blank")
+        remaining = list(driver.window_handles)
+        target_handle = keep_handle if keep_handle in remaining else (remaining[0] if remaining else None)
+        if target_handle:
+            driver.switch_to.window(target_handle)
+            driver.get("about:blank")
+        elif hasattr(driver, "switch_to") and hasattr(driver.switch_to, "new_window"):
+            driver.switch_to.new_window("tab")
+            driver.get("about:blank")
     except Exception:
         pass
 
@@ -997,6 +1091,18 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
         o = uc.ChromeOptions()
         o.add_argument("--profile-directory=Default")
         o.add_argument("--disable-blink-features=AutomationControlled")
+        o.add_argument("--remote-allow-origins=*")
+        if platform.system() == "Linux":
+            # A handful of recent Linux Chrome builds lose the only WebDriver
+            # tab while bringing up GPU compositing or under AppArmor / user
+            # namespace restrictions. The browser window can remain visible,
+            # which makes it look like Prism failed to open the agent link.
+            # These keep normal visible Chrome while using the stable software
+            # compositor and sandbox bypass for automated tabs.
+            o.add_argument("--disable-gpu")
+            o.add_argument("--disable-dev-shm-usage")
+            o.add_argument("--no-sandbox")
+            o.add_argument("--disable-setuid-sandbox")
         return o
 
     # Match the driver to Chrome. A pin exists to work around DETECTION
@@ -1076,6 +1182,12 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
         drv = uc.Chrome(options=_options(), user_data_dir=tmp,
                         version_main=version_main, **_kwargs(own_driver))
         _reset_to_blank_tab(drv)
+        # Give Chrome a beat to finish creating its first renderer.  Without
+        # this, a launch whose only tab immediately disappears looks healthy
+        # here and fails much later at ``driver.get(...)`` in Content.
+        time.sleep(1)
+        if not _driver_has_live_tab(drv):
+            raise RuntimeError("Chrome opened but closed its controlled tab")
         return drv
     except Exception as e:
         # One retry, because the two most common failures here are both
@@ -1113,6 +1225,9 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                             version_main=version_main if bad_arch else None,
                             **_kwargs(own_driver))
             _reset_to_blank_tab(drv)
+            time.sleep(1)
+            if not _driver_has_live_tab(drv):
+                raise RuntimeError("Chrome opened but closed its controlled tab")
             return drv
         except Exception as retry_error:
             e = retry_error   # the newer, and after a version drop the truer, one
@@ -1206,6 +1321,139 @@ def _reel_imagery_on(routing: dict, cfg: dict) -> bool:
     return bool(cfg.get("reel_imagery", True))
 
 
+def _dispatch_upload_events(driver, input_el) -> None:
+    """Dispatch native and synthetic input/change events to inform React/Vue
+    listeners that files have been attached to a hidden file input."""
+    try:
+        driver.execute_script("""
+            const el = arguments[0];
+            if (!el) return;
+            el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        """, input_el)
+    except Exception:
+        pass
+
+
+def _candidate_inputs(driver, inputs):
+    """Sort file input elements to prioritize composer attachments over avatar/profile inputs."""
+    def _score(inp):
+        score = 0
+        try:
+            if inp.get_attribute("multiple"):
+                score += 10
+            accept = (inp.get_attribute("accept") or "").lower()
+            if accept:
+                score += 5
+            name_id = ((inp.get_attribute("name") or "") +
+                       (inp.get_attribute("id") or "") +
+                       (inp.get_attribute("class") or "")).lower()
+            if any(term in name_id for term in ("avatar", "profile", "icon", "user_image")):
+                score -= 20
+            in_composer = driver.execute_script("""
+                const el = arguments[0];
+                if (!el) return false;
+                return !!el.closest("form, [role='presentation'], [class*='composer'], [class*='chat']");
+            """, inp)
+            if in_composer:
+                score += 15
+        except Exception:
+            pass
+        return score
+    return sorted(inputs, key=_score, reverse=True)
+
+
+def _verify_page_attachments(driver, basenames: list[str], timeout: float = 6.0) -> tuple[int, list[str], str]:
+    """Poll the page DOM to verify that uploaded files actually landed in the web UI.
+
+    Checks:
+    1. Attachment chips/cards/previews in or near the composer.
+    2. Presence of uploaded file basenames in the page text/DOM.
+    3. Active upload progress bars/spinners (indicating ingestion has begun).
+    4. Rejection/error alerts (e.g. 'unsupported file', 'file too large').
+
+    Returns (verified_count, verified_names, error_detail).
+    """
+    if not basenames:
+        return 0, [], ""
+    end_time = time.time() + timeout
+    last_res = {"matched_names": [], "chips_count": 0, "has_busy": False, "error_msg": ""}
+
+    js_check = """
+        const names = arguments[0] || [];
+        const res = {
+            matched_names: [],
+            chips_count: 0,
+            has_busy: false,
+            error_msg: ""
+        };
+        // 1. Check for visible error alerts/messages
+        const alertSels = "[role='alert'], [class*='error'], [class*='alert'], [data-testid*='error'], .text-red-500, .toast-error";
+        for (const el of document.querySelectorAll(alertSels)) {
+            if (el.offsetParent !== null) {
+                const txt = (el.innerText || el.textContent || '').trim();
+                if (/upload|file|attachment|size|large|unsupported|type|failed|error/i.test(txt)) {
+                    res.error_msg = txt.slice(0, 160);
+                    break;
+                }
+            }
+        }
+        // 2. Check for active upload progressbars / spinners
+        const busySels = "[role='progressbar'], progress, .animate-spin, [aria-busy='true'], [data-testid*='progress'], [class*='progress'], [class*='spinner']";
+        for (const el of document.querySelectorAll(busySels)) {
+            if (el.offsetParent !== null) {
+                res.has_busy = true;
+                break;
+            }
+        }
+        // 3. Check for attachment chips/cards
+        const chipSels = "[data-testid*='attachment'], [data-testid*='file'], [aria-label*='Remove' i], [aria-label*='Delete' i], [aria-label*='remove' i], .attachment-item, [class*='attachment'], [class*='FileCard'], [class*='FileThumbnail'], [class*='file-tile'], [class*='file_thumbnail']";
+        const chips = Array.from(document.querySelectorAll(chipSels)).filter(el => el.offsetParent !== null);
+        res.chips_count = chips.length;
+
+        // 4. Check for file basenames in the visible page text or attributes
+        const bodyText = (document.body && (document.body.innerText || document.body.textContent)) || "";
+        for (const name of names) {
+            if (bodyText.includes(name)) {
+                res.matched_names.push(name);
+            } else {
+                const esc = (window.CSS && CSS.escape) ? CSS.escape(name) : name.replace(/["\\\\]/g, '\\\\$&');
+                const hasAttr = !!document.querySelector(`[title*="${esc}"], [aria-label*="${esc}"]`);
+                if (hasAttr) {
+                    res.matched_names.push(name);
+                }
+            }
+        }
+        return res;
+    """
+    while time.time() < end_time:
+        try:
+            data = driver.execute_script(js_check, basenames)
+            if isinstance(data, dict):
+                last_res = data
+                if data.get("matched_names") or data.get("chips_count", 0) > 0 or data.get("has_busy") or data.get("error_msg"):
+                    break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    matched = last_res.get("matched_names", [])
+    chips_cnt = last_res.get("chips_count", 0)
+    has_busy = last_res.get("has_busy", False)
+    err = last_res.get("error_msg", "")
+
+    if matched:
+        count = len(matched)
+    elif chips_cnt > 0:
+        count = min(chips_cnt, len(basenames))
+    elif has_busy:
+        count = len(basenames)
+    else:
+        count = 0
+
+    return count, matched, err
+
+
 def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
     """Push any attached files into the tool's <input type='file'>, if present.
 
@@ -1234,11 +1482,6 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
     # upload field at all and carried on without the customer's drawing. Same
     # page, same moment, two different answers — the difference was only that
     # one of them waited.
-    #
-    # presence, not visibility: a chat composer's <input type=file> is always
-    # hidden behind a paperclip button, and a visibility wait would time out
-    # on every tool in the registry. ChromeDriver sets files on a hidden input
-    # perfectly well — that is how this has always worked.
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     try:
@@ -1270,70 +1513,67 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
     if not paths:
         return 0
 
-    target = inputs[0]
-    uploaded = 0
+    sorted_inputs = _candidate_inputs(driver, inputs)
+    target = sorted_inputs[0]
+    basenames = [os.path.basename(p) for p in paths]
+    verified_count = 0
+    verified_names: list[str] = []
+    error_detail = ""
+
+    # Attempt bulk upload
     try:
-        # Most multi-file inputs accept newline-separated paths in one send_keys.
         target.send_keys("\n".join(paths))
-        uploaded = len(paths)
-        ui.info(f"   📎  uploaded {uploaded} file(s)")
+        _dispatch_upload_events(driver, target)
+        verified_count, verified_names, error_detail = _verify_page_attachments(
+            driver, basenames, timeout=5.0)
     except Exception as e:
-        # Fall back to one-at-a-time (input may be replaced between sends).
-        # Every failure here used to vanish into a bare `except: pass` — the
-        # short reason is kept now so a customer wondering why a file never
-        # showed up has something better than silence to go on.
         bulk_reason = str(e).strip().splitlines()[0][:120] if str(e).strip() else "no detail"
-        reasons = []
+
+    # Fall back to one-at-a-time or alternative candidate inputs if bulk produced 0 verified
+    if verified_count == 0 and not error_detail:
         for p in paths:
-            # EVERY matching input, not just the first. The try used to sit
-            # OUTSIDE this inner loop, so the first input raising jumped
-            # straight to the handler and the others were never reached —
-            # which made the fallback identical to the bulk attempt that had
-            # just failed. Pages that keep several file inputs around (a
-            # composer's, plus one behind an "attach" menu) only accept one
-            # of them, and it is not reliably the first in the DOM.
-            sent, detail = False, "no file input accepted it"
-            for inp in driver.find_elements(By.CSS_SELECTOR, sel):
+            sent = False
+            for inp in sorted_inputs:
                 try:
                     inp.send_keys(p)
+                    _dispatch_upload_events(driver, inp)
                     sent = True
                     break
-                except Exception as pe:
-                    text = str(pe).strip().splitlines()[0] if str(pe).strip() else ""
-                    detail = text[:120] or detail
-            if sent:
-                uploaded += 1
-            else:
-                reasons.append(f"{os.path.basename(p)} ({detail})")
-        if uploaded:
-            ui.info(f"   📎  uploaded {uploaded} file(s)")
-        if reasons:
-            ui.warn(f"   couldn't upload {len(reasons)} of {len(paths)} "
-                    f"file(s) to {who} — bulk upload failed ({bulk_reason}), "
-                    "then one-at-a-time failed too: "
-                    + "; ".join(reasons[:3])
-                    + (f" (+{len(reasons) - 3} more)" if len(reasons) > 3 else ""))
-    if not uploaded:
-        ui.warn(f"   ⚠️   0 of {len(paths)} attachment(s) reached {who} — "
-                "it will answer without ever seeing them")
-        return 0   # nothing reached the page — no ingest to wait for
+                except Exception:
+                    pass
+        if sent:
+            verified_count, verified_names, error_detail = _verify_page_attachments(
+                driver, basenames, timeout=4.0)
+
+    # Verification outcome check
+    if verified_count == 0:
+        if error_detail:
+            ui.warn(f"   ⚠️   0 of {len(paths)} attachment(s) reached {who} — "
+                    f"page reported: {error_detail}")
+        else:
+            ui.warn(f"   ⚠️   0 of {len(paths)} attachment(s) reached {who} — "
+                    "the page did not accept or display the attached files; "
+                    "it will answer blind to them")
+        return 0
+
+    uploaded = verified_count
+    ui.info(f"   📎  verified {uploaded} file(s) attached to {who}")
     if uploaded < len(paths):
-        ui.warn(f"   ⚠️   only {uploaded} of {len(paths)} attachment(s) "
-                f"uploaded to {who} — the rest never reached the page")
+        ui.warn(f"   ⚠️   only {uploaded} of {len(paths)} attachment(s) reached {who} — "
+                "the rest never appeared on the page")
+
     # Big files / multiple files take a while to ingest — submitting before the
-    # upload finishes silently drops the attachment. Wait a size-scaled floor,
-    # then keep waiting while the page still shows an upload spinner/progress
-    # bar, up to a size-scaled cap.
+    # upload finishes silently drops the attachment. Wait while the page still
+    # shows an upload spinner/progress bar, up to a size-scaled cap.
     total_mb = sum(a.get("size", 0) for a in attachments) / 1e6
-    floor = min(15 + int(total_mb * 4), 120)          # 6.5 MB → ~41s
-    cap = max(45, min(300, 30 + int(total_mb * 20)))  # 6.5 MB → 160s
+    cap = max(30, min(300, 20 + int(total_mb * 15)))
     start = time.time()
-    time.sleep(min(floor, cap))
+    time.sleep(2)  # brief pause to allow upload progressbar to mount
     while time.time() - start < cap:
         try:
             busy = driver.execute_script(
                 """
-                const sels = "[role='progressbar'], progress, .animate-spin, [aria-busy='true']";
+                const sels = "[role='progressbar'], progress, .animate-spin, [aria-busy='true'], [data-testid*='progress']";
                 return Array.from(document.querySelectorAll(sels))
                             .some(el => el.offsetParent !== null);
                 """)
@@ -1341,8 +1581,10 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
             busy = False
         if not busy:
             break
-        time.sleep(2)
-    ui.info(f"   📎  upload settled after {int(time.time() - start)}s")
+        time.sleep(1.5)
+    settled_secs = int(time.time() - start)
+    if settled_secs > 2:
+        ui.info(f"   📎  upload settled after {settled_secs}s")
     return uploaded
 
 
@@ -1558,7 +1800,7 @@ def _harvest_images(driver, agent_cfg, stage: str) -> list[dict]:
                     # from a file the client actually owns — they are not
                     # interchangeable when one of them is a logo.
                     "_generated": True})
-        if len(out) >= 4:
+        if len(out) >= 8:
             break
     return out
 
@@ -2487,7 +2729,8 @@ def _regenerate_once(driver, agent_cfg: dict) -> bool:
 
 
 def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
-                     grace: int | None = None, should_stop=None) -> int:
+                     grace: int | None = None, should_stop=None,
+                     baseline_count: int | None = None) -> int:
     """Wait for generated images to actually appear, then stop growing.
 
     _smart_wait watches TEXT, and during image generation the text is finished
@@ -2528,6 +2771,18 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
                        .test(document.body.innerText || '');
         return [n, px + ':' + sig, busy];
     """
+    # Capture the pre-generation page after Send but before the first poll:
+    # uploaded client images are already on that page and must not be counted
+    # as generated artwork. Subsequent image-tool turns pass their known
+    # count, so each one waits for a genuinely new asset.
+    if baseline_count is None:
+        try:
+            baseline_n, _baseline_sig, _baseline_busy = driver.execute_script(js, sel)
+            baseline_n = int(baseline_n or 0)
+        except Exception:
+            baseline_n = 0
+    else:
+        baseline_n = max(0, int(baseline_count))
     start, last, last_sig, steady = time.time(), 0, "", 0
     while time.time() - start < cap:
         # Four seconds a poll, and stop/skip checked every poll: this loop
@@ -2541,11 +2796,13 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
             n = int(n or 0)
         except Exception:
             continue
-        if n > last:
-            last, last_sig, steady = n, sig, 0
-            ui.info(f"   🖼️   {n} image(s) so far…")
-        elif last and sig != last_sig:
-            last_sig, steady = sig, 0      # a preview became the real thing
+        new_n = max(0, n - baseline_n)
+        # A generator can replace a preview in place. Its count stays the
+        # same, but its source signature changes; that is still evidence the
+        # new image is progressing, never a reason to idle until the cap.
+        if new_n > last or (last and sig != last_sig):
+            last, last_sig, steady = max(last, new_n), sig, 0
+            ui.info(f"   🖼️   {last} new image(s) so far…")
         elif last:
             steady += 4
             # Images that have been sitting there unchanged for 20s — and
@@ -2555,6 +2812,18 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
         elif grace is not None and not busy and time.time() - start >= grace:
             break   # nothing ever appeared — not this turn's kind of reply
     return last
+
+
+def _chatgpt_is_busy(driver) -> bool:
+    """True if ChatGPT is actively generating an image or answer."""
+    try:
+        return bool(driver.execute_script("""
+            const stopBtn = document.querySelector('button[aria-label*="Stop"], button[data-testid*="stop"]');
+            const busy = /creating image|generating image|rendering image|creating your image/i.test(document.body.innerText || '');
+            return Boolean(stopBtn || busy);
+        """))
+    except Exception:
+        return False
 
 
 def _wait_for_files(driver, cap: int = 60, grace: int = 12,
@@ -2765,6 +3034,13 @@ def _maker_brief(agent_name: str, agent_cfg: dict) -> str:
     makes = (agent_cfg or {}).get("makes", "")
     if not makes:
         return ""
+    if (agent_name == "ElevenLabs" or (agent_cfg or {}).get("runner") == "elevenlabs"
+            or "voice" in makes.lower() or "audio" in makes.lower()):
+        return (
+            f"You are {agent_name}. Create the voice-over audio for this deliverable. "
+            "Speak ONLY the dialogue and spoken narration lines below — do NOT speak "
+            "any instructions, scene labels, visual descriptions, or JSON syntax.\n\n"
+        )
     return (
         f"You are {agent_name}, and what I need from you is {makes}. Build "
         f"it here, in this tool — the thing itself is the deliverable of "
@@ -4073,9 +4349,10 @@ def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
                 pass
         if not clicked:
             box.send_keys(Keys.ENTER)
-        _smart_wait(driver, agent_cfg,
-                    wait or agent_cfg.get("wait_time", 60), expect=expect,
-                    should_stop=should_stop)
+        if wait >= 0:
+            _smart_wait(driver, agent_cfg,
+                        wait or agent_cfg.get("wait_time", 60), expect=expect,
+                        should_stop=should_stop)
         return _capture(driver, agent_cfg, keep=expect)
     except Exception as e:
         ui.err(f"   follow-up failed: {e}")
@@ -4237,11 +4514,13 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
     with open(spec_path, "w", encoding="utf-8") as f:
         _json.dump(new_spec, f, indent=2)
     ui.info(f"   🎬  re-filming {len(new_spec['scenes'])} scenes…")
-    # Follow-ups must pass the same browser preflight as first renders.  This
-    # used to be disabled here, allowing a changed scene to export clipped
-    # text, off-canvas imagery, or an unresolved asset even though refine_spec
-    # had already attempted a layout check.
-    _web.render(new_spec, out, on_progress=on_progress, check=True)
+    # Follow-ups must pass the same browser preflight as first renders.
+    try:
+        _web.render(new_spec, out, on_progress=on_progress, check=True)
+    except Exception as e:
+        ui.warn(f"   re-film preflight issue ({e}) — auto-healing accent and retrying…")
+        new_spec = _web.ensure_accent_applied(new_spec)
+        _web.render(new_spec, out, on_progress=on_progress, check=True)
     note = f"reel re-filmed — {os.path.basename(out)} ({'; '.join(notes)})"
     emit("stage_done", {"stage": "media", "count": 1, "texts": [note],
                         "url": out, "timed_out": False})
@@ -4361,13 +4640,43 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
     name = (spec.get("design") or {}).get("name", "")
     if name:
         ui.info(f"   🎨  design: {name}")
+
+    # If audio voice-over was generated in an earlier stage, scale scenes to match it
+    voice_files = [
+        a.get("path", "") for a in (attachments or [])
+        if isinstance(a, dict) and (
+            a.get("kind") == "audio" or
+            str(a.get("path", "")).lower().endswith(
+                (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"))
+        ) and os.path.isfile(a.get("path", ""))
+    ]
+    if voice_files:
+        try:
+            from . import footage as _footage
+            voice_dur = float(_footage.probe(voice_files[-1]).get("duration") or 0)
+            if voice_dur > 0 and spec.get("scenes"):
+                planned_secs = sum(float(sc.get("seconds", 4) or 4) for sc in spec["scenes"])
+                if planned_secs > 0 and voice_dur > planned_secs:
+                    scale = voice_dur / planned_secs
+                    for sc in spec["scenes"]:
+                        cur = float(sc.get("seconds", 4) or 4)
+                        sc["seconds"] = round(cur * scale, 2)
+                    ui.info(f"   ⏱️   scaled scenes to match {voice_dur:.1f}s voice-over")
+        except Exception:
+            pass
+
     secs = sum(float(sc.get("seconds", 4) or 4) for sc in spec["scenes"])
     ui.info(f"   🎬  filming {len(spec['scenes'])} scenes, ~{secs:.0f}s, "
             "1080x1920 — in a browser, locally")
     try:
         web.render(spec, out)
     except Exception as e:
-        return "", f"Render failed: {e}"
+        try:
+            ui.warn(f"   render preflight issue ({e}) — auto-healing accent and retrying…")
+            spec = web.ensure_accent_applied(spec)
+            web.render(spec, out)
+        except Exception as retry_err:
+            return "", f"Render failed: {retry_err}"
     for fault in (spec.get("_faults") or [])[:5]:
         ui.warn(f"   layout: {fault}")
     return out, f"reel filmed — {os.path.basename(out)}"
@@ -4420,6 +4729,33 @@ def _run_motion(prior_text, attachments, cfg: dict, brand: dict | None = None):
     _json.dump(spec, open(os.path.join(C.RUNS_DIR, f"motion_{stamp}.json"), "w"),
                indent=2)
 
+    # If audio voice-over was generated in an earlier stage, scale motion project duration
+    voice_files = [
+        a.get("path", "") for a in (attachments or [])
+        if isinstance(a, dict) and (
+            a.get("kind") == "audio" or
+            str(a.get("path", "")).lower().endswith(
+                (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"))
+        ) and os.path.isfile(a.get("path", ""))
+    ]
+    if voice_files:
+        try:
+            from . import footage as _footage
+            voice_dur = float(_footage.probe(voice_files[-1]).get("duration") or 0)
+            if voice_dur > 0 and spec.get("scenes"):
+                if "project" not in spec:
+                    spec["project"] = {}
+                spec["project"]["duration"] = voice_dur
+                planned_secs = sum(float(sc.get("duration", 4) or 4) for sc in spec["scenes"])
+                if planned_secs > 0 and voice_dur > planned_secs:
+                    scale = voice_dur / planned_secs
+                    for sc in spec["scenes"]:
+                        cur = float(sc.get("duration", 4) or 4)
+                        sc["duration"] = round(cur * scale, 2)
+                    ui.info(f"   ⏱️   scaled motion scenes to match {voice_dur:.1f}s voice-over")
+        except Exception:
+            pass
+
     dur = float((spec.get("project") or {}).get("duration", 8.0) or 8.0)
     ui.info(f"   🎬  rendering {len(spec.get('scenes', []))} scenes, "
             f"~{dur:.0f}s, 1080x1920 — locally")
@@ -4445,8 +4781,340 @@ def _studio_conversation(stages, stage: str, all_links: dict) -> dict:
     return {}
 
 
+def _footage_script(prior_text) -> list[dict]:
+    """Extract simple on-screen copy without imposing a template schema."""
+    import json as _json
+
+    def instruction_like(value: str) -> bool:
+        low = " ".join(value.lower().split())
+        return low.startswith((
+            "i want to ", "i need to ", "we want to ", "we need to ",
+            "please create ", "please make ", "create a reel ",
+            "create an instagram ", "make a reel ", "make an instagram ",
+        ))
+
+    sources = [prior_text] if isinstance(prior_text, str) else list(prior_text)
+    for source in sources:
+        text = str(source or "")
+        decoder = _json.JSONDecoder()
+        for start, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(text[start:])
+            except (TypeError, ValueError):
+                continue
+            scenes = candidate.get("scenes") if isinstance(candidate, dict) else None
+            if not isinstance(scenes, list):
+                continue
+            captions = []
+            for scene in scenes:
+                if not isinstance(scene, dict):
+                    continue
+                value = (scene.get("caption") or scene.get("on_screen_text")
+                         or scene.get("subtitles") or scene.get("headline")
+                         or scene.get("text"))
+                if not value and isinstance(scene.get("lines"), list):
+                    value = " ".join(str(v) for v in scene["lines"] if v)
+                if value and not instruction_like(str(value)):
+                    item = {"text": str(value),
+                            "seconds": scene.get("seconds", 3)}
+                    for k in ("kicker", "badge", "tag"):
+                        if scene.get(k):
+                            item["kicker"] = str(scene[k])
+                            break
+                    for k in ("highlight", "focus", "accent"):
+                        if scene.get(k):
+                            item["highlight"] = str(scene[k])
+                            break
+                    for k in ("style", "theme", "archetype"):
+                        if scene.get(k):
+                            item["style"] = str(scene[k]).lower().strip()
+                            break
+                    for k in ("position", "pos", "placement"):
+                        if scene.get(k):
+                            item["position"] = str(scene[k]).lower().strip()
+                            break
+                    for k in ("sub", "subline", "subtitle", "secondary"):
+                        if scene.get(k):
+                            item["sub"] = str(scene[k]).strip()
+                            break
+                    if scene.get("transition"):
+                        item["transition"] = str(scene["transition"])
+                    captions.append(item)
+            if captions:
+                return captions
+
+    # Prose and labelled script fallback: when the writer did not format as JSON
+    import re as _re
+    for source in sources:
+        text = str(source or "")
+        labelled = _re.findall(
+            r"(?im)^\s*(?:(?:scene\s*\d+[\s:\.\)]*)?(?:caption|on[- ]screen text|subtitle|text)\s*:\s*)[\"']?([^\n\"']+)[\"']?\s*$",
+            text)
+        found = []
+        for line in labelled:
+            clean = " ".join(line.strip().strip('"\'').split())
+            if clean and not instruction_like(clean) and len(clean) > 2 and not clean.lower().startswith(("scene ", "voice", "audio", "duration")):
+                found.append({"text": clean, "seconds": 3})
+        if found:
+            return found
+
+        numbered = _re.findall(r"(?m)^\s*(?:\d+[\.\)]|scene\s+\d+[:\.\)])\s*[\"']?([^\n\"']+)[\"']?\s*$", text)
+        for line in numbered:
+            clean = " ".join(line.strip().strip('"\'').split())
+            if ":" in clean:
+                sub_parts = clean.split(":", 1)
+                if any(k in sub_parts[0].lower() for k in ("caption", "text", "screen")):
+                    clean = sub_parts[1].strip().strip('"\'')
+                elif any(k in sub_parts[0].lower() for k in ("voice", "audio", "vo")):
+                    continue
+            if clean and not instruction_like(clean) and len(clean) > 2 and not clean.lower().startswith(("scene ", "duration", "visual", "audio")):
+                found.append({"text": clean, "seconds": 3})
+        if found:
+            return found
+    return []
+
+
+def _voiceover_text(prior_text) -> str:
+    """The spoken words only — never the pipeline prompt or scene JSON."""
+    import json as _json
+
+    sources = [prior_text] if isinstance(prior_text, str) else list(prior_text)
+    for source in sources:
+        text = str(source or "")
+        decoder = _json.JSONDecoder()
+        for start, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(text[start:])
+            except (TypeError, ValueError):
+                continue
+            scenes = candidate.get("scenes") if isinstance(candidate, dict) else None
+            if not isinstance(scenes, list):
+                continue
+            spoken = []
+            for scene in scenes:
+                if not isinstance(scene, dict):
+                    continue
+                explicit = (scene.get("voiceover") or scene.get("voice_over")
+                            or scene.get("narration") or scene.get("spoken"))
+                if explicit:
+                    parts = ([explicit] if isinstance(explicit, str)
+                             else explicit if isinstance(explicit, list) else [])
+                else:
+                    # Studio's established script schema carries headline and
+                    # support rather than a dedicated voiceover field. Those
+                    # are finished client-facing words; kicker is a visual
+                    # label and is deliberately not read aloud.
+                    parts = [scene.get("headline"), scene.get("support")]
+                    if not any(parts) and isinstance(scene.get("lines"), list):
+                        parts = scene["lines"]
+                for part in parts:
+                    clean = " ".join(str(part or "").split())
+                    if clean and clean not in spoken:
+                        spoken.append(clean)
+            if spoken:
+                return " ".join(
+                    value if value.endswith((".", "!", "?")) else value + "."
+                    for value in spoken)[:5000]
+
+    # A few script writers return labelled prose rather than JSON. Read only
+    # explicitly marked VO lines; falling back to the whole response would
+    # send headings, directions and Prism's handoff rules to speech synthesis.
+    import re as _re
+    marked = []
+    for source in sources:
+        for value in _re.findall(
+                r"(?im)^\s*(?:voice[ -]?over|vo|narration)\s*:\s*(.+)$",
+                str(source or "")):
+            clean = " ".join(value.split())
+            if clean:
+                marked.append(clean)
+    return " ".join(marked)[:5000]
+
+
+def _run_elevenlabs(driver, agent_cfg: dict, narration: str,
+                    should_stop=None) -> list[str]:
+    """Drive ElevenLabs' speech form, which is not a chat composer."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    narration = " ".join(str(narration or "").split()).strip()
+    if not narration:
+        raise RuntimeError(
+            "the writing step supplied no spoken voice-over lines, so Prism "
+            "did not send pipeline instructions to ElevenLabs")
+
+    box = WebDriverWait(driver, agent_cfg.get("input_wait", 20)).until(
+        EC.presence_of_element_located(
+            (By.CSS_SELECTOR, agent_cfg["textarea_selector"])))
+    try:
+        box.click()
+        box.send_keys(Keys.CONTROL, "a")
+        box.send_keys(Keys.BACKSPACE)
+    except Exception:
+        pass
+    if not _fast_type(driver, box, narration):
+        box.send_keys(narration)
+    # Notify React that the textarea content has changed so internal state updates
+    try:
+        driver.execute_script(
+            "arguments[0].dispatchEvent(new Event('input', { bubbles: true }));"
+            "arguments[0].dispatchEvent(new Event('change', { bubbles: true }));",
+            box)
+    except Exception:
+        pass
+
+    if not _text_landed(_composer_text(driver, box), narration):
+        raise RuntimeError("the narration would not go into ElevenLabs' text field")
+
+    signature_js = """
+        const audio = [...document.querySelectorAll('audio')]
+          .map(a => a.currentSrc || a.src || '').filter(Boolean);
+        const downloads = [...document.querySelectorAll('a[href], button')]
+          .filter(e => /download/i.test((e.innerText || '') + ' ' +
+                                       (e.getAttribute('aria-label') || '')))
+          .map(e => (e.href || '') + '|' + (e.innerText || '').trim());
+        return JSON.stringify({audio, downloads});
+    """
+    try:
+        before = driver.execute_script(signature_js) or ""
+    except Exception:
+        before = ""
+
+    find_button_js = """
+        const preferred = ['generate speech', 'generate voice', 'convert to speech',
+                           'synthesize', 'generate', 'create speech', 'generate audio'];
+        // 1. Try testids or submit buttons
+        const testBtn = document.querySelector(
+            'button[data-testid*="generate"], [data-testid*="speech-synthesis-generate"], [data-testid*="generate-button"], button[type="submit"]');
+        if (testBtn && !testBtn.disabled && !testBtn.getAttribute('aria-disabled')) {
+            return testBtn;
+        }
+        // 2. Search all buttons and role="button" elements
+        const candidates = [...document.querySelectorAll('button, [role="button"]')];
+        for (const pref of preferred) {
+            for (const btn of candidates) {
+                const text = ((btn.innerText || '') + ' ' + (btn.getAttribute('aria-label') || '') + ' ' + (btn.getAttribute('data-testid') || '')).toLowerCase();
+                if (text.includes(pref) && !btn.disabled && !btn.getAttribute('aria-disabled')) {
+                    return btn;
+                }
+            }
+        }
+        return null;
+    """
+
+    generate = None
+    deadline_btn = time.time() + 15
+    while time.time() < deadline_btn:
+        if should_stop and should_stop():
+            return []
+        try:
+            candidate = driver.execute_script(find_button_js)
+            if candidate is not None:
+                generate = candidate
+                break
+        except Exception:
+            pass
+        try:
+            candidates = driver.find_elements(By.CSS_SELECTOR, "button, [role='button']")
+            for wanted in ("generate speech", "generate voice", "convert to speech",
+                           "synthesize", "generate", "create speech", "generate audio"):
+                for b in candidates:
+                    try:
+                        lbl = " ".join(((b.text or "") + " " +
+                                        (b.get_attribute("aria-label") or "") + " " +
+                                        (b.get_attribute("data-testid") or "")).lower().split())
+                        if b.is_displayed() and b.is_enabled() and wanted in lbl:
+                            generate = b
+                            break
+                    except Exception:
+                        continue
+                if generate is not None:
+                    break
+            if generate is not None:
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    if generate is None:
+        raise RuntimeError(
+            "Prism could not find ElevenLabs' Generate speech button; its "
+            "page layout may have changed")
+
+    try:
+        generate.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", generate)
+    ui.info(f"   🔊  sent {len(narration.split())} spoken words only — "
+            "waiting for the audio…")
+    deadline = time.time() + max(45, int(agent_cfg.get("wait_time", 90)))
+    while time.time() < deadline:
+        if should_stop and should_stop():
+            return []
+        time.sleep(2)
+        try:
+            after = driver.execute_script(signature_js) or ""
+            if after and after != before and ("audio" in after or "download" in after.lower()):
+                return [f"Voice-over generated from {len(narration.split())} spoken words."]
+        except Exception:
+            continue
+    raise RuntimeError(
+        "ElevenLabs accepted the narration, but no new audio player or "
+        "download appeared before the wait ended")
+
+
+def _run_footage(prior_text, attachments, cfg: dict, on_progress=None):
+    """Cut attached client clips, then add planned captions and voice-over."""
+    try:
+        from . import footage
+        from . import config as C
+    except Exception as e:
+        return "", f"The client-footage editor isn't available ({e})."
+
+    def _path_of(item):
+        if isinstance(item, dict):
+            return str(item.get("path", "") or "")
+        return str(item or "")
+
+    videos = [_path_of(a) for a in (attachments or [])
+              if footage.is_video(_path_of(a))]
+    audio = [_path_of(a) for a in (attachments or [])
+             if str(_path_of(a)).lower().endswith(footage.AUDIO_SUFFIXES)
+             and os.path.isfile(_path_of(a))]
+    if not audio and cfg.get("audio_path") and os.path.isfile(cfg["audio_path"]):
+        audio = [cfg["audio_path"]]
+    captions = _footage_script(prior_text)
+    if not captions:
+        return "", ("The writing step did not return usable reel captions. "
+                    "Prism refused to put the task instruction itself on "
+                    "the client video; run the caption step again.")
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    out = os.path.join(C.RUNS_DIR, f"client_reel_{int(time.time())}.mp4")
+    ui.info(f"   🎬  editing {len(videos)} client clip(s), "
+            f"{len(captions)} caption(s)"
+            + (" + voice-over" if audio else ""))
+    try:
+        footage.render(videos, out, captions=captions,
+                       audio_path=audio[-1] if audio else "",
+                       on_progress=on_progress)
+    except Exception as e:
+        return "", f"Client-footage edit failed: {e}"
+    details = [f"{len(videos)} clips", f"{len(captions)} dynamic motion captions"]
+    if len(videos) > 1:
+        details.append(f"{len(videos) - 1} transitions")
+    details.append("voice-over replaces camera audio" if audio else "silent picture edit")
+    return out, f"client footage edited — {os.path.basename(out)} ({', '.join(details)})"
+
+
 def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
-               brand: dict | None = None, studio: dict | None = None):
+               brand: dict | None = None, studio: dict | None = None,
+               on_progress=None):
     """Execute an agent that lives in Prism rather than in a browser.
 
     prior_text is either a single string or the earlier stages' outputs,
@@ -4457,6 +5125,12 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
     message explains what went wrong — a local stage must degrade the same
     way a scraped one does, never take the run down with it.
     """
+    if kind == "reel_web" and any(
+            str(a.get("path", "")).lower().endswith(
+                (".mov", ".mp4", ".m4v", ".webm"))
+            for a in (attachments or [])):
+        return _run_footage(prior_text, attachments, cfg,
+                            on_progress=on_progress)
     if kind == "reel_web":
         return _run_studio(prior_text, attachments, cfg, brand, studio=studio)
     if kind == "motion":
@@ -4625,6 +5299,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     from . import skills as SK
 
     attachments = attachments or []
+    source_footage = [a for a in attachments
+                      if str(a.get("path", "")).lower().endswith(
+                          (".mov", ".mp4", ".m4v", ".webm"))]
+    browser_attachments = [a for a in attachments if a not in source_footage]
 
     # "Reply in Gujarati", if the user asked for it. Resolved once per run
     # rather than per prompt: it is the same sentence every time, and reading
@@ -4649,8 +5327,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # its file/vision handling is the most reliable of the web tools. If this
     # stage fails, `prior` stays empty and the next stage gets the raw files
     # re-supplied, so the run degrades gracefully to the old behaviour.
-    if attachments and chatgpt_analysis and stages[0][1] != "ChatGPT":
-        names = ", ".join(a["name"] for a in attachments)
+    if browser_attachments and chatgpt_analysis and stages[0][1] != "ChatGPT":
+        names = ", ".join(a["name"] for a in browser_attachments)
         goal = f" for this task: {query}" if query.strip() else " for the user's task"
         q = (f"Your ONLY task is: analyse the attached file(s) ({names}) thoroughly — "
              "their content, structure, key facts, numbers, data and style — and "
@@ -4661,6 +5339,29 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         stages.insert(0, ("analysis", "ChatGPT", [q]))
         ui.info("📎  attachments present — ChatGPT will analyse the files first")
 
+    # The script writer needs to know what each source shot actually shows,
+    # but uploading hundreds of megabytes of client MOVs to every browser tool
+    # is slow and unnecessary. Give it labelled opening/action frames per
+    # planned clip instead. The full-resolution footage never leaves the local
+    # editor; ElevenLabs is explicitly excluded from attachments below.
+    early_studio = any(
+        (A.resolve_agent("", agent) or {}).get("local") == "reel_web"
+        for _stage, agent, _questions in stages)
+    if source_footage and early_studio:
+        try:
+            from . import footage as _footage_preview
+            sheet = _footage_preview.storyboard_sheet(
+                [item.get("path", "") for item in source_footage])
+            if sheet:
+                preview = F.attach(sheet)
+                preview["_generated"] = True
+                preview["name"] = "client-footage-storyboard.jpg"
+                browser_attachments.append(preview)
+                ui.info(f"🎬  prepared a {len(source_footage)}-shot visual "
+                        "storyboard for the caption writer")
+        except Exception as e:
+            ui.warn(f"   couldn't prepare the footage storyboard ({e})")
+
     # A local renderer draws whatever the stage before it hands over, so that
     # stage has to hand over a scene spec rather than prose. Rather than
     # making the router understand renderers, the requirement is appended to
@@ -4670,9 +5371,73 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # needs TWO writing passes before it: one for the words, one for the art
     # direction. Splitting them is the point — a single reply that has to do
     # both produces a design that describes itself instead of one that exists.
+    # Studio owns its artwork batch: it needs the files collected and named
+    # before the art director begins. Leaving the router's ordinary `visual`
+    # stage in as well opened the same image tool twice (once for `visual`,
+    # again for `artwork`) and looked like Prism was endlessly retyping the
+    # job. This is one deliverable, not two. Keep the owner's visual toggle:
+    # it is still consulted below before the one Studio artwork stage is
+    # inserted.
+    has_studio = any((A.resolve_agent("", an) or {}).get("local") == "reel_web"
+                     for _, an, _ in stages)
+    if has_studio:
+        stages = [item for item in stages if item[0] != "visual"]
+
     studio_at = next((i for i, (_, an, _) in enumerate(stages)
                       if (A.resolve_agent("", an) or {}).get("local") == "reel_web"),
                      None)
+    footage_writer = None
+    if studio_at is not None and source_footage:
+        # Source clips change Studio's job from generation to editing. Keep
+        # the planned content and audio stages (their captions and ElevenLabs
+        # file feed the edit), but do not append Studio's HTML scene prompts
+        # or insert generated artwork. The local renderer detects the footage
+        # below and performs the cut instead.
+        ui.info(f"🎞️   {len(source_footage)} source video(s) attached — "
+                "Studio will edit them using the planned text and audio")
+        writer = next((i for i in range(studio_at - 1, -1, -1)
+                       if stages[i][0] in ("content", "brains")), None)
+        if writer is not None and stages[writer][2]:
+            st, agent, prompts = stages[writer]
+            prompts = list(prompts)
+            prompts[-1] += (
+                "\n\nCLIENT-FOOTAGE EDIT SCRIPT & DIRECTION: Reply with a concise JSON "
+                "object containing a scenes array. Write exactly "
+                f"{len(source_footage)} scenes, matching the supplied CLIP storyboard.\n\n"
+                "STUDIO COPYWRITING & VOICEOVER STANDARDS (NO AI SLOP):\n"
+                "• KILL CORPORATE ROBOTIC SLOP: Absolutely forbidden words and clichés: "
+                "'cutting-edge', 'game-changer', 'elevate', 'seamless', 'revolutionize', "
+                "'unparalleled', 'delve', 'testament', 'beacon', 'symphony', 'masterpiece', "
+                "'in today's fast-paced world', 'journey of'. Never write generic brochure or LinkedIn ad copy.\n"
+                "• SPOKEN VOICEOVER (narration): Write for an authentic, compelling human voice actor speaking with "
+                "emotion, tension, curiosity, and conviction. Use conversational breathing pauses "
+                "(..., —, and short rhythmic clauses) so ElevenLabs speaks naturally. Hook the viewer in Scene 1 "
+                "with an intriguing truth, tension, or visceral detail. Use sensory words (friction, "
+                "heat, sound, weight, precision) and relatable human stakes.\n"
+                "• DYNAMIC ON-SCREEN CAPTIONS: Captions are high-impact kinetic punchlines (2 to 5 words max!), "
+                "NOT verbatim subtitles of the voiceover. For stacked 2-line contrasting typography, provide "
+                "'caption' (primary line) and optional 'sub' (secondary contrasting line), or separate with a slash "
+                "(e.g. 'Boring / subtitles' or 'But if you do / the math').\n"
+                "• VISUAL STYLE & POSITION: Set 'style' to 'creator' (punchy 3D stacked), 'editorial' "
+                "(elegant high-contrast serif), or 'neon' (sleek cyber scan glow). Set 'position' to 'upper', "
+                "'center', or 'lower' to keep captions dynamic across scenes.\n\n"
+                "SCHEMA PER SCENE:\n"
+                "{\n"
+                '  "seconds": <float>,\n'
+                '  "caption": "<short 2-5 word visual hook>",\n'
+                '  "sub": "<optional second contrasting line>",\n'
+                '  "voiceover": "<natural spoken human line with pauses ...>",\n'
+                '  "kicker": "<optional micro eyebrow label>",\n'
+                '  "highlight": "<focal word to ignite with color>",\n'
+                '  "style": "creator" | "editorial" | "neon",\n'
+                '  "position": "upper" | "center" | "lower"\n'
+                "}\n\n"
+                "The attached labelled client-footage storyboard is authoritative: scene 1 describes "
+                "CLIP 1, scene 2 CLIP 2, and so on. Never claim an action or result that its corresponding "
+                "OPEN/ACTION frames do not visibly support.")
+            stages[writer] = (st, agent, prompts)
+            footage_writer = writer
+        studio_at = None
     design_feeder = None
     script_stage = ""
     research_stage = ""
@@ -4685,6 +5450,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # refuses outright rather than picking one. Each entry here replaces those
     # rules for that stage.
     machine_stages: dict[int, str] = {}
+    if footage_writer is not None:
+        machine_stages[footage_writer] = (
+            "\n\nSTRICT PIPELINE RULES:\n"
+            "Your answer is parsed by Prism and then passed to the audio "
+            "step. Return only the requested JSON object. Do not add "
+            "markdown fences, commentary, a handoff, or a follow-up question.")
     if studio_at is not None:
         # The stage that actually WRITES the reel — content's job by
         # PIPELINE_ORDER's own description ("copy, docs, scripts"), brains
@@ -4784,6 +5555,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 studio_at += 1
                 ui.info(f"🖼️   {maker} will search the web and make up to "
                         f"{_web.MAX_GENERATED} images for it")
+
+            # The studio pipeline follows the order:
+            # write up -> image -> artwork -> audio if needed -> design -> render
+            audio_idx = next((i for i, (st, _, _) in enumerate(stages) if st == "audio"), None)
+            if audio_idx is not None:
+                audio_entry = stages.pop(audio_idx)
+                if audio_idx < studio_at:
+                    studio_at -= 1
+                stages.insert(studio_at, audio_entry)
+                studio_at += 1
 
             # The art director is the same tool as the writer unless a
             # stronger one is switched on: this pass is the harder of the two.
@@ -5029,8 +5810,36 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                (attachments or []) + pipeline_files,
                                cfg, stage, brand=studio_brand,
                                studio=_studio_conversation(
-                                   stages, stage, all_links))
+                                   stages, stage, all_links),
+                               on_progress=lambda d, t: emit(
+                                   "local_progress", {"stage": stage,
+                                                      "done": d, "total": t}))
         if out:
+            voice_files = [
+                item.get("path", "") for item in pipeline_files
+                if (item.get("kind") == "audio" or
+                    str(item.get("path", "")).lower().endswith(
+                        (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac")))
+                and os.path.isfile(item.get("path", ""))
+            ]
+            # Studio/Reel/Motion render their picture locally. When an audio
+            # stage ran before them, finish the deliverable here by muxing its
+            # downloaded track into that MP4. Client-footage renders already
+            # do this inside _run_footage because their duration planning uses
+            # the voice track, so do not needlessly replace it a second time.
+            if voice_files and "voice-over" not in note:
+                try:
+                    from . import footage as _footage
+                    ui.info("   🔊  adding the generated voice-over to the video…")
+                    _footage.mix_audio(out, voice_files[-1])
+                    note += " · voice-over mixed"
+                except Exception as e:
+                    error = ("The video rendered, but Prism could not add the "
+                             f"generated voice-over: {e}")
+                    ui.err(error)
+                    emit("stage_error", {"stage": stage, "error": error,
+                                         "url": out})
+                    return
             # Keep the internal reel_<timestamp> working name, but make
             # the customer-facing artifact describe the original request.
             try:
@@ -5119,6 +5928,52 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         [(_st, stage_kinds[_i]) for _i, (_st, _a, _q) in enumerate(stages)])
     delivered: dict[str, int] = {}
 
+    def _open_agent_page(agent_name: str, agent_cfg: dict, stage: str) -> None:
+        """Open a stage's agent page, relaunching once if Chrome loses its tab.
+
+        A Chrome window may still be visible after its renderer has vanished;
+        WebDriver then raises ``no such window`` on navigation.  Retrying here
+        is safe because no upload or prompt has happened yet, and it prevents
+        a transient browser failure from cancelling the whole client reel.
+        """
+        nonlocal driver, first_tab
+        global _active_driver
+        target = (resume_urls or {}).get(stage) or agent_cfg["url"]
+        last_error = None
+        for attempt in range(2):
+            try:
+                _ensure_active_window(driver)
+                if not first_tab:
+                    _open_tab(driver, agent_name)
+                first_tab = False
+                _ensure_active_window(driver)
+                try:
+                    driver.get(target)
+                except Exception as get_err:
+                    if _browser_is_gone(get_err) and _ensure_active_window(driver):
+                        driver.get(target)
+                    else:
+                        raise get_err
+                time.sleep(agent_cfg.get("page_wait", 4))
+                if not _driver_has_live_tab(driver):
+                    raise RuntimeError("browser has closed its controlled agent tab")
+                return
+            except Exception as error:
+                last_error = error
+                if attempt or not _browser_is_gone(error):
+                    raise
+                ui.warn(f"   Chrome lost its tab while opening {agent_name} — "
+                        "relaunching it once before the prompt is sent")
+                try:
+                    if driver is not None:
+                        driver.quit()
+                except Exception:
+                    pass
+                _active_driver = None
+                _release_profile()
+                driver, first_tab = _get_driver(cfg)
+        raise last_error  # pragma: no cover - the loop always returns or raises
+
     for stage_idx, (stage, agent_name, questions) in enumerate(stages):
         # Per stage, never carried: see the skill check below.
         skill_keys, skill_task_text = [], ""
@@ -5191,12 +6046,18 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         # retry pass, with whatever that pass recovered. (Its card stays
         # queued meanwhile: no stage_start is emitted until it really runs.)
         if agent_cfg.get("local"):
+            has_spec = any(
+                ('"scenes"' in t or '"html"' in t)
+                for ts in all_responses.values() for t in ts)
+            feeder_st = stages[design_feeder][0] if design_feeder is not None else ""
+            critical_missing = not has_spec and (feeder_st in failures or spec_feeder in failures)
             if failover and failures:
-                deferred_locals.append((stage, agent_name, agent_cfg))
-                ui.warn(f"   ⏸  {stage}: holding until "
-                        f"{', '.join(failures)} has been retried — it feeds "
-                        "this step")
-                continue
+                if critical_missing:
+                    deferred_locals.append((stage, agent_name, agent_cfg))
+                    ui.warn(f"   ⏸  {stage}: holding until "
+                            f"{', '.join(failures)} has been retried — it feeds "
+                            "this step")
+                    continue
             _run_local_stage(stage, agent_name, agent_cfg)
             continue
 
@@ -5205,15 +6066,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 
         timed_out = False
         try:
-            if not first_tab:
-                _open_tab(driver, agent_name)
-            first_tab = False
-            # A follow-up RESUMES the exact conversation this stage answered in
-            # (its saved tab URL) instead of the tool's blank home page — so it
-            # continues the SAME chat, with all its context, rather than opening
-            # a fresh one. resume_urls is empty on an ordinary run.
-            driver.get((resume_urls or {}).get(stage) or agent_cfg["url"])
-            time.sleep(agent_cfg.get("page_wait", 4))
+            # A follow-up resumes its exact saved chat URL.  The helper also
+            # recovers once if Chrome's visible window lost its controlled tab
+            # before any prompt/upload could be duplicated.
+            _open_agent_page(agent_name, agent_cfg, stage)
 
             # Only NON-EMPTY prior outputs count — a failed scrape must not
             # inject an empty "[STAGE]" block downstream.
@@ -5238,14 +6094,19 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # travel only to the stages that make the deliverable.
             producer = stage in ("visual", "media", "development",
                                  "presentation", "format", "artwork")
-            include_attachment = bool(attachments)
+            # Source video is never sent to browser tools for a local edit.
+            # The writing/audio stages need the brief and script, not hundreds
+            # of megabytes of client footage; the local renderer receives the
+            # originals through `attachments` in _run_local_stage above.
+            include_attachment = (bool(browser_attachments)
+                                  and agent_cfg.get("runner") != "elevenlabs")
             # Producers also receive files GENERATED by earlier stages
             # (e.g. the logo the visual stage just made) — those can't
             # travel in a text handoff at all.
-            send_files = (attachments if include_attachment else []) + \
+            send_files = (browser_attachments if include_attachment else []) + \
                          (pipeline_files if producer else [])
             went_up = 0
-            if send_files:
+            if send_files and agent_cfg.get("runner") != "elevenlabs" and agent_name != "ElevenLabs":
                 went_up = _upload_files(driver, agent_cfg, send_files, agent_name)
 
             # Relay hand-off: forward ONLY the most recent stage's output.
@@ -5256,11 +6117,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # The person's own words first, before the attachments and before
             # the previous stage's handoff. Whatever else gets crowded out of
             # a long prompt, this must not be it.
+            _kind = stage_kinds.get(stage_idx, "text")
             context = _intent_block(query)
+            if _kind == "text" and any(w in (query or "").lower() for w in (
+                    "image", "picture", "photo", "drawing", "visual", "artwork",
+                    "video", "reel", "audio", "voice")):
+                context += (
+                    "NOTE ON MEDIA: The user's request asks for generated media "
+                    "(images, audio, or video). However, media generation is "
+                    "handled by dedicated later stages in this pipeline. For "
+                    "THIS step, do NOT generate images or call image creation "
+                    "tools — reply strictly with written text.\n\n"
+                )
             if include_attachment:
                 # Built per stage, not once: whether the files went UP to
                 # this tool decides whether their text is pasted in as well.
-                context += F.context_block(attachments, uploaded=bool(went_up))
+                context += F.context_block(browser_attachments,
+                                           uploaded=bool(went_up))
             if producer and pipeline_files:
                 # Not always pictures any more — _harvest_files also lands
                 # generated documents, decks, code and archives here, so the
@@ -5390,6 +6263,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # with no words in them. Not said on a `file` step — there
                 # the panel IS the deliverable.
                 _drift = (agent_cfg.get("avoid") or "").strip()
+                if "image" in agent_cfg.get("produces", ()):
+                    image_guard = "Do not generate images or call image tools for this step — reply in written text only."
+                    if image_guard.lower() not in _drift.lower():
+                        _drift = f"{_drift} {image_guard}".strip() if _drift else image_guard
                 if _drift:
                     handoff = "\n\n" + _drift + handoff
 
@@ -5427,6 +6304,17 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                          + handoff)
                 stage_responses = _run_canva(driver, agent_cfg, stage,
                                              canva_prompt, should_stop=stage_halt)
+            elif agent_cfg.get("runner") == "elevenlabs":
+                # ElevenLabs is a speech form, not a chat agent. It receives
+                # only words that should be spoken — no task brief, attached
+                # artwork, JSON, handoff rules or "produce an MP3" wrapper.
+                voice_sources = [
+                    text for _prior_stage, texts in reversed(prior)
+                    for text in texts if str(text).strip()]
+                narration = _voiceover_text(voice_sources)
+                ui.info(f"   → narration only: {len(narration.split())} words")
+                stage_responses = _run_elevenlabs(
+                    driver, agent_cfg, narration, should_stop=stage_halt)
             elif agent_name == "NotebookLM":
                 # NotebookLM is not a chat box — it's a "sources" notebook
                 # (add a source, then either ask about it or generate a
@@ -5555,7 +6443,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         except Exception:
                             pass
 
-                        full_prompt = ((context + prompt) if (idx == 1 and context) else prompt) + handoff
+                        if stage == "audio":
+                            spoken = _voiceover_text([t for ts in reversed(list(all_responses.values())) for t in ts if t.strip()])
+                            if spoken:
+                                full_prompt = f"Record this voice-over narration aloud. Return the generated audio file:\n\n{spoken}"
+                            else:
+                                full_prompt = prompt
+                        else:
+                            full_prompt = ((context + prompt) if (idx == 1 and context) else prompt) + handoff
                         if idx == 1:
                             # A maker hears what it is for before anything
                             # else -- see _maker_brief.
@@ -5661,6 +6556,84 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                        "reason": note, "exhausted": False}
                     continue
 
+                # A promised image is not a text answer. ChatGPT commonly
+                # writes its tiny acknowledgement immediately, then draws in
+                # a side pane; `_smart_wait` cannot see that pane and used to
+                # consume the entire agent timer before `_wait_for_images`
+                # was even allowed to look. Start the image watcher as soon
+                # as the prompt has landed. Once its finished-picture check
+                # returns, the deliverable is ready — do not make the owner
+                # wait for an unrelated prose timer.
+                promised = set(image_stages or ())
+                got = 0
+                image_is_deliverable = stage == "artwork" or stage in promised
+                if image_is_deliverable:
+                    from . import reel_web as _rw
+                    want, image_cap = ((_rw.MAX_GENERATED, 300)
+                                       if stage == "artwork" else (1, 420))
+                    ui.info(f"   ⏳  watching for the pictures to finish "
+                            f"rendering (up to {image_cap}s)…")
+                    got = _wait_for_images(driver, agent_cfg, want,
+                                           cap=image_cap, grace=None,
+                                           should_stop=stage_halt)
+                    # Image agents commonly honour the first tool call but
+                    # stop there even when their prose instruction asks for a
+                    # set. Make the remaining artwork calls explicit, in the
+                    # same chat, and watch each one directly — no prose timer
+                    # sits between an already-finished image and Prism.
+                    if stage == "artwork" and got < want:
+                        js_img_count = (
+                            "let n = 0; "
+                            "for (const img of document.querySelectorAll('img')) { "
+                            "  if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256) n++; "
+                            "} "
+                            "return n;"
+                        )
+                        while got < want and not stage_halt():
+                            # Ensure any previous generation is completely finished before typing
+                            settle_deadline = time.time() + 60
+                            while time.time() < settle_deadline and not stage_halt():
+                                if not _chatgpt_is_busy(driver):
+                                    break
+                                time.sleep(2)
+
+                            try:
+                                before_dom = int(driver.execute_script(js_img_count) or 0)
+                            except Exception:
+                                before_dom = 0
+
+                            number = got + 1
+                            _reask(
+                                driver, agent_cfg,
+                                f"Now create artwork asset {number} of {want}. "
+                                "Make it a different single reusable visual "
+                                "ingredient for this reel, with no text or "
+                                "multi-panel layout. Use the image tool now.",
+                                wait=-1, should_stop=stage_halt)
+
+                            # Wait for this new asset to finish rendering
+                            time.sleep(4)
+                            wait_start = time.time()
+                            asset_finished = False
+                            while time.time() - wait_start < image_cap and not stage_halt():
+                                if _sleep_interruptibly(4, stage_halt):
+                                    break
+                                busy = _chatgpt_is_busy(driver)
+                                try:
+                                    cur_dom = int(driver.execute_script(js_img_count) or 0)
+                                except Exception:
+                                    cur_dom = before_dom
+                                if cur_dom > before_dom and not busy:
+                                    asset_finished = True
+                                    break
+
+                            if asset_finished:
+                                got += 1
+                                ui.info(f"   🖼️   artwork asset {got} of {want} completed")
+                            else:
+                                ui.warn(f"   ⚠️  could not generate artwork asset {number}")
+                                break
+
                 # `min_wait` raises the ceiling for a run that redoes whole
                 # deliverables — a follow-up — where the tool's everyday
                 # budget cut the answer off mid-way. A ceiling only: the
@@ -5680,10 +6653,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     # without a marker a pause reads as "finished" and we scrape
                     # the preamble before the JSON has been written.
                     expect = '"scenes"'
-                ui.info(f"   ⏳  waiting up to {wait}s for {agent_name} to finish…")
-                emit("waiting", {"stage": stage, "seconds": wait})
-                took, settled = _smart_wait(driver, agent_cfg, wait,
-                                            expect=expect, should_stop=stage_halt)
+                if got and image_is_deliverable:
+                    took, settled = 0, True
+                    ui.info("   ✓  finished image detected — continuing now")
+                else:
+                    ui.info(f"   ⏳  waiting up to {wait}s for {agent_name} to finish…")
+                    emit("waiting", {"stage": stage, "seconds": wait})
+                    took, settled = _smart_wait(driver, agent_cfg, wait,
+                                                expect=expect, should_stop=stage_halt)
                 if skip_requested() and not stopped():
                     # "Skip this step": keep whatever the tool had produced —
                     # exactly as a Stop would — and carry on with the NEXT
@@ -5748,9 +6725,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     ui.warn(f"still generating after {took}s — scraping what "
                             f"is on the page and keeping the link")
 
-                promised = set(image_stages or ())
-                got = 0            # images that rendered this turn, if any
-                if stage in ("artwork", "visual", "media") or stage in promised:
+                if (not got and not image_is_deliverable
+                        and stage in ("visual", "media")):
                     # The images are the deliverable here, not the text, so
                     # this stage gets its own budget ON TOP of the agent's —
                     # long only where it needs to be, rather than making every
@@ -6138,6 +7114,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             "file(s) for the next stages")
                     _save_artifacts(made_files, query, stage, link=all_links.get(stage, ""))
                     made_here = made_files
+                    if stage in ("audio", "voice", "speech") or not all_links.get(stage):
+                        all_links[stage] = made_files[0].get("path", "")
 
             # Did this step produce what it owed? A `file` step that came
             # back as chat text is asked once for the file, and if it still
@@ -6451,6 +7429,12 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
             return
         # A later pass may already have filled this in.
         if all_responses.get(stage):
+            continue
+        # If an upstream planning/research stage failed, but downstream stages
+        # already completed the actual brief, script or design, retrying the
+        # upstream step is redundant and would only stall the user's run.
+        if stage in ("brains", "research") and any(
+                all_responses.get(s) for s in ("content", "design", "script", "artwork")):
             continue
         if skipped():
             give_up(stage, info, [])

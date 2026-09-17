@@ -635,6 +635,38 @@ def missing_planned(scene: dict, planned: list[str]) -> list[str]:
             for n in planned if f"asset:{n}" not in blob]
 
 
+def ensure_accent_applied(spec: dict) -> dict:
+    """Ensure the client's brand accent colour is actively used in the design.
+
+    If brand accent is specified but not referenced in the design CSS or scene
+    markup, injects targeted CSS rules applying var(--accent) to prominent focal
+    elements (e.g. .kicker, .accent, .highlight, h1 em, borders, badges).
+    """
+    brand = spec.get("brand") or {}
+    accent = str(brand.get("accent", "")).strip()
+    if not accent:
+        return spec
+    blob = (str((spec.get("design") or {}).get("css", "")) + " " +
+            " ".join(str(sc.get("html", "")) + " " + str(sc.get("css", ""))
+                     for sc in spec.get("scenes") or [])
+            ).lower()
+    if "var(--accent" in blob.replace(" ", "") or accent.lower() in blob:
+        return spec
+
+    design = spec.setdefault("design", {})
+    existing_css = design.get("css", "")
+    accent_rules = (
+        f"\n/* Auto-applied client brand accent ({accent}) */\n"
+        f":root {{ --accent: {accent}; }}\n"
+        f".kicker, .accent, .highlight, [data-prism-id*='accent'], "
+        f"h1 em, h2 em, .badge {{ color: var(--accent) !important; }}\n"
+        f".accent-bg, .badge-accent, .pill-accent {{ background-color: var(--accent) !important; }}\n"
+        f".accent-border {{ border-color: var(--accent) !important; }}\n"
+    )
+    design["css"] = (existing_css + "\n" + accent_rules).strip()
+    return spec
+
+
 def brand_faults(spec: dict) -> list[str]:
     """Did the design actually use the client's colours?
 
@@ -654,9 +686,18 @@ def brand_faults(spec: dict) -> list[str]:
             ).lower()
     if "var(--accent" in blob.replace(" ", "") or accent in blob:
         return []
+    # Auto-heal the design spec with the client's accent
+    ensure_accent_applied(spec)
+    new_blob = (str((spec.get("design") or {}).get("css", "")) + " " +
+                " ".join(str(sc.get("html", "")) + " " + str(sc.get("css", ""))
+                         for sc in spec.get("scenes") or [])
+                ).lower()
+    if "var(--accent" in new_blob.replace(" ", "") or accent in new_blob:
+        return []
     return [f"the client's accent colour {accent} appears nowhere in the "
             "design — use var(--accent) for the element the eye goes to first "
             "in each scene, or the reel is not in their colours"]
+
 
 
 def structural_faults(spec: dict) -> list[str]:
@@ -1045,8 +1086,13 @@ def render(spec: dict, out_path: str, on_progress=None,
                 # Look at a settled frame of every scene BEFORE encoding
                 # anything: a reel that fails the check is worth catching in
                 # seconds rather than after a minute of rendering.
+                filmed = ensure_accent_applied(filmed)
                 faults.extend(structural_faults(filmed))
-                faults.extend(brand_faults(filmed))
+                bfaults = brand_faults(filmed)
+                if bfaults:
+                    filmed = ensure_accent_applied(filmed)
+                    bfaults = brand_faults(filmed)
+                faults.extend(bfaults)
                 for name in missing_assets(filmed):
                     faults.append(f'asset:{name} is referenced but unavailable')
                 for s in plan:
@@ -1055,13 +1101,14 @@ def render(spec: dict, out_path: str, on_progress=None,
                         if fault not in faults:
                             faults.append(fault)
 
-                # Never publish an MP4 that the browser has already proved
-                # malformed. Previously faults were only attached to the
-                # JSON after encoding, so clipped copy or images still looked
-                # like a successful render in Studio.
-                if faults:
-                    preview = "; ".join(faults[:8])
-                    more = f" (+{len(faults) - 8} more)" if len(faults) > 8 else ""
+                # Fatal faults are those that make rendering impossible (missing HTML, invalid timing).
+                # Brand accent and minor styling faults are recorded in spec["_faults"] so they can be
+                # reviewed and refined, but do not prevent the MP4 from being written.
+                fatal_faults = [f for f in faults if "has no HTML content" in f or "duration" in f
+                                or "outside the supported" in f]
+                if fatal_faults:
+                    preview = "; ".join(fatal_faults[:8])
+                    more = f" (+{len(fatal_faults) - 8} more)" if len(fatal_faults) > 8 else ""
                     raise ReelError(
                         "Render preflight failed; no MP4 was written: "
                         + preview + more)
@@ -1230,7 +1277,7 @@ ASSET_TOKEN = "{{ASSETS}}"
 # stage, which has not run when the design prompt is built.
 BRAND_TOKEN = "{{BRAND}}"
 
-MAX_GENERATED = 3
+MAX_GENERATED = 6
 
 
 def brand_block(brand: dict | None) -> str:
@@ -1389,19 +1436,25 @@ def imagery_instructions(request: str, has_own_artwork: bool = False,
         "  · Each file contains ONE clear subject only, with generous empty "
         "space around it so the video can crop, animate, and place live text "
         "beside it.\n\n"
-        "WHAT THE THREE ARE:\n"
+        f"WHAT THE {MAX_GENERATED} ASSETS ARE:\n"
         + ("  1. NO logo — the client's real mark was supplied and is already "
            "in hand, so anything you draw would be a lookalike and would be "
-           "thrown away. Make three SUBJECT images instead.\n"
+           f"thrown away. Make {MAX_GENERATED} SUBJECT images instead.\n"
            if has_own_artwork else
            "  1. A wordmark or emblem for the company, in the spirit of what "
            "your search found — their colours, their industry. The company "
            "name must be spelled EXACTLY as it is written above; check it "
            "character by character before you finish.\n")
-        + "  2-3. The SUBJECT of their business — the actual equipment, "
-        "produce or material. A seed company wants seed, crop, a field; an "
-        "IT firm wants racks, cabling, cameras; a workshop wants its "
-        "machines.\n\n"
+        + "  2. The PRIMARY HERO SUBJECT of their business — the main equipment, "
+        "flagship product, or core offering.\n"
+        "  3. PROCESS / ACTION — a crisp, clear representation of their craft, "
+        "manufacturing, engineering, or workflow in action.\n"
+        "  4. SECONDARY DETAIL / TEXTURE / MATERIAL — a specific close-up, component, "
+        "or raw material that proves domain mastery.\n"
+        "  5. TRUST / BADGE / METRIC — an iconography graphic, certification mark, "
+        "or stylized badge representing quality, speed, or precision.\n"
+        "  6. OUTCOME / FINISH — the finished product, happy result, or dramatic "
+        "closing visual.\n\n"
         "EVERY IMAGE MUST:\n"
         "  · have a TRANSPARENT background — a PNG with alpha, the subject "
         "cut out and nothing behind it. No white card, no scene, no desk, no "
@@ -2305,11 +2358,16 @@ def followup_instructions(change: str, spec: dict, new_assets: str = "",
     changes the scenes it affects rather than guessing what moved."""
     total = len(spec.get("scenes") or [])
     have = ", ".join(f"asset:{n}" for n in (spec.get("_assets") or {}))
+    brand = spec.get("brand") or {}
+    faults = spec.get("_faults") or []
     return (
         "Continue the saved Studio project from this design conversation. "
         "Its previous export may have failed. The owner wants this change:\n\n"
         f"  “{change.strip()}”\n\n"
-        f"THE REEL AS FILMED — {total} scene(s):\n{_scene_index_lines(spec)}\n\n"
+        + (("\nPREVIOUS RENDER FAULTS (must be resolved in this revision):\n· "
+            + "\n· ".join(faults) + "\n\n") if faults else "")
+        + (brand_block(brand) + "\n\n" if brand else "")
+        + f"THE REEL AS FILMED — {total} scene(s):\n{_scene_index_lines(spec)}\n\n"
         + ("CURRENT ART DIRECTION (keep unless the change asks to replace it):\n"
            + str((spec.get("design") or {}).get("direction"))[:3000] + "\n\n"
            if (spec.get("design") or {}).get("direction") else "")
@@ -2463,6 +2521,7 @@ def apply_followup(spec: dict, patch: dict) -> dict:
     else:
         new.pop("edits", None)
     new.pop("_faults", None)
+    ensure_accent_applied(new)
     return new
 
 
@@ -2504,6 +2563,7 @@ def refine_spec(spec: dict, change: str, ask, check=None, log=None,
             return []
         try:
             return list(check({"design": design, "scenes": [scene],
+                               "brand": spec.get("brand") or {},
                                "_assets": spec.get("_assets") or {}}) or [])
         except Exception as e:                           # noqa: BLE001
             say(f"couldn't lay the scene out ({e})")

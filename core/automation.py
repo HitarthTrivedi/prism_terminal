@@ -1103,6 +1103,7 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
     # to the argument list rather than replacing it — so a retry needs its own.
     def _options():
         o = uc.ChromeOptions()
+        o.page_load_strategy = "eager"
         o.add_argument("--profile-directory=Default")
         o.add_argument("--disable-blink-features=AutomationControlled")
         o.add_argument("--remote-allow-origins=*")
@@ -1195,6 +1196,10 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
     try:
         drv = uc.Chrome(options=_options(), user_data_dir=tmp,
                         version_main=version_main, **_kwargs(own_driver))
+        try:
+            drv.set_page_load_timeout(35)
+        except Exception:
+            pass
         _reset_to_blank_tab(drv)
         # Give Chrome a beat to finish creating its first renderer.  Without
         # this, a launch whose only tab immediately disappears looks healthy
@@ -1238,6 +1243,10 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
             drv = uc.Chrome(options=_options(), user_data_dir=tmp,
                             version_main=version_main if bad_arch else None,
                             **_kwargs(own_driver))
+            try:
+                drv.set_page_load_timeout(35)
+            except Exception:
+                pass
             _reset_to_blank_tab(drv)
             time.sleep(1)
             if not _driver_has_live_tab(drv):
@@ -1500,16 +1509,21 @@ def _verify_page_attachments(driver, basenames: list[str], timeout: float = 6.0)
         }
         return res;
     """
+    executed_dom_check = False
     while time.time() < end_time:
         try:
             data = driver.execute_script(js_check, basenames)
             if isinstance(data, dict):
+                executed_dom_check = True
                 last_res = data
                 if data.get("matched_names") or data.get("chips_count", 0) > 0 or data.get("has_busy") or data.get("error_msg"):
                     break
         except Exception:
             pass
         time.sleep(0.5)
+
+    if not executed_dom_check:
+        return len(basenames), list(basenames), ""
 
     matched = last_res.get("matched_names", [])
     chips_cnt = last_res.get("chips_count", 0)
@@ -3169,6 +3183,11 @@ _BROWSER_GONE = (
     "disconnected: not connected to devtools",
     "chrome not reachable",
     "browser has closed",
+    "read timed out",
+    "read timeout",
+    "connection refused",
+    "connection reset",
+    "max retries exceeded",
 )
 
 
@@ -6438,8 +6457,27 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 try:
                     driver.get(target)
                 except Exception as get_err:
-                    if _browser_is_gone(get_err) and _ensure_active_window(driver):
-                        driver.get(target)
+                    err_str = str(get_err).lower()
+                    is_socket_or_gone = _browser_is_gone(get_err)
+                    if ("timeout" in err_str or "timed out" in err_str) and not is_socket_or_gone:
+                        ui.warn(f"   Navigation to {target} timed out; stopping background requests and proceeding")
+                        try:
+                            driver.execute_script("window.stop();")
+                        except Exception:
+                            pass
+                    elif is_socket_or_gone and _ensure_active_window(driver):
+                        try:
+                            driver.get(target)
+                        except Exception as retry_err:
+                            r_err_str = str(retry_err).lower()
+                            if ("timeout" in r_err_str or "timed out" in r_err_str) and not _browser_is_gone(retry_err):
+                                ui.warn(f"   Navigation to {target} timed out on retry; stopping background requests and proceeding")
+                                try:
+                                    driver.execute_script("window.stop();")
+                                except Exception:
+                                    pass
+                            else:
+                                raise retry_err
                     else:
                         raise get_err
                 time.sleep(agent_cfg.get("page_wait", 4))

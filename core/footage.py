@@ -27,7 +27,7 @@ MAX_SHOT_SECONDS = 4.6
 MIN_SHOT_SECONDS = 1.8
 
 # Client footage needs editing that feels intentional, not a slideshow of
-# effects.  Keep the transition vocabulary understated so the story remains
+# effects. Keep the transition vocabulary dynamic and cinematic so the story remains
 # in the camera action and captions.
 SUPPORTED_TRANSITIONS = {
     "fade", "smoothleft", "smoothright", "zoomin", "wipeleft", "wiperight",
@@ -35,10 +35,11 @@ SUPPORTED_TRANSITIONS = {
     "slideleft", "slideright", "slideup", "slidedown",
 }
 TRANSITIONS_ROTATION = [
-    "fade",
+    "smoothleft",
+    "zoomin",
+    "wipeleft",
+    "hblur",
     "dissolve",
-    "fadefast",
-    "fadeblack",
 ]
 
 
@@ -584,21 +585,25 @@ def _render_motion_caption_card(
         s_draw = ImageDraw.Draw(shadow)
         draw = ImageDraw.Draw(img)
 
-        y = 10
+        # Subtle dark glass container for guaranteed contrast on bright/white video footage
+        draw.rounded_rectangle((4, 4, box_w - 4, box_h - 4), radius=18,
+                               fill=(15, 18, 26, 175), outline=(255, 255, 255, 38), width=1)
+
+        y = 12
         if kicker:
-            draw.text((15, y), kicker.upper(), font=f_kicker, fill=(240, 230, 210, 220))
+            draw.text((22, y), kicker.upper(), font=f_kicker, fill=(240, 230, 210, 220))
             y += kicker_h
 
         # Top line: delicate italic serif in warm off-white
         if line1:
-            x = 15
+            x = 22
             s_draw.text((x + 2, y + 3), line1, font=f_top, fill=(0, 0, 0, 220))
             draw.text((x, y), line1, font=f_top, fill=(240, 242, 246, 250))
             y += line1_h
 
         # Bottom line: giant high-contrast display serif in pure white
         if line2:
-            x = 15
+            x = 22
             s_draw.text((x + 3, y + 5), line2, font=f_bot, fill=(0, 0, 0, 240))
             draw.text((x, y), line2, font=f_bot, fill=(255, 255, 255, 255))
 
@@ -857,6 +862,85 @@ def _concat_prepared_clips(paths: list[str], out_path: str) -> tuple[str, str]:
         raise
 
 
+def _join_clips_with_transitions(paths: list[str], durations: list[float],
+                                 transitions: list[str] | None = None,
+                                 trans_dur: float = DEFAULT_TRANSITION_SECONDS,
+                                 out_path: str = "") -> tuple[str, str]:
+    """Join normalized clips using dynamic transitions (smoothleft, zoomin, wipeleft, hblur, dissolve).
+
+    Because each clip is already a normalized 720×1280 silent mezzanine, xfade
+    executes quickly with minimal memory footprint while delivering broadcast-quality
+    visual scene shifts.
+    """
+    if len(paths) <= 1 or trans_dur <= 0.0:
+        return _concat_prepared_clips(paths, out_path)
+
+    folder = os.path.dirname(os.path.abspath(out_path)) or tempfile.gettempdir()
+    fd, joined_path = tempfile.mkstemp(prefix="prism-footage-joined-",
+                                       suffix=".mp4", dir=folder)
+    os.close(fd)
+
+    inputs: list[str] = []
+    for p in paths:
+        inputs += ["-i", p]
+
+    filter_chains = []
+    current_label = "0:v"
+    current_offset = max(0.1, durations[0] - trans_dur)
+
+    clean_transitions = []
+    for t in (transitions or []):
+        t_clean = str(t).lower().strip()
+        if t_clean in SUPPORTED_TRANSITIONS:
+            clean_transitions.append("fade" if t_clean == "fadefast" else t_clean)
+
+    for i in range(1, len(paths)):
+        next_label = f"xf{i}"
+        if i - 1 < len(clean_transitions):
+            t_type = clean_transitions[i - 1]
+        else:
+            t_type = TRANSITIONS_ROTATION[(i - 1) % len(TRANSITIONS_ROTATION)]
+
+        filter_chains.append(
+            f"[{current_label}][{i}:v]xfade=transition={t_type}:"
+            f"duration={trans_dur:.3f}:offset={current_offset:.3f}[{next_label}]"
+        )
+        current_label = next_label
+        if i < len(paths) - 1:
+            current_offset += durations[i] - trans_dur
+
+    total_video_seconds = max(0.1, sum(durations) - (len(durations) - 1) * trans_dur)
+    command = [
+        reel.ffmpeg_path(), "-y", "-hide_banner", "-loglevel", "error",
+        *inputs,
+        "-filter_complex", ";".join(filter_chains),
+        "-map", f"[{current_label}]",
+        "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-threads", "1",
+        "-t", f"{total_video_seconds:.3f}",
+        "-movflags", "+faststart",
+        joined_path,
+    ]
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+        if result.returncode or not os.path.isfile(joined_path) or os.path.getsize(joined_path) < 1024:
+            # Fallback to clean cuts if xfade encountered any issue
+            try:
+                os.unlink(joined_path)
+            except OSError:
+                pass
+            return _concat_prepared_clips(paths, out_path)
+        return joined_path, ""
+    except Exception:
+        try:
+            os.unlink(joined_path)
+        except OSError:
+            pass
+        return _concat_prepared_clips(paths, out_path)
+
+
 def render(paths: list[str], out_path: str, title: str = "",
            font_path: str = "", on_progress=None,
            captions: list[dict] | None = None, audio_path: str = "",
@@ -872,21 +956,28 @@ def render(paths: list[str], out_path: str, title: str = "",
     if space:
         raise RuntimeError(space)
 
-    # The low-memory client-footage path joins normalised clips as clean cuts,
-    # so duration planning must not reserve overlap for xfade. This lets the
-    # picture land exactly on the full generated narration rather than
-    # silently trimming the last spoken lines.
-    trans_dur = 0.0
+    # Curated transitions (smoothleft, zoomin, wipeleft, hblur, dissolve) are applied
+    # across normalized 720×1280 mezzanine clips. Duration planning accounts for
+    # transition overlaps so narration and picture remain tightly synchronized.
+    trans_dur = DEFAULT_TRANSITION_SECONDS if len(paths) > 1 else 0.0
     clips = edit_plan(paths, audio_path=audio_path, captions=captions,
                       transition_seconds=trans_dur)
     durations = [max(1.0, float(c["selected"])) for c in clips]
     prepared_paths = _prepare_clips(clips, out_path, on_progress=on_progress)
-    joined_path, concat_list_path = _concat_prepared_clips(prepared_paths, out_path)
+
+    scene_transitions = [
+        str(c.get("transition", "")).strip()
+        for c in (captions or [])
+        if isinstance(c, dict) and c.get("transition")
+    ]
+    joined_path, concat_list_path = _join_clips_with_transitions(
+        prepared_paths, durations, transitions=scene_transitions,
+        trans_dur=trans_dur, out_path=out_path)
     # A single joined input keeps memory bounded. The per-shot durations are
     # retained below for caption timing, even though the physical video now
     # arrives through one stream.
     paths = [joined_path]
-    video_seconds = max(0.1, sum(durations))
+    video_seconds = max(0.1, sum(durations) - max(0, len(durations) - 1) * trans_dur)
 
     inputs: list[str] = []
     for p in paths:
@@ -950,12 +1041,13 @@ def render(paths: list[str], out_path: str, title: str = "",
         else:
             base_y = "(H-h)-260"
 
-        y_expr = (
-            f"'{base_y} + 45*pow(max(0,1-(t-{start:.3f})/{fade_in_dur:.3f}),3) "
-            f"- 20*pow(max(0,(t-({end:.3f}-{fade_out_dur:.3f}))/{fade_out_dur:.3f}),2)'"
-        )
+        slide_in = f"140*pow(max(0,1-(t-{start:.3f})/{fade_in_dur:.3f}),3)"
+        drift = f"18*(t-{start:.3f})/{duration:.3f}"
+        slide_out = f"35*pow(max(0,(t-({end:.3f}-{fade_out_dur:.3f}))/{fade_out_dur:.3f}),2)"
+        y_expr = f"'{base_y} + {slide_in} - {drift} - {slide_out}'"
+
         filters.append(
-            f"[{current}][{card_label}]overlay=x=(W-w)/2:y={y_expr}:"
+            f"[{current}][{card_label}]overlay=x=(W-w)/2:y={y_expr}:eval=frame:"
             f"enable='between(t,{start:.3f},{end:.3f})'[{out_label}]"
         )
         current = out_label
@@ -1060,7 +1152,8 @@ def render(paths: list[str], out_path: str, title: str = "",
             except OSError:
                 pass
         for temporary_path in (joined_path, concat_list_path):
-            try:
-                os.unlink(temporary_path)
-            except OSError:
-                pass
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass

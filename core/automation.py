@@ -2138,6 +2138,75 @@ def _harvest_files(driver, agent_cfg, stage: str, ignore_names=(),
         except Exception:
             pass
 
+    # ChatGPT's newer file card: a container (not itself an <a>) that shows
+    # a filename and type label ("Delta_Report... PDF").  The download link
+    # may be an <a> INSIDE the card, or the card itself may be clickable
+    # with no anchor.  This pass looks for cards, digs out any nested <a>,
+    # and adds them to the candidate list so they go through the same
+    # extension/fetch logic.  If no <a> is found inside, the card's own
+    # text is used so _filename_in_text and _card_filename can still pick
+    # up the type label and flag it for the click-to-download fallback.
+    try:
+        _card_js = """
+            const fileCardRe = /\\.(?:docx?|pdf|pptx?|xlsx?|csv|md|txt|zip|json|py|ipynb)(?:\\s|\\n)*(?:document|spreadsheet|presentation|file)?\\s*$/im;
+            const sels = [
+                "[data-testid*='artifact' i]", "[class*='artifact' i]",
+                "[data-testid*='file' i]", "[data-testid*='download' i]",
+                "[class*='file-card' i]", "[class*='fileCard' i]",
+            ];
+            const byAttr = document.querySelectorAll(sels.join(', '));
+            // Also sweep the assistant turn for any short element whose
+            // text names a file type — the broadest net for an unknown card
+            // shape, scoped to assistant turns so sidebar and nav are excluded.
+            // ChatGPT's current DOM does not put a message-role attribute on
+            // every assistant turn.  Its turn has an `agent-turn` child
+            // instead.  Scope this scan to the LAST assistant reply: files
+            // from an older conversation turn must never satisfy the current
+            // stage (or be clicked/downloaded in its place).
+            const scopes = [
+                ...document.querySelectorAll("[data-message-author-role='assistant'], "
+                    + "[data-message-role='assistant'], .agent-turn, "
+                    + "section[data-testid^='conversation-turn-']:has(.agent-turn)")
+            ];
+            const scope = scopes.at(-1) || document;
+            const respEls = scope.querySelectorAll('*');
+            const byText = [...respEls].filter(el => {
+                const t = (el.innerText || '').trim();
+                return t.length >= 10 && t.length < 300
+                    && el.querySelectorAll('p, li, ol, ul, h1, h2, h3').length <= 1
+                    && fileCardRe.test(t);
+            });
+            const all = new Set([...byAttr, ...byText]);
+            const result = [];
+            for (const card of all) {
+                // Prefer an <a> inside the card — its href is fetchable.
+                const a = card.matches('a[href]') ? card : card.querySelector('a[href]');
+                if (a) {
+                    result.push([a.href || '', a.getAttribute('download'), (a.textContent || '').trim()]);
+                } else {
+                    // No anchor: report the card's text so _card_filename
+                    // can extract the type label and _filename_in_text can
+                    // flag it.  The href is empty so the fetch will be
+                    // skipped — the click fallback will handle it.
+                    result.push(['', null, (card.innerText || '').trim()]);
+                }
+            }
+            return result;
+        """
+        card_links = driver.execute_script(_card_js) or []
+        seen_hrefs = {c[0] for c in candidates if c[0]}
+        for href, dl, text in card_links:
+            if href and href not in seen_hrefs:
+                candidates.append((href, dl, text))
+                seen_hrefs.add(href)
+            elif not href and text:
+                # No anchor — the card's text still feeds _filename_in_text
+                # and _card_filename so the click fallback knows a card-
+                # shaped deliverable exists.
+                candidates.append(("", None, text))
+    except Exception:
+        pass
+
     # The customer's own attachments come back as chips in THEIR turn of the
     # conversation, with the same download anchors a generated file has.
     # Harvesting the whole page (the fallback when the reply itself holds no
@@ -2239,7 +2308,8 @@ _FILE_STAGES = ("development", "presentation", "format", "content", "write", "au
 _FILE_HINT_RE = re.compile(
     r"\b(?:download|attached|attachment|here(?:'s| is) (?:the|your) (?:file|"
     r"document|report|spreadsheet|deck|presentation|workbook|pdf))\b"
-    r"|\.(?:pdf|docx?|pptx?|xlsx?|csv|zip|md|json|py|ipynb)\b", re.I)
+    r"|\.(?:" + "|".join(re.escape(ext.lstrip("."))
+                              for ext in _HARVESTABLE_EXTS) + r")\b", re.I)
 
 
 def _harvest_stage_files(driver, agent_cfg, stage: str, texts,
@@ -2264,13 +2334,15 @@ def _harvest_stage_files(driver, agent_cfg, stage: str, texts,
         _wait_for_files(driver, stage=stage)
         return _harvest_files(driver, agent_cfg, stage, ignore_names=ignore,
                               click_fallback=True)
-    n = _wait_for_files(driver, stage=stage, cap=0, grace=0)
+    # Some agents append the file card after their text without mentioning a
+    # filename. Give the page a short chance to expose it on every stage.
+    n = _wait_for_files(driver, stage=stage, cap=8, grace=4)
     hinted = any(_FILE_HINT_RE.search(t or "") for t in (texts or []))
     if not n and not hinted:
         return []
     if not n:
         ui.info("   ⏳  the reply mentions a file — giving it a moment to appear…")
-        n = _wait_for_files(driver, stage=stage, cap=30, grace=9)
+        n = _wait_for_files(driver, stage=stage, cap=18, grace=6)
     return _harvest_files(driver, agent_cfg, stage, ignore_names=ignore,
                           click_fallback=bool(n) or hinted)
 
@@ -2311,7 +2383,7 @@ def _doc_stem(text: str, stage: str) -> str:
 
 def _meet_contract(driver, agent_cfg: dict, stage: str, kind: str,
                    texts: list, made: list, *, query: str = "",
-                   attachments=None, should_stop=None) -> dict:
+                   task: str = "", attachments=None, should_stop=None) -> dict:
     """Hold a finished step to what it owed, and try ONCE to put it right.
 
     This is the half of core/contract.py that touches the page. A step whose
@@ -2338,7 +2410,7 @@ def _meet_contract(driver, agent_cfg: dict, stage: str, kind: str,
         return out
 
     ext = _c.wanted_ext(query)
-    ask = _c.reask(kind, ext=ext)
+    ask = _c.reask(kind, ext=ext, query=query, task=task)
     halted = should_stop or (lambda: False)
     if (ask and driver is not None and agent_cfg.get("textarea_selector")
             and not halted()):
@@ -2382,8 +2454,19 @@ def _meet_contract(driver, agent_cfg: dict, stage: str, kind: str,
 
     # Last resort, and the reason a document request can no longer end with
     # nothing to open: write the file out of the words the tool did write.
-    best = max((t for t in list(texts) + out["texts"] if (t or "").strip()),
-               key=len, default="")
+    #
+    # Prefer the original turn over the corrective turn.  The correction is
+    # only meant to make the site attach a file; it is not a new writing
+    # brief.  Some agents answer that correction with a longer stock message
+    # such as "I don't see anything earlier in this conversation…".  Choosing
+    # the longest reply across both turns then made Prism faithfully save that
+    # error as the customer's document and discard the real answer it had
+    # already captured.  The original turn is the source material for this
+    # fallback; use a corrective turn only when the original was empty.
+    best = max((t for t in texts if (t or "").strip()), key=len, default="")
+    if not best:
+        best = max((t for t in out["texts"] if (t or "").strip()),
+                   key=len, default="")
     if not best:
         out["missing"] = short
         return out
@@ -2423,6 +2506,38 @@ def _click_download_control(driver, agent_cfg: dict) -> bool:
     the reply first, then the whole page. Returns whether something was
     clicked. Never raises."""
     from selenium.webdriver.common.by import By
+    # New ChatGPT file cards use an icon-only `Download file` button and no
+    # fetchable anchor.  A file card's filename button OPENS a preview; it is
+    # not a download control.  Only the explicitly-labelled button is safe.
+    # Keep this check scoped to the latest assistant turn so an older result
+    # cannot be downloaded for the current stage.
+    try:
+        clicked = bool(driver.execute_script(r"""
+            const scopes = [...document.querySelectorAll(
+                "[data-message-author-role='assistant'], "
+                + "[data-message-role='assistant'], .agent-turn, "
+                + "section[data-testid^='conversation-turn-']:has(.agent-turn)")];
+            const scope = scopes.at(-1);
+            if (!scope) return false;
+            const button = [...scope.querySelectorAll(
+                "button[aria-label*='download' i], a[download], "
+                + "a[aria-label*='download' i]")]
+                .find(el => el.getClientRects().length && !el.disabled);
+            if (!button) return false;
+            button.scrollIntoView({block: 'center'});
+            button.click();
+            return true;
+        """))
+        if clicked:
+            return True
+    except Exception:
+        pass
+    # ChatGPT must never fall through to generic card/text clicks: its file
+    # card is a preview opener, while its neighbouring icon button is the
+    # actual download.  Waiting for that explicit button is safer than
+    # opening a preview and incorrectly asking the model for the same file.
+    if "chatgpt.com" in str(agent_cfg.get("url") or agent_cfg.get("start_url") or ""):
+        return False
     # _within, not f"{scope}…". A response_selector is a selector LIST, and a
     # descendant combinator binds tighter than the comma — so `f"{scope}
     # a[download]"` meant "every branch except the last, PLUS a[download]
@@ -2459,8 +2574,104 @@ def _click_download_control(driver, agent_cfg: dict) -> bool:
                     return True
             except Exception:
                 continue
+    # Last resort before generic text search: look for an explicitly-labelled
+    # download control inside a file card.  Never click the card itself: on
+    # current ChatGPT it opens a preview rather than downloading the file.
+    try:
+        card_js = """
+            const typeRe = /(^|[·•|\\s])(docx?|pdf|pptx?|xlsx?|csv|md|txt|zip|json|py|ipynb)\\s*$/im;
+            const sels = [
+                "[data-testid*='artifact' i]", "[class*='artifact' i]",
+                "[data-testid*='file' i]", "[data-testid*='download' i]",
+                "[class*='file-card' i]", "[class*='fileCard' i]",
+            ];
+            const byAttr = [...document.querySelectorAll(sels.join(', '))]
+                .filter(el => typeRe.test((el.innerText || '').trim()));
+            const respEls = document.querySelectorAll(
+                "[data-message-author-role='assistant'] *, "
+                + "[data-message-role='assistant'] *");
+            const byText = [...respEls].filter(el => {
+                const t = (el.innerText || '').trim();
+                return t.length >= 10 && t.length < 300
+                    && el.querySelectorAll('p, li, ol, ul, h1, h2, h3').length <= 1
+                    && typeRe.test(t);
+            });
+            // Return the outermost unique cards.
+            const all = [...new Set([...byAttr, ...byText])];
+            return all.length;
+        """
+        n = int(driver.execute_script(card_js) or 0)
+    except Exception:
+        n = 0
+    if n:
+        # Re-query (the count was JS-only) and click a labelled download
+        # control inside the card, never the card itself.
+        try:
+            card_sels = (
+                "[data-testid*='artifact' i], [class*='artifact' i], "
+                "[data-testid*='file' i], [data-testid*='download' i], "
+                "[class*='file-card' i], [class*='fileCard' i]")
+            els = driver.find_elements(By.CSS_SELECTOR, card_sels)
+            for card in els:
+                try:
+                    txt = (card.text or "").strip()
+                    if len(txt) < 10 or len(txt) > 300:
+                        continue
+                    if not _CARD_TYPE_RE.search(txt):
+                        continue
+                    if not (card.is_displayed()):
+                        continue
+                    # Prefer a download button or link INSIDE the card.
+                    inner = None
+                    for inner_sel in ("a[download]",
+                                      "[aria-label*='download' i]",
+                                      "[data-testid*='download' i]"):
+                        try:
+                            inner = card.find_element(By.CSS_SELECTOR,
+                                                       inner_sel)
+                            if inner.is_displayed():
+                                break
+                            inner = None
+                        except Exception:
+                            inner = None
+                    if inner is None:
+                        continue
+                    target = inner
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});",
+                        target)
+                    target.click()
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
     # Last resort: a visible link/button whose text is literally "Download …".
     return _click_by_text(driver, ["download"], timeout=4)
+
+
+def _current_chatgpt_file_card(driver) -> bool:
+    """Whether the newest ChatGPT reply already contains a generated file.
+
+    This is deliberately a *guard*, not a click target.  The filename button
+    opens ChatGPT's preview pane; only its sibling ``Download file`` button
+    may be clicked by `_click_download_control`.
+    """
+    try:
+        return bool(driver.execute_script(r"""
+            const scopes = [...document.querySelectorAll(
+                "[data-message-author-role='assistant'], "
+                + "[data-message-role='assistant'], .agent-turn, "
+                + "section[data-testid^='conversation-turn-']:has(.agent-turn)")];
+            const scope = scopes.at(-1);
+            if (!scope) return false;
+            if (scope.querySelector("button[aria-label*='download' i], a[aria-label*='download' i]")) return true;
+            const fileCardRe = /\.(?:docx?|pdf|pptx?|xlsx?|csv|md|txt|zip|json|py|ipynb)(?:\s|\n)*(?:document|spreadsheet|presentation|file)?\s*$/im;
+            return [...scope.querySelectorAll('button, [role="button"]')]
+                .some(el => fileCardRe.test((el.innerText || '').trim()));
+        """))
+    except Exception:
+        return False
 
 
 def _capture_download(driver, stage: str, click, *, wait: float = 45,
@@ -2495,7 +2706,18 @@ def _capture_download(driver, stage: str, click, *, wait: float = 45,
     except Exception:
         pass
     before = set(os.listdir(folder))
-    if not click():
+    # ChatGPT creates the card before it mounts its icon-only `Download
+    # file` button.  Do not mistake that short gap for a missing deliverable
+    # and send the model a duplicate corrective prompt.  Wait briefly for an
+    # explicit control; `click` never opens a file card.
+    clicked = False
+    click_deadline = time.time() + min(20, wait)
+    while time.time() < click_deadline:
+        if click():
+            clicked = True
+            break
+        time.sleep(1)
+    if not clicked:
         _restore_downloads(driver, folder)
         return []
 
@@ -2691,8 +2913,8 @@ def _sleep_interruptibly(seconds: float, should_stop=None) -> bool:
     return should_stop()
 
 
-def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
-                stable_for: int = 25, min_wait: int = 35,
+def _smart_wait(driver, agent_cfg, cap: int, poll: int = 1,
+                stable_for: float = 2.5, min_wait: int = 3,
                 expect: str = "", should_stop=None) -> tuple[int, bool]:
     """Wait for the agent to finish generating — but no longer than needed.
     Polls the response selector and returns once the total response text has
@@ -2746,6 +2968,26 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
         except Exception:
             return False
 
+    def still_generating() -> bool:
+        if busy_sel:
+            try:
+                return any(el.is_displayed() for el in driver.find_elements(By.CSS_SELECTOR, busy_sel))
+            except Exception:
+                return False
+        try:
+            return bool(driver.execute_script("""
+                return [...document.querySelectorAll('button')].some(button => {
+                    if (!button.getClientRects().length) return false;
+                    const labels = [button.innerText, button.getAttribute('aria-label'),
+                                    button.getAttribute('title')];
+                    return labels.some(label =>
+                        /^(stop|stop generating|stop response|cancel response)$/i
+                            .test((label || '').trim()));
+                });
+            """))
+        except Exception:
+            return False
+
     while time.time() - start < cap:
         # Stopping here returns settled=False, which the caller already treats
         # as "we stopped watching, the tool didn't fail" — exactly the truth
@@ -2770,7 +3012,7 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
             last_change = time.time()
         elif (grown and time.time() - start >= min_wait
               and time.time() - last_change >= stable_for
-              and has_marker()):
+              and has_marker() and not still_generating()):
             settled = True
             break
         if (turn_sel and busy_sel and not grown
@@ -2964,13 +3206,55 @@ def _wait_for_files(driver, cap: int = 60, grace: int = 12,
         # "Document·DOCX" over a Download button. Matched on the artifact
         # containers the page itself names, so this stays cheap and does not
         # sweep every div on a long conversation.
+        #
+        # Relaxed since 1.5.4: the `/download/i` requirement dropped a
+        # ChatGPT file card whose text is "Delta_Report... PDF" with no
+        # "Download" word anywhere.  A card whose innerText names a known
+        # file type is counted whether or not it also says "download".
+        #
+        # A fourth shape: ChatGPT's newer file card.  It is not marked with
+        # "artifact" in any attribute — it sits inside the assistant turn as
+        # a standalone block.  Detected by a broader sweep of the reply area
+        # for any element whose text is SHORT and ends with a bare file-type
+        # word (PDF, DOCX …) on a line of its own.  The length cap (< 300
+        # chars) and the requirement for a type-word ON ITS OWN LINE keep it
+        # from matching a long prose paragraph that merely mentions "PDF".
         + r"const typeRe = /(^|[·•|\s])(docx?|pdf|pptx?|xlsx?|csv|md|txt|zip"
         r"|json|py|ipynb)\s*$/im;"
+        + r"const fileCardRe = /\.(?:docx?|pdf|pptx?|xlsx?|csv|md|txt|zip|json|py|ipynb)(?:\s|\n)*(?:document|spreadsheet|presentation|file)?\s*$/im;"
         "const cards = [...document.querySelectorAll(\"[data-testid*='artifact' i], "
         "[class*='artifact' i]\")].filter(el => "
-        "typeRe.test(((el.innerText || '').trim())) "
-        "&& /download/i.test(el.innerText || ''));"
-        "return new Set([...byHref, ...byText, ...cards]).size;")
+        "(typeRe.test(((el.innerText || '').trim())) || fileCardRe.test(((el.innerText || '').trim()))));"
+        # ChatGPT file cards: short blocks whose text ends with a type label.
+        "const chatCards = [...document.querySelectorAll("
+        "\"[data-testid*='file' i], [data-testid*='download' i], "
+        "[class*='file-card' i], [class*='fileCard' i]\")].filter(el => {"
+        "  const t = (el.innerText || '').trim();"
+        "  return t.length < 300 && (typeRe.test(t) || fileCardRe.test(t)); });"
+        # Broadest fallback: any element inside the response area whose text
+        # is SHORT, contains a known extension as a standalone word, and is
+        # NOT a full paragraph.  This catches cards whose DOM attributes
+        # carry no predictable marker at all — only their visible text
+        # distinguishes them from prose.
+        "const assistantScopes = [...document.querySelectorAll("
+        "\"[data-message-author-role='assistant'], "
+        "[data-message-role='assistant'], .agent-turn, "
+        "section[data-testid^='conversation-turn-']:has(.agent-turn)\")];"
+        "const assistantScope = assistantScopes.at(-1) || document;"
+        "const respEls = assistantScope.querySelectorAll('*');"
+        "const inlineCards = [...respEls].filter(el => {"
+        "  const t = (el.innerText || '').trim();"
+        "  if (t.length < 10 || t.length > 300) return false;"
+        "  if (el.querySelectorAll('p, li, ol, ul, h1, h2, h3').length > 1) return false;"
+        "  return typeRe.test(t) || fileCardRe.test(t); });"
+        # ChatGPT's Sep 2026 file card is filename + "Document", with an
+        # icon-only button labelled "Download file". It has neither a URL nor
+        # an extension in its type line, so the visible control is the honest
+        # signal that a deliverable exists. Scoped to the current assistant
+        # turn so old downloadable files cannot trigger a correction.
+        "const downloadControls = assistantScope.querySelectorAll("
+        "\"button[aria-label*='download' i], a[aria-label*='download' i]\");"
+        "return new Set([...byHref, ...byText, ...cards, ...chatCards, ...inlineCards, ...downloadControls]).size;")
 
     def probe() -> int:
         try:
@@ -2985,7 +3269,7 @@ def _wait_for_files(driver, cap: int = 60, grace: int = 12,
     if last:
         ui.info(f"   📎  {last} file link(s) so far…")
     while time.time() - start < cap:
-        time.sleep(3)
+        time.sleep(1)
         n = probe()
         if n < 0:
             continue
@@ -2993,9 +3277,9 @@ def _wait_for_files(driver, cap: int = 60, grace: int = 12,
             last, steady = n, 0
             ui.info(f"   📎  {n} file link(s) so far…")
         elif last:
-            steady += 3
-            # A link that's been sitting there for 10s is all there is.
-            if steady >= 10:
+            steady += 1
+            # A link that's been sitting there for 4s is all there is.
+            if steady >= 4:
                 break
         elif time.time() - start >= grace:
             break   # nothing ever appeared — not this turn's kind of reply
@@ -6480,6 +6764,32 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 raise retry_err
                     else:
                         raise get_err
+                # ChatGPT redirects its bare home URL to the last chat the
+                # browser happened to view.  A new Prism job must never type
+                # into that unrelated conversation; only a saved follow-up
+                # URL is allowed to resume one.  Click the product's own
+                # New chat control after the redirect has settled.
+                if (agent_name == "ChatGPT"
+                        and not (resume_urls or {}).get(stage)):
+                    try:
+                        fresh_chat = bool(driver.execute_script("""
+                            const controls = [...document.querySelectorAll(
+                                "a, button, [role='button']")];
+                            const newChat = controls.find(el => {
+                                const label = ((el.getAttribute('aria-label') || '')
+                                    + ' ' + (el.innerText || '')).trim();
+                                return /^new chat$/i.test(label)
+                                    || /^(start )?new chat/i.test(label);
+                            });
+                            if (!newChat || !newChat.getClientRects().length) return false;
+                            newChat.click();
+                            return true;
+                        """))
+                        if fresh_chat:
+                            ui.info("   💬  started a fresh ChatGPT conversation")
+                            time.sleep(1)
+                    except Exception:
+                        pass
                 time.sleep(agent_cfg.get("page_wait", 4))
                 if not _driver_has_live_tab(driver):
                     raise RuntimeError("browser has closed its controlled agent tab")
@@ -7715,11 +8025,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                              or agent_cfg.get("search_tool")
                              or agent_cfg.get("runner")
                              or agent_name == "NotebookLM")
-            if not stopped() and chat_tool and not machine_shaped:
+            # A ChatGPT file card means the deliverable is already there.
+            # If the browser has not copied it to Prism yet, wait/report that
+            # state rather than asking the same chat to create it again.
+            # (The card itself opens a preview, so it is never a download
+            # fallback; `_capture_download` waits for its explicit button.)
+            card_waiting = (agent_name == "ChatGPT" and not made_here
+                            and _current_chatgpt_file_card(driver))
+            if card_waiting:
+                stage_notes[stage] = (
+                    "The generated file is ready in ChatGPT; Prism is waiting "
+                    "for its download control instead of requesting it again.")
+                short_of = "download pending"
+            elif not stopped() and chat_tool and not machine_shaped:
                 fixed = _meet_contract(
                     driver, agent_cfg, stage, kind_here, stage_responses,
                     made_here, query=query, attachments=attachments,
-                    should_stop=stage_halt)
+                    task="\n".join(questions), should_stop=stage_halt)
                 if fixed["files"]:
                     _save_artifacts(fixed["files"], query, stage,
                                     link=all_links.get(stage, ""))

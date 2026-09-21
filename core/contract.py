@@ -287,14 +287,27 @@ def missing(kind: str, *, texts=None, files: int = 0, images: int = 0) -> str:
     return ""
 
 
-def reask(kind: str, ext: str = "") -> str:
+def reask(kind: str, ext: str = "", query: str = "", task: str = "") -> str:
     """The one short follow-up sent in the same chat when a step missed its
     contract. Short on purpose — the tool still has everything it wrote a
-    moment ago, so this is a correction, not a re-brief."""
+    moment ago, so this is a correction, not a re-brief.
+
+    A browser can nevertheless land on a fresh chat after a site reload or a
+    recovered tab. Include the write step's original task (or the person's
+    request when no stage prompt is available) in that case: a bare "give me
+    that as a file" has no referent there and leads to the agent's unhelpful
+    "I don't see anything earlier" reply.
+    """
     if kind == "file":
-        return ("Please give me that as a downloadable "
+        line = ("Please give me the finished result as a downloadable "
                 f"{ext + ' ' if ext else ''}file, built here — the text in "
                 "the chat is not what I need to keep.")
+        original = " ".join((task or query or "").split())
+        if original:
+            # A stage prompt has already been trimmed by the planner; this
+            # ceiling only protects the recovery path from a pasted report.
+            line += f" Original task: {original[:1200]}"
+        return line
     if kind == "image":
         return ("Please generate the image itself now and show it here — "
                 "one picture, no description.")

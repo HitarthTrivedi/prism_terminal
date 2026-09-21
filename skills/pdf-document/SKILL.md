@@ -18,9 +18,8 @@ alone.
 
 ## Rules
 
-1. **Page one stands alone.** Who this is from, what it is about, who it
-   is for, and the date. A page that arrives forwarded, with no email
-   around it, must still make sense.
+1. **Page one stands alone.** Title, subject, date, and who it is from/for.
+   A page that arrives forwarded, with no email around it, must still make sense.
 2. **Write in pages, not in flow.** Say where each page breaks and what
    is on it. A document written as one river of text lands with a heading
    alone at the foot of a page and its table overleaf.
@@ -29,16 +28,16 @@ alone.
 4. **Tables for anything compared.** Specifications, options, prices and
    timelines are tables with named columns and units in the header, never
    prose. Give every table a caption that says what it shows.
-5. **Numbers carry units and currency.** Every figure: unit, currency,
-   and the basis (per piece, per m², ex-works, inclusive of GST).
-6. **Say what is not included.** For anything that quotes, scopes or
-   promises: an explicit exclusions or assumptions block. This is the
-   paragraph that prevents the argument later.
-7. **Validity and version.** A price, a specification or a proposal
-   carries a date and how long it stands. A document with no date is
-   quoted back at you two years later.
-8. **Contact and next step on the last page.** Who to reply to, how, and
-   what happens next.
+5. **Numbers carry units and context.** For technical specifications, metrics
+   or commercial figures: state the unit, currency, and basis where applicable
+   (e.g., per piece, per m², or parameter bounds).
+6. **Say what is not included when scoping.** For anything that quotes, scopes or
+   promises project or commercial work: an explicit exclusions or assumptions block.
+   This prevents ambiguity later.
+7. **Validity and version for commercial terms.** A price, formal specification
+   or proposal carries a date and how long it stands.
+8. **Contact and next step for client deliverables.** On proposals, quotes, and
+   external deliverables: state who to reply to, how, and what happens next.
 9. **No live-document habits.** No "click here", no "see the section
    above", no hover states. Refer to pages by number and headings by name.
 
@@ -48,7 +47,7 @@ Mark every page explicitly:
 
 ```
 PAGE 1 — Cover
-  Title, one-line subtitle, client name, date, your company and contact.
+  Title, one-line subtitle, client/audience name, date, author/company and contact.
 PAGE 2 — What this is
   ...
 TABLE (page 4): "Grade comparison — IS 2062 E250 vs E350"
@@ -60,13 +59,12 @@ proposal 6 to 12. State the page count at the top and keep to it.
 
 ## Quality checklist
 
-- Page 1 names the sender, the subject, the recipient and the date.
+- Page 1 names the title or subject, the date, and author or recipient.
 - Every page is marked and has one subject.
 - Every compared set of values is a table with units in the header.
-- Every price or specification carries its basis, currency and validity.
-- There is an exclusions or assumptions block wherever something is
-  promised or priced.
-- The last page says who to contact and what happens next.
+- Commercial figures or specifications carry their basis, units and validity where applicable.
+- There is an exclusions or assumptions block where work or pricing is scoped.
+- Client proposals and quotes say who to contact and what happens next.
 - No screen-only language and no unresolved placeholder.
 
 ## Non-goals

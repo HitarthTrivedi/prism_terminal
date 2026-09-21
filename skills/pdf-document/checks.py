@@ -35,6 +35,9 @@ SCREEN = re.compile(r"click here|\bclick the link\b|\bhover\b|scroll (?:down|up)
                     re.IGNORECASE)
 CONTACT = re.compile(r"@[\w.-]+\.\w{2,}|\bcontact\b|\breach (?:us|out)\b|"
                      r"\+\d[\d\s-]{7,}|\bphone\b|\bemail\b", re.IGNORECASE)
+COMMERCIAL = re.compile(
+    r"\b(?:proposal|quotation|quote|tender|bid|rfp|rfq|pricing|commercial|"
+    r"scope of work|scope of supply|contract|vendor|client)\b", re.IGNORECASE)
 
 
 def faults(text: str, context: dict) -> list:
@@ -45,6 +48,8 @@ def faults(text: str, context: dict) -> list:
                 "subject, the recipient and the date."]
     lines = SK.text_lines(text)
     out = []
+    prompt = str((context or {}).get("prompt", ""))
+    is_commercial = bool(COMMERCIAL.search(text) or COMMERCIAL.search(prompt))
 
     pages = [i for i, line in enumerate(lines) if PAGE.match(line)]
     if not pages:
@@ -61,10 +66,10 @@ def faults(text: str, context: dict) -> list:
             out.append("The cover page carries no date. A forwarded document "
                        "with no date gets quoted back years later.")
 
-    if MONEY.search(text) and not VALIDITY.search(text):
+    if is_commercial and MONEY.search(text) and not VALIDITY.search(text):
         out.append("Prices appear with no validity period. Say how long they "
                    "stand, or they stand forever.")
-    if PROMISE.search(text) and not EXCLUSIONS.search(text):
+    if is_commercial and PROMISE.search(text) and not EXCLUSIONS.search(text):
         out.append("The document scopes or promises something but has no "
                    "exclusions or assumptions block. That block is what "
                    "prevents the argument later.")
@@ -79,7 +84,7 @@ def faults(text: str, context: dict) -> list:
         out.append("Screen-only language in a printed document: "
                    + ", ".join(screen[:6])
                    + ". Refer to pages by number and headings by name.")
-    if not CONTACT.search(text):
+    if is_commercial and not CONTACT.search(text):
         out.append("No contact details. The last page says who to reply to "
                    "and what happens next.")
     held = SK.placeholders(text)

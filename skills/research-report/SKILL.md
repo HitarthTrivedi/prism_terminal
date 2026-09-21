@@ -35,9 +35,10 @@ known and what is not, because the reader cannot tell the two apart.
    substituting the all-India number is a fabrication.
 7. **Ranges beat false precision.** If three sources disagree, give the
    range and say which you would trust and why. Do not average them.
-8. **Local reality where the work is local.** For an Indian buyer, quote
-   Indian prices, Indian standards (IS/BIS), Indian suppliers, GST and
-   ₹ — not US equivalents converted at today's rate.
+8. **Local reality where the work is local.** Match the regional context of the
+   work or audience. Quote local prices, regional standards (such as IS/BIS, ISO,
+   ASTM, or EN), relevant suppliers, and local currency — avoid converting
+   foreign equivalents when primary local data applies.
 
 ## Shape
 

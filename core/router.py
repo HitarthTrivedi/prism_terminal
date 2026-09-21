@@ -391,6 +391,30 @@ def apply_make_guardrail(query: str, routing: dict, agents: dict) -> list[str]:
     return forced
 
 
+def apply_research_reasoning_guardrail(routing: dict, agents: dict) -> bool:
+    """A genuine research pass is followed by Prism's reasoning pass.
+
+    Research collects sources and current facts; ``brains`` is where those
+    findings are weighed into a recommendation. The router occasionally chose
+    only Research, leaving a research task as a source dump even when the
+    person had configured a Think-it-through agent. This is intentionally
+    keyed to the routed research stage, not keyword matching, so an ordinary
+    task that merely says "research" does not grow a step the planner rejected.
+    """
+    research = routing.get("research") or {}
+    if not (isinstance(research, dict) and research.get("needed")
+            and research.get("questions") and agents.get("brains")):
+        return False
+    brains = routing.get("brains") or {}
+    if isinstance(brains, dict) and brains.get("needed") and brains.get("questions"):
+        return False
+    routing["brains"] = {"needed": True, "questions": [
+        "Think through the research findings and turn them into the key "
+        "decisions, implications and evidence-based recommendation."
+    ]}
+    return True
+
+
 def apply_script_guardrail(routing: dict, agents: dict) -> bool:
     """A reel/video/deck needs WORDS — script, narration, captions, slide copy.
     That's the CONTENT agent's job. If MEDIA or PRESENTATION is about to
@@ -1322,6 +1346,9 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     if forced:
         pretty = ", ".join(f"{s} ({agents.get(s) or A.summary_agent_name(agents)})" for s in forced)
         ui.info(f"🛡️  guardrail enabled required stage(s): {pretty}")
+    if apply_research_reasoning_guardrail(routing, agents):
+        ui.info(f"🛡️  guardrail enabled Think it through ({agents['brains']}) "
+                "after research")
     if apply_script_guardrail(routing, agents):
         ui.info(f"🛡️  guardrail enabled content ({agents['content']}) — "
                 "the reel/deck's script is a content job, not a brains job")

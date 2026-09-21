@@ -3,7 +3,7 @@ title: Cold outreach email
 description: A first email to someone who did not ask to hear from you — short, specific to them, one ask, no claim that cannot be stood behind.
 features: [leads.reach]
 stages: [content]
-triggers: [cold email, cold outreach, outreach, prospecting email, first touch, intro email, sales email, mail merge]
+triggers: [cold email, cold outreach, sales outreach, prospecting email, first touch email, sales email, b2b cold email]
 transport: [browser, api]
 budget: 3000
 version: 1

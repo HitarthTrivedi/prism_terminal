@@ -2,7 +2,7 @@
 title: Documentation
 description: A user guide, manual, SOP, runbook, README or API reference — written so someone can do the task without asking anyone.
 stages: [content, development]
-triggers: [documentation, docs, document the, document how, documenting, user guide, user manual, manual, readme, sop, standard operating procedure, runbook, handbook, api reference, api docs, how-to, installation guide, troubleshooting]
+triggers: [documentation, docs, document the api, document how, user guide, user manual, manual, readme, sop, standard operating procedure, runbook, handbook, api reference, api docs, how-to, installation guide, troubleshooting]
 transport: [browser, api]
 budget: 3400
 version: 1

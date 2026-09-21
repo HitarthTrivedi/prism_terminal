@@ -38,6 +38,7 @@ version: 1
 | `stages` | pipeline stages the router may attach it to (`research leads brains content visual media audio development presentation summary`) |
 | `features` | add-on jobs that append it themselves via `skills.addendum("<feature>")`, e.g. `boq.format`, `inquiry.negotiation`, `leads.reach` |
 | `triggers` | words or phrases in the person's own request that attach the skill when the router did not. Only ONE skill is attached this way, the one mentioned earliest, so triggers should be the words someone uses for *this* deliverable and nothing broader |
+| `only_when_asked` | optional, `true` or `false`. `true` means the router's pick is kept only when one of the `triggers` appears in the person's own words. Use it for a skill that dictates a file format or document type (PDF, Word), so a format nobody asked for is never typed into a step. A customer override that leaves the key out keeps the shipped value |
 | `transport` | `browser` (typed into ChatGPT, Claude, Canva …), `api` (a direct Groq call), or both |
 | `budget` | characters typed over browser transport; the body is cut at a paragraph boundary past this |
 | `version` | bump when the doctrine changes in a way a customer override should be re-read against |
@@ -141,6 +142,8 @@ in the request, then the one with the most matches. So:
   `document` in "document the api".
 - A skill with no triggers is fine. It then only ever runs when the planner
   names it, which is the right choice for doctrine that needs judgement.
+  (Not with `only_when_asked: true`: that flag needs at least one trigger,
+  or the skill can never be attached.)
 
 ## Seeing what applies
 

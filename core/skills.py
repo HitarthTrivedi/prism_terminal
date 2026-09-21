@@ -28,8 +28,10 @@ Two ways in
     it applies to (`stages:` in the frontmatter) and puts the fitting keys
     in that stage's "skills" list. `assign()` validates what it chose and
     falls back to `triggers:` matched against the person's own words, the
-    same way the make-stage guardrail backs up the router. automation.run
-    then types `block()` into the stage prompt after the person's words.
+    same way the make-stage guardrail backs up the router. A skill marked
+    `only_when_asked: true` is kept from the router's pick only when one of
+    its triggers appears in those words. automation.run then types
+    `block()` into the stage prompt after the person's words.
   · FEATURE. An add-on that builds its own prompt (BOQ, drafting, Reel …)
     appends `addendum("<feature>")` — the skills whose `features:` list
     names that job. Nothing is injected when no skill claims the job, so
@@ -110,6 +112,11 @@ class Skill:
     overridden: bool = False
     notes: str = ""
     checks_path: str = ""
+    # True: a format skill the router may attach only when the person's OWN
+    # words ask for that kind of deliverable (a trigger appears in them).
+    # None means the frontmatter did not say, so an override inherits the
+    # shipped value; see assign().
+    only_when_asked: bool | None = None
 
     @property
     def has_checks(self) -> bool:
@@ -187,6 +194,19 @@ def _as_int(value, default: int) -> int:
         return default
 
 
+def _as_flag(value) -> bool | None:
+    """A frontmatter yes/no. None when the key is absent or unreadable, so
+    an override that says nothing keeps what the shipped skill said."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower() if value is not None else ""
+    if text in ("true", "yes", "on", "1"):
+        return True
+    if text in ("false", "no", "off", "0"):
+        return False
+    return None
+
+
 def _as_list(value) -> list:
     """Whatever the planner put in "skills", as a list.
 
@@ -236,6 +256,7 @@ def _parse(key: str, folder: str, shipped_checks: str = "",
         path=folder,
         overridden=overridden,
         checks_path=shipped_checks,
+        only_when_asked=_as_flag(meta.get("only_when_asked")),
     )
 
 
@@ -303,6 +324,8 @@ def reload() -> dict:
                 override.features = override.features or base.features
                 override.triggers = override.triggers or base.triggers
                 override.description = override.description or base.description
+                if override.only_when_asked is None:
+                    override.only_when_asked = base.only_when_asked
                 override.title = (base.title if override.title == key
                                   else override.title)
             skills[key] = override
@@ -425,6 +448,18 @@ def assign(query: str, routing: dict, stages) -> dict:
         for k in raw or []:
             k = str(k).strip().lower() if isinstance(k, (str, int)) else ""
             if k in avail and k not in keys:
+                if avail[k].only_when_asked and _trigger_score(avail[k], q)[2] == 0:
+                    # A format skill (a PDF or Word document's rulebook, say)
+                    # the planner named although the person never asked for
+                    # that format. The planner writes from a brief a model
+                    # expanded from the request, and two of the owner's three
+                    # reel tasks of 21 Sep 2026 got a quote-and-price document
+                    # rulebook typed into the storyboard step because that
+                    # brief invented "a storyboard PDF". The person's own
+                    # words decide, as they do for the fallback.
+                    ui.info(f"📘  {stage}: skill {k} left off — nothing in "
+                            "the request asks for that kind of document")
+                    continue
                 keys.append(k)
         if not keys and data.get("needed"):
             # ONE, not two. A planner that names two skills has reasoned

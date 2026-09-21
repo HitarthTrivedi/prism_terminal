@@ -679,24 +679,55 @@ def _schema_stub(agents: dict) -> str:
     return "{\n" + ",\n".join(parts) + "\n}"
 
 
-def enrich_query(query: str, profile: str, api_key: str, model: str) -> str:
+def _attached_line(attachments) -> str:
+    """What is really attached, in a line the brief step cannot misread. The
+    brief was inventing attachments ("incorporate the attached cultural study
+    excerpts") from a request that only MENTIONED a study."""
+    names = [str(a.get("name") or "").strip() for a in (attachments or [])
+             if isinstance(a, dict)]
+    names = [n for n in names if n]
+    if names:
+        return "Files the user attached: " + ", ".join(names) + ".\n"
+    return "Files the user attached: none.\n"
+
+
+def enrich_query(query: str, profile: str, api_key: str, model: str,
+                 attachments: list | None = None) -> str:
     """Pre-pass: expand the user's raw request into a professional task brief.
     This is what separates a human's one-liner from an engineered prompt — the
     router then writes every stage prompt FROM this brief. Returns "" on any
-    failure so routing still works without it."""
+    failure so routing still works without it.
+
+    The brief sharpens the request and never enlarges it. Told to fill in the
+    deliverable, the constraints and "things the user didn't say", the model
+    invented them: on 21 Sep 2026 the briefs for plain reel requests asked for
+    ".docx (script) + .pdf (storyboard)", a ₹12,000 budget and "the attached
+    cultural study excerpts" -- none of it asked for, nothing attached -- and
+    the planner then wrote a PDF step and attached a document rulebook to it."""
     profile_line = f'The user describes themselves as: "{profile}".\n' if profile else ""
+    attach_line = _attached_line(attachments)
     prompt = f"""You are a senior prompt engineer. Expand the raw request below into a crisp
 professional TASK BRIEF that a downstream AI pipeline will use to write prompts.
 Do NOT answer or perform the task itself.
 
-{profile_line}Cover, in at most 220 words, as plain bullet lines:
+THE BRIEF SHARPENS THE REQUEST; IT NEVER ENLARGES IT.
+- Every deliverable, file type, tool, platform, length, budget and deadline in
+  the brief must come from the raw request. Where the request does not say,
+  write "not specified" -- never fill the gap with a guess. A file type nobody
+  named is "not specified", not ".pdf".
+- Do not add a second deliverable beside the one asked for: no extra script
+  file, storyboard PDF, report, deck or spreadsheet.
+- A file is attached only if it is listed below. Mentioning a study, a report
+  or a source in the request does not make it an attachment.
+
+{attach_line}{profile_line}Cover, in at most 220 words, as plain bullet lines:
 - GOAL: the outcome the user actually wants (read intent, not just words)
-- DELIVERABLE & FORMAT: exact artefact(s) and the structure/sections expected
+- DELIVERABLE & FORMAT: the artefact(s) the user asked for and the structure/sections it needs
 - AUDIENCE & TONE
 - SCOPE: explicitly IN and explicitly OUT (respect words like "only" / "don't")
-- CONSTRAINTS & GIVENS: tech, languages, budget, sources, attached material
-- QUALITY BAR: 2-3 measurable criteria a professional result must meet
-- IMPLICIT NEEDS: things the user didn't say but a professional would include
+- CONSTRAINTS & GIVENS: only what the request states -- languages, budget, sources, attached material -- or "none stated"
+- QUALITY BAR: 2-3 criteria a professional result must meet, judged from the result itself
+- IMPLICIT NEEDS: what a professional would put INSIDE the requested deliverable that the user didn't spell out -- never extra files, formats, tools or work products
 
 Raw request:
 {query}
@@ -932,7 +963,10 @@ def build_prompt(query: str, profile: str, agents: dict, attachments: list | Non
     brief_block = (
         "\n═══ TASK BRIEF (auto-expanded from the raw request by a prompt-"
         "engineering pass; mine it for context, deliverable specs, quality "
-        "criteria and non-goals when writing each stage prompt) ═══\n"
+        "criteria and non-goals when writing each stage prompt. It restates "
+        "the request and never adds to it: where it names a deliverable, "
+        "file type, budget or attachment that the person's own words do "
+        "not, ignore that part) ═══\n"
         f"{brief}\n" if brief else ""
     )
     return f"""You are the planner of Prism — a desktop app that runs real AI
@@ -1303,7 +1337,8 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     model = cfg.get("model", "llama-3.3-70b-versatile")
     brief = ""
     try:
-        brief = enrich_query(query, cfg.get("profile", ""), api_key, model)
+        brief = enrich_query(query, cfg.get("profile", ""), api_key, model,
+                             attachments)
         if brief:
             ui.info("🪄  expanded your request into a professional task brief")
     except Exception:

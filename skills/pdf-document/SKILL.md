@@ -3,6 +3,7 @@ title: PDF or Word document
 description: A document that will be printed, sent as a PDF or opened in Word — brochure, datasheet, one-pager, proposal, product document or report. Built page by page, with the front page working on its own.
 stages: [content, presentation, development]
 triggers: [pdf, docx, word document, word doc, word file, document, brochure, datasheet, data sheet, one-pager, one pager, leaflet, flyer, whitepaper, white paper, proposal, catalogue, catalog, spec sheet, annual report, case study pdf]
+only_when_asked: true
 transport: [browser, api]
 budget: 3200
 version: 1

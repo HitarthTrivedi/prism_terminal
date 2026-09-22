@@ -215,6 +215,13 @@ def find(desc: str, cfg: dict) -> dict:
     """Resolve a natural-language location description.
     Returns {"folders": hints, "filename": hint, "dir": best_dir_or_None,
              "files": [matched paths], "score": best_match_confidence_or_None}."""
+    expanded = os.path.abspath(os.path.expanduser(desc.strip()))
+    if os.path.exists(expanded):
+        if os.path.isdir(expanded):
+            return {"folders": [desc], "filename": None, "dir": expanded, "files": [], "score": 1.0}
+        return {"folders": [os.path.dirname(expanded)], "filename": os.path.basename(expanded),
+                "dir": os.path.dirname(expanded), "files": [expanded], "score": 1.0}
+
     parsed = parse_description(desc, cfg)
     filename = parsed.get("filename")
     # Defensive net: a "filename" with no extension that just repeats one of

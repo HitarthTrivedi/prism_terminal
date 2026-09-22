@@ -160,8 +160,9 @@ MAX_DIR_FILES = 15
 
 
 def attach_dir(path: str) -> list[dict]:
-    """Attachment records for every plain file directly inside a folder
-    (hidden files skipped, capped at MAX_DIR_FILES)."""
+    """Attachment records for every plain file directly inside a folder,
+    falling back to subdirectories if none are in the root (hidden files
+    skipped, capped at MAX_DIR_FILES)."""
     path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isdir(path):
         raise NotADirectoryError(path)
@@ -175,7 +176,20 @@ def attach_dir(path: str) -> list[dict]:
         except Exception:
             continue
         if len(out) >= MAX_DIR_FILES:
-            break
+            return out
+    if not out:
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in sorted(files):
+                if name.startswith("."):
+                    continue
+                fp = os.path.join(root, name)
+                try:
+                    out.append(attach(fp))
+                except Exception:
+                    continue
+                if len(out) >= MAX_DIR_FILES:
+                    return out
     return out
 
 

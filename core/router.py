@@ -391,6 +391,39 @@ def apply_make_guardrail(query: str, routing: dict, agents: dict) -> list[str]:
     return forced
 
 
+_RESEARCH_TERMS = [
+    "research", "deep research", "look up", "investigate", "investigation",
+    "sources", "citations", "fact-finding", "background analysis", "market study",
+    "web search", "find out", "gather information", "look into",
+    # broader research intent — phrases that clearly mean "go and find facts"
+    "find information", "find data", "find sources", "find me facts",
+    "data on", "information about", "facts about",
+    "market research", "competitive analysis", "competitive landscape",
+    "trends in", "industry report", "latest news", "recent news",
+    "background on", "context on", "learn about",
+]
+
+
+def apply_research_guardrail(query: str, routing: dict, agents: dict) -> bool:
+    """Ensure research stage is enabled when the task explicitly asks for research
+    and the user has a research agent configured."""
+    if not agents.get("research"):
+        return False
+    data = routing.get("research") or {}
+    if data.get("needed") and data.get("questions"):
+        return False
+    q = query.lower()
+    if _mentions(q, _RESEARCH_TERMS):
+        routing["research"] = {
+            "needed": True,
+            "questions": [
+                f"Research and gather facts, sources, data, and background on: {query.strip()}"
+            ]
+        }
+        return True
+    return False
+
+
 def apply_research_reasoning_guardrail(routing: dict, agents: dict) -> bool:
     """A genuine research pass is followed by Prism's reasoning pass.
 
@@ -1381,6 +1414,8 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     if forced:
         pretty = ", ".join(f"{s} ({agents.get(s) or A.summary_agent_name(agents)})" for s in forced)
         ui.info(f"🛡️  guardrail enabled required stage(s): {pretty}")
+    if apply_research_guardrail(query, routing, agents):
+        ui.info(f"🛡️  guardrail enabled Look things up ({agents['research']}) for research task")
     if apply_research_reasoning_guardrail(routing, agents):
         ui.info(f"🛡️  guardrail enabled Think it through ({agents['brains']}) "
                 "after research")

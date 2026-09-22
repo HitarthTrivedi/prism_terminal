@@ -1666,9 +1666,16 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
         try:
             busy = driver.execute_script(
                 """
-                const sels = "[role='progressbar'], progress, .animate-spin, [aria-busy='true'], [data-testid*='progress']";
-                return Array.from(document.querySelectorAll(sels))
-                            .some(el => el.offsetParent !== null);
+                const sels = "[role='progressbar'], progress, .animate-spin, [aria-busy='true'], [data-testid*='progress'], [data-testid*='upload'], [class*='uploading'], [class*='upload-progress']";
+                if (Array.from(document.querySelectorAll(sels)).some(el => el.offsetParent !== null)) {
+                    return true;
+                }
+                const sendBtn = document.querySelector("button[data-testid='send-button'], button[aria-label*='Send'], button[type='submit']");
+                if (sendBtn && (sendBtn.disabled || sendBtn.getAttribute("aria-disabled") === "true")) {
+                    const atts = document.querySelectorAll("[data-testid*='attachment'], [data-testid*='file'], [class*='attachment']");
+                    if (atts.length > 0) return true;
+                }
+                return false;
                 """)
         except Exception:
             busy = False
@@ -2302,7 +2309,7 @@ def _harvest_files(driver, agent_cfg, stage: str, ignore_names=(),
 
 # Stages whose deliverable is usually a file. Every OTHER stage is looked at
 # too (see _harvest_stage_files), but these get the patient wait.
-_FILE_STAGES = ("development", "presentation", "format", "content", "write", "audio")
+_FILE_STAGES = ("brains", "development", "presentation", "format", "content", "write", "audio")
 
 # A reply that says a file is coming, even when no link is on the page yet.
 _FILE_HINT_RE = re.compile(
@@ -7394,31 +7401,39 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         time.sleep(1.5)
 
                         # Submit — try the button, fall back to Enter.
-                        submitted = False
+                        # When attachments or rich content are present, the page may keep the
+                        # send button disabled for several seconds while uploading/indexing.
+                        # Poll and retry submit with a generous window so we don't abort prematurely.
                         sel = agent_cfg.get("submit_selector", "")
-                        if sel:
-                            try:
-                                btn = WebDriverWait(driver, 5).until(
-                                    EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
-                                btn.click()
-                                submitted = True
-                            except Exception:
-                                pass
-                        if not submitted:
-                            textarea.send_keys(Keys.ENTER)
+                        has_attachments = bool(attachments or stage_files)
+                        submit_deadline = time.time() + (35 if has_attachments else 12)
+                        sent = False
 
-                        # `submitted` only ever meant "click() did not raise".
-                        # A composer that still holds the prompt did not send
-                        # it — try the other route once, then say so rather
-                        # than waiting out the full cap for an answer to a
-                        # question nobody was asked.
-                        if not _prompt_was_sent(driver, textarea, full_prompt):
+                        while time.time() < submit_deadline:
+                            if sel:
+                                try:
+                                    btn = driver.find_element(By.CSS_SELECTOR, sel)
+                                    is_disabled = driver.execute_script(
+                                        "return arguments[0].disabled || arguments[0].getAttribute('aria-disabled') === 'true';",
+                                        btn)
+                                    if not is_disabled and btn.is_displayed():
+                                        btn.click()
+                                        if _prompt_was_sent(driver, textarea, full_prompt, timeout=2):
+                                            sent = True
+                                            break
+                                except Exception:
+                                    pass
                             try:
                                 textarea.send_keys(Keys.ENTER)
+                                if _prompt_was_sent(driver, textarea, full_prompt, timeout=2):
+                                    sent = True
+                                    break
                             except Exception:
                                 pass
-                            if not _prompt_was_sent(driver, textarea,
-                                                    full_prompt, timeout=8):
+                            time.sleep(1)
+
+                        if not sent:
+                            if not _prompt_was_sent(driver, textarea, full_prompt, timeout=6):
                                 raise RuntimeError(
                                     f"{agent_name} would not accept the prompt "
                                     "— it is still sitting in the message box")

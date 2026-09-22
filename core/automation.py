@@ -2339,7 +2339,7 @@ def _harvest_stage_files(driver, agent_cfg, stage: str, texts,
                               click_fallback=True)
     # Some agents append the file card after their text without mentioning a
     # filename. Give the page a short chance to expose it on every stage.
-    n = _wait_for_files(driver, stage=stage, cap=8, grace=4)
+    n = _wait_for_files(driver, stage=stage, cap=0, grace=0)
     hinted = any(_FILE_HINT_RE.search(t or "") for t in (texts or []))
     if not n and not hinted:
         return []

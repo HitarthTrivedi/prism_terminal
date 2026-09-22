@@ -7375,6 +7375,21 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 f"the prompt would not go into {agent_name}'s "
                                 "message box — nothing was sent")
 
+                        # The DOM having the text is not proof the page's OWN
+                        # framework has: on a composer that only just became
+                        # present (a fresh "New chat", or straight off
+                        # navigation) the text can land — _text_landed reads
+                        # raw innerText/value, which is all it CAN read — a
+                        # beat before React finishes wiring the control up,
+                        # so the send button stays inert to a click that
+                        # raises nothing and an Enter the framework never
+                        # sees. A short settle here, only once real text is
+                        # confirmed in the box, costs nothing next to the
+                        # minutes this stage already waits for a reply, and
+                        # is cheaper than the run reporting the prompt never
+                        # sent at all (see agents.py's page_wait comments).
+                        time.sleep(1.5)
+
                         # Submit — try the button, fall back to Enter.
                         submitted = False
                         sel = agent_cfg.get("submit_selector", "")

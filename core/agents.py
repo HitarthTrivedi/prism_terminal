@@ -517,6 +517,15 @@ AGENT_REGISTRY = {
         "routing an ordinary image request through Canva returns a stock "
         "template and loses the picture they asked for",
         "Freemium", "5–20s", 120,
+        # The busiest tool in the registry, on the thinnest settle time of
+        # any of them (_GENERIC has none; every other agent that sets its
+        # own is 8-14s). A "New chat" click swaps in a fresh composer that
+        # is present in the DOM before React has finished wiring it up --
+        # typing lands (raw DOM text, which is all _text_landed can check),
+        # the click or Enter that follows does nothing because the
+        # framework's OWN state never saw it, and the run reports "would
+        # not accept the prompt" on a page that looks, to the eye, ready.
+        page_wait=10,
         textarea_selector="#prompt-textarea",
         # A CHAIN, not one selector. OpenAI rolls the conversation DOM out in
         # buckets, so two customers on the same day can see different markup:
@@ -568,6 +577,12 @@ AGENT_REGISTRY = {
         "https://claude.ai",
         "advanced coding, complex documentation, UI artifacts & long-form reasoning",
         "Freemium", "10–30s", 300,
+        # See ChatGPT's page_wait comment above -- same fix, same reasoning.
+        # Claude's textarea_selector is also the broadest, most generic one
+        # in the registry (any contenteditable div), which a page is more
+        # likely to satisfy with something present-but-not-yet-live sooner
+        # after navigation than a narrower selector would.
+        page_wait=10,
         textarea_selector="div[contenteditable='true']",
         # .font-claude-response is the newer class; the old one is kept ahead
         # of it so nothing changes for a customer still served the old markup.

@@ -2320,10 +2320,13 @@ def _harvest_stage_files(driver, agent_cfg, stage: str, texts,
     research or summary step for "an Excel of the results" produced it, and
     Prism walked past: the file was never saved, and when the reply was the
     file alone the step read as "Prism couldn't read the response". Now the
-    file stages keep their patient wait, and every other stage gets a free
-    look -- one probe of the page, no sleep -- and a real wait only when the
-    page already shows a file link or the reply's own words say one is
-    coming. A plain-text step costs nothing extra."""
+    file stages keep their patient wait, and every other stage gets a short,
+    capped look (see _wait_for_files' cap/grace below) even with no hint in
+    the reply's own words -- some agents append the file card after their
+    text with no filename anywhere in it, so a zero-cost single probe still
+    missed those. A real, much longer wait is reserved for when the page
+    already shows a file link or the reply's own words say one is coming.
+    A plain-text step pays the short grace window, never the long one."""
     ignore = set()
     for a in attachments or []:
         if isinstance(a, dict):

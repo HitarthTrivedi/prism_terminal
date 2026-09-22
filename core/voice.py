@@ -99,6 +99,40 @@ def choose(hint: str) -> str:
         sys.stdout.flush()
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _silence_alsa():
+    """Silence ALSA / JACK library C-level stderr noise on Linux during device scan."""
+    if os.name == "nt":
+        yield
+        return
+    try:
+        from ctypes import CFUNCTYPE, c_char_p, c_int, cdll
+        c_error_handler = CFUNCTYPE(None, c_char_p, c_int, c_char_p, c_int, c_char_p)(lambda *_: None)
+        asound = cdll.LoadLibrary("libasound.so.2")
+        asound.snd_lib_error_set_handler(c_error_handler)
+    except Exception:
+        pass
+    try:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        saved_stderr = os.dup(2)
+        os.dup2(devnull, 2)
+    except Exception:
+        saved_stderr = None
+    try:
+        yield
+    finally:
+        if saved_stderr is not None:
+            try:
+                os.dup2(saved_stderr, 2)
+                os.close(saved_stderr)
+                os.close(devnull)
+            except Exception:
+                pass
+
+
 def record_until(should_stop) -> bytes:
     """Record the mic until `should_stop()` returns True. Returns a WAV byte
     string. Pulled out of record_and_transcribe() so any front-end (CLI
@@ -106,9 +140,10 @@ def record_until(should_stop) -> bytes:
     without re-implementing the actual PyAudio capture."""
     import pyaudio
 
-    pa = pyaudio.PyAudio()
-    stream = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
-                     input=True, frames_per_buffer=CHUNK)
+    with _silence_alsa():
+        pa = pyaudio.PyAudio()
+        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
+                         input=True, frames_per_buffer=CHUNK)
     frames: list[bytes] = []
     start = time.time()
     try:

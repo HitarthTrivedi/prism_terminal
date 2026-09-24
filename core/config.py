@@ -189,18 +189,20 @@ def active_agents(cfg: dict) -> dict:
     return {k: v for k, v in (cfg.get("agents") or {}).items() if v}
 
 
-def save_run(record: dict, runs_dir: str = "") -> str:
+def save_run(record: dict, runs_dir: str = "", path: str = "") -> str:
     """Persist one query's routing + responses to <runs_dir>/run_<ts>.json.
 
     `runs_dir` defaults to ~/.prism/runs, which is where the CLI has always
     written and still does. The GUI passes a per-member folder instead when
     the copy belongs to a company team, so one person's history does not land
-    in another's — see prism_gui/workspace.py.
+    in another's — see prism_gui/workspace.py. If `path` is specified, updates
+    that exact file in-place so follow-ups belong to the same task history.
     """
     import time
     runs_dir = runs_dir or RUNS_DIR
     os.makedirs(runs_dir, exist_ok=True)
-    path = os.path.join(runs_dir, f"run_{int(time.time())}.json")
+    if not path:
+        path = os.path.join(runs_dir, f"run_{int(time.time())}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=2, ensure_ascii=False)
     return path
@@ -308,7 +310,7 @@ def begin_run(task: str, title: str = "") -> str:
                     "Everything Prism produced for this run is in this folder.\n")
     except OSError:
         pass
-    _run.update(task=task, dir=folder, title=title)
+    _run.update(task=task, dir=folder, title=title, continued=False)
     return folder
 
 
@@ -320,6 +322,19 @@ def current_run_dir() -> str:
     """The folder the current run's artifacts go to, or "" before any run."""
     folder = _run.get("dir") or ""
     return folder if folder and os.path.isdir(folder) else ""
+
+
+def continue_run(folder: str, task: str = "", title: str = "") -> str:
+    """Anchor future artifact writes to an existing run folder instead of
+    opening a brand-new timestamped folder. Used for follow-ups and edits so
+    all artifacts of a task remain in one unified directory.
+    """
+    if not folder or not os.path.isdir(folder):
+        return begin_run(task, title)
+    task_name = task or _run.get("task") or os.path.basename(os.path.dirname(folder)) or "Task"
+    run_title = title or _run.get("title") or task_name
+    _run.update(task=task_name, dir=folder, title=run_title, continued=True)
+    return folder
 
 
 def artifact_task_dir(task: str) -> str:
@@ -339,7 +354,7 @@ def artifact_task_dir(task: str) -> str:
     """
     if not task:
         return artifacts_root()
-    if _run.get("task") == task and current_run_dir():
+    if (_run.get("continued") or _run.get("task") == task) and current_run_dir():
         return _run["dir"]
     return begin_run(task)
 
@@ -384,6 +399,14 @@ def save_artifact(src_path: str, prompt: str, kind: str = "artifact",
                             else f"{stem}_{n}{ext}")
     import shutil
     shutil.copy2(src_path, dest)
+    if ext.lower() == ".mp4":
+        src_json = os.path.splitext(src_path)[0] + ".json"
+        if os.path.isfile(src_json):
+            try:
+                dest_json = os.path.splitext(dest)[0] + ".json"
+                shutil.copy2(src_json, dest_json)
+            except OSError:
+                pass
     if link:
         try:
             with open(dest + ".link.txt", "w", encoding="utf-8") as f:

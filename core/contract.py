@@ -106,7 +106,8 @@ _FILE_REQUEST = [re.compile(p, re.I) for p in (
 #: Asking for a download without naming a format.
 _DOWNLOAD_REQUEST = re.compile(
     r"\b(?:downloadable|download link|as a file|send me the file"
-    r"|give me the file)\b", re.I)
+    r"|give me the file|(?:give me|send me|make|create|generate|provide)\s+(?:an?\s+)?(?:document|doc|file|report)"
+    r"|as\s+a\s+(?:document|doc|file|report))\b", re.I)
 
 #: The word right before a format that makes it the INPUT, not the output:
 #: "the attached PDF", "this spreadsheet", "your deck".

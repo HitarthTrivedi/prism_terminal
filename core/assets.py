@@ -542,8 +542,22 @@ def collect(images: list, out_dir: str | None = None,
     if logo is not None:
         rest.remove(logo)
         table["logo"] = {**logo, "kind": "logo"}
-    for i, a in enumerate(rest, 1):
-        table[f"art{i}"] = {**a, "kind": "art"}
+
+    # When newly generated artworks exist, they are the primary production
+    # deliverables for the reel! Prioritize them as art1, art2, etc.
+    # Source attachments that were provided as inspiration/reference are placed
+    # after the production artworks and marked as reference-only.
+    made_items = [a for a in rest if a.get("made")]
+    source_items = [a for a in rest if not a.get("made")]
+
+    if made_items:
+        for i, a in enumerate(made_items, 1):
+            table[f"art{i}"] = {**a, "kind": "art"}
+        for j, a in enumerate(source_items, 1):
+            table[f"ref{j}"] = {**a, "kind": "reference", "reference_only": True}
+    else:
+        for i, a in enumerate(rest, 1):
+            table[f"art{i}"] = {**a, "kind": "art"}
     return table
 
 
@@ -585,19 +599,30 @@ def manifest(table: dict) -> str:
     if not table:
         return NO_ARTWORK
     lines, wide, opaque, clear = [], [], [], []
+    has_made = any(a.get("made") for a in table.values())
+
     for name, a in table.items():
-        if a.get("made"):
-            what = ("a mark generated for this reel" if a["kind"] == "logo"
-                    else "imagery generated for this reel")
+        if a.get("kind") == "logo":
+            what = ("a mark generated for this reel" if a.get("made")
+                    else "the client's own mark, taken from their artwork")
+        elif a.get("made"):
+            what = "PRODUCTION ARTWORK (newly generated for this reel — MUST BE FEATURED)"
+        elif a.get("reference_only") or (has_made and not a.get("made")):
+            what = "REFERENCE ONLY (source inspiration material) — DO NOT place in reel scenes; feature the production artwork instead"
         else:
-            what = ("the client's own mark, taken from their artwork"
-                    if a["kind"] == "logo" else "artwork the client supplied")
+            what = "artwork the client supplied"
+
         if a.get("composite"):
             lines.append(f'  asset:{name} — {a["w"]}x{a["h"]}, '
                          'REJECTED CONTACT SHEET / REFERENCE-ONLY — '
                          'do not place this board or guess panel crops; '
                          'request separate images for production.')
             continue
+
+        if a.get("reference_only") or (has_made and not a.get("made") and a.get("kind") != "logo"):
+            lines.append(f'  asset:{name} — {a["w"]}x{a["h"]} — {what}')
+            continue
+
         if a["alpha"]:
             cut = "transparent PNG, soft edges"
             clear.append(f"asset:{name}")
@@ -613,30 +638,19 @@ def manifest(table: dict) -> str:
             wide.append(f"asset:{name}")
     if clear:
         lines.append(
-            "\nTHE TRANSPARENT ONES — " + ", ".join(clear) + " — need no "
-            "backing. Place them straight on the background, on a colour "
-            "field, or beside type, and let their edges breathe. Do not draw "
-            "a card, box or panel behind one to 'contain' it: the cut-out IS "
-            "the shape, and a box around it reads as a placeholder.")
+            "\nTHE TRANSPARENT ONES — " + ", ".join(clear) + " — have transparent cutouts and "
+            "need no backing. Place them directly on the background or colour field, sized generously (occupying 40-60% of the frame) "
+            "so the full product is celebrated. Let their edges breathe. Never clip them with polygon masks.")
     if opaque:
-        # The 2026-09-07 reel: told only that a picture was "opaque", the
-        # art director set it down as a rectangle in the middle of the paper
-        # with a grey plate behind it. An opaque picture has exactly three
-        # good uses, and they are named rather than left to be guessed.
         lines.append(
             "\nTHE OPAQUE ONES — " + ", ".join(opaque) + " — carry their own "
-            "background, and a rectangle of somebody else's background sitting "
-            "in the middle of the frame is the commonest way a picture ruins a "
-            "reel. Treat each as a PHOTOGRAPH, one of three ways: (1) "
-            "FULL-BLEED — the picture fills the frame or a whole band of it, "
-            "`object-fit: cover` with `object-position` on the part that "
-            "matters, and the copy sits on a solid or translucent panel over "
-            "it; (2) INSIDE A SHAPE — a `clip-path`, a circle, a tall rounded "
-            "frame — so the crop is obviously deliberate; (3) AS A PLATE — "
-            "edge-to-edge across the frame's width with a rule above and "
-            "below, part of the layout's grid. Never a bare <img> at its own "
-            "size floating on empty paper, and never a drop-in with a soft "
-            "grey box behind it.")
+            "background. Treat each as a PHOTOGRAPH, in one of these clean editorial ways: "
+            "(1) FULL-BLEED — the picture fills the frame or an intentional band, "
+            "`object-fit: cover` with `object-position` on the hero area, paired with a readable translucent or solid backing under copy; "
+            "(2) ARCHED OR ROUNDED EDITORIAL FRAME — an elegant tall arch (`border-radius: 400px 400px 0 0`) or generous rounded card (`border-radius: 24px-36px`) with `overflow: hidden`; "
+            "(3) HORIZONTAL EDITORIAL PLATE — edge-to-edge across the frame's width with fine framing rules. "
+            "\nCRITICAL: NEVER use arbitrary polygon clip-paths (`clip-path: polygon(...)`) to chop or slice product photos. Diagonal polygon cuts slice through products, specs, and labels. Products must always remain intact, complete, and unclipped. "
+            "Never place a tiny <img> floating loosely on empty space with a grey box.")
     if wide:
         lines.append(
             "\nTHESE ARE WIDER THAN THEY ARE TALL — " + ", ".join(wide) +

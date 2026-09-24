@@ -301,6 +301,32 @@ def storyboard_sheet(paths: list[str]) -> str:
                     pass
 
 
+def is_valid_audio(audio_path: str) -> bool:
+    """True if audio_path exists, is not empty, is not an HTML error page,
+    and carries valid audio headers/streams."""
+    try:
+        if not audio_path or not os.path.isfile(audio_path):
+            return False
+        if os.path.getsize(audio_path) < 128:
+            return False
+        with open(audio_path, "rb") as f:
+            head = f.read(512)
+        if head.lstrip().startswith((b"<!DOCTYPE", b"<html", b"<?xml", b"<head", b"<body")):
+            return False
+        if head.startswith((b"ID3", b"RIFF", b"OggS", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")) or b"ftyp" in head[:16]:
+            return True
+        import shutil
+        probe_exe = shutil.which("ffprobe")
+        if probe_exe:
+            cmd = [probe_exe, "-v", "error", "-show_entries", "stream=codec_type",
+                   "-of", "csv=p=0", audio_path]
+            out = subprocess.check_output(cmd, text=True, timeout=10)
+            return "audio" in out
+        return True
+    except Exception:
+        return False
+
+
 def mix_audio(video_path: str, audio_path: str) -> str:
     """Replace a local render's soundtrack with a finished voice track.
 
@@ -316,6 +342,8 @@ def mix_audio(video_path: str, audio_path: str) -> str:
     if not (audio_path.lower().endswith(AUDIO_SUFFIXES)
             and os.path.isfile(audio_path)):
         raise ValueError("The generated voice-over is not a supported audio file.")
+    if not is_valid_audio(audio_path):
+        raise ValueError(f"The audio file {os.path.basename(audio_path)} is invalid or corrupt (unreadable audio header/packets).")
     video_dur = float(probe(video_path).get("duration") or 0)
     audio_dur = float(probe(audio_path).get("duration") or 0)
     if video_dur <= 0 and audio_dur <= 0:

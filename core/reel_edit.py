@@ -438,6 +438,15 @@ def serve(spec: dict, fps: int | None = None,
             self.end_headers()
             self.wfile.write(html)
 
+        def do_OPTIONS(self):
+            origin = self.headers.get("Origin", "")
+            self.send_response(204)
+            if origin and (origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:")):
+                self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
         def do_POST(self):
             callback = {"/save": on_save, "/autosave": on_save,
                         "/render": on_render}.get(self.path)
@@ -453,7 +462,7 @@ def serve(spec: dict, fps: int | None = None,
             # an empty body used to be accepted as "no edits" — wiping the
             # saved ones and starting a render.
             origin = self.headers.get("Origin", "")
-            if origin and not origin.startswith("http://127.0.0.1:"):
+            if origin and not (origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:")):
                 self.send_response(403)
                 self.end_headers()
                 return
@@ -470,6 +479,8 @@ def serve(spec: dict, fps: int | None = None,
             body = json.dumps({"ok": True, "edits": len(edits)}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            if origin and (origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:")):
+                self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -481,7 +492,7 @@ def serve(spec: dict, fps: int | None = None,
 
         def _refine(self):
             origin = self.headers.get("Origin", "")
-            if origin and not origin.startswith("http://127.0.0.1:"):
+            if origin and not (origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:")):
                 self.send_response(403)
                 self.end_headers()
                 return
@@ -508,6 +519,8 @@ def serve(spec: dict, fps: int | None = None,
             body = json.dumps({"ok": ok}).encode()
             self.send_response(200 if ok else 400)
             self.send_header("Content-Type", "application/json")
+            if origin and (origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:")):
+                self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

@@ -419,6 +419,14 @@ window.__check = function () {
                    Math.round(r.height) + ') runs off the frame');
         }
       }
+      const clip = cs.clipPath || '';
+      if (clip && clip.includes('polygon') && clip !== 'none') {
+        const key = 'polygon_clip|' + (el.getAttribute('alt') || el.tagName);
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push('product or artwork has a diagonal polygon clip-path (' + clip.slice(0, 40) + ') which slices off the artwork; use clean rectangular cards, rounded corners, arches, or unclipped containers');
+        }
+      }
     }
 
     // CSS animations are the motion contract. A missing fill mode causes a
@@ -894,12 +902,19 @@ def _scope(css: str, root: str, prefix: str, renames: dict) -> str:
                            (_scope_selector(s, root) for s in prelude.split(","))
                            if p)
         out.append(f"{scoped or root}{{{body}}}")
-    return "".join(out)
+def sanitize_scene_css(css: str) -> str:
+    """Neutralize destructive polygon clip-paths on images and cards.
+    A model told to make an 'editorial crop' sometimes writes
+    clip-path: polygon(...) which slices diagonally through products and text.
+    """
+    if not css:
+        return ""
+    return re.sub(r"clip-path\s*:\s*polygon\([^)]+\)\s*;?", "/* clip-path sanitized */", css, flags=re.I)
 
 
 def scope_css(css: str, idx: int) -> str:
     """A scene's own stylesheet, unable to reach any other scene."""
-    css = str(css or "").strip()
+    css = sanitize_scene_css(str(css or "").strip())
     if not css:
         return ""
     root, prefix = f"#s{idx}", f"s{idx}-"
@@ -982,7 +997,7 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         f"{fonts}"
         f"<style>{_HARNESS_CSS}</style>"
         f"<style>:root{{{root_vars}}}</style>"
-        f"<style>{_drop_missing(_place_assets(design.get('css', ''), design_uris))}</style>"
+        f"<style>{_drop_missing(_place_assets(sanitize_scene_css(design.get('css', '')), design_uris))}</style>"
         f"<style>{''.join(scene_css)}</style>"
         # A scene's own CSS commonly includes `.scene{position:relative}`.
         # Because scoping intentionally allows that selector to target the
@@ -1551,17 +1566,32 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "\n\nQUALITY BAR — design this as a short film, not a stack of social cards. "
         "The first 1.5 seconds need one unmistakable focal point; use one "
         "dominant composition per scene, a clear foreground/midground/background "
-        "hierarchy, and generous safe margins. Do not default to split-screen, "
-        "a narrow image strip, or a picture beside an oversized headline. Keep "
+        "hierarchy, and generous safe margins. "
+        "ONE HERO FOCAL POINT PER SCENE: Never pile multiple product photos into one scene with conflicting rotations, "
+        "tilted overlaps, or cluttered collage piles. A vertical mobile reel lasts 3-4 seconds per scene — the viewer can "
+        "only absorb ONE hero product focal point at a time. Make the featured product large, proud, and spacious "
+        "(occupying 40-60% of the visual weight). If a scene has bullet points or features, place them in a clean editorial "
+        "column with clear spacing, never overlapping or crowding the product. "
+        "BALANCED VERTICAL COMPOSITION: Distribute the composition with intentional balance across the 1080x1920 canvas. "
+        "Avoid leaving half the screen empty or clustering elements in one corner. "
+        "Never print giant random numbers (like '200 g') that overpower the product. "
+        "Labels and descriptions must accurately describe the featured artwork on screen. "
+        "Do not default to split-screen, a narrow image strip, or a picture beside an oversized headline. Keep "
         "all copy live HTML/CSS: generated images are visual ingredients only, "
         "never a finished poster or text-bearing storyboard."
-        "\nSHAPE DIRECTION — geometric elements must feel authored, not like "
-        "placeholders. Define one shape vocabulary for the whole reel (for "
-        "example: clipped editorial corners, a single orbital construction, "
+        "\nSHAPE & EDITORIAL FRAMING — geometric elements must feel authored, not like "
+        "placeholders. Define one cohesive framing system for the whole reel (for "
+        "example: classic architectural arches, soft rounded editorial cards, "
         "or a measured rule/grid system) and reuse it with variation. Every "
         "shape needs a job in the story or hierarchy. Use optical alignment, "
         "a small stroke scale (1px/2px/4px), intentional proportions, and "
-        "controlled opacity. Avoid random circles, generic pills, arbitrary "
+        "controlled opacity. "
+        "CRITICAL PRODUCT FRAMING: Never use arbitrary diagonal polygon clip-paths (`clip-path: polygon(...)`) "
+        "on product photography or artwork. Diagonal polygon cuts slice through the client's products, candles, jars, and labels. "
+        "Products must always remain intact, complete, and fully visible. Transparent cut-outs should float cleanly with natural "
+        "breathing room. Photographic cards should use clean rounded corners (`border-radius: 20px-36px`) or tall arches (`border-radius: 400px 400px 0 0`). "
+        "Avoid random floating shapes, decorative clutter, and stray measure lines that do not connect to the subject. "
+        "Avoid random circles, generic pills, arbitrary "
         "solid rectangles, decorative counters and corner marks, equal-weight "
         "decorations, and shapes that merely fill empty space. Geometry is "
         "optional: a single well-spaced phrase with a purposeful reveal can "
@@ -1572,7 +1602,7 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "or graphic system for every scene."
         "\nCOMPOSITION SYSTEM — use a consistent 12-column grid and an 8px rhythm. "
         "Align type, rules, and shape edges to shared guides; vary the span and "
-        f"offset, not the underlying grid. THE SAFE AREA: keep essential copy "
+        "offset, not the underlying grid. THE SAFE AREA: keep essential copy "
         f"inside {SAFE_AREA}. "
         "Use at most three typographic roles (display, support, micro-label) and "
         "no more than two families. Let negative space carry as much weight as "
@@ -1652,9 +1682,12 @@ def design_instructions(brand: dict | None = None, request: str = "",
         # confetti and nobody — not the model, not the check — knew a
         # picture had gone missing, because nothing had said where it went.
         + (("THE ASSET PLAN: `assets` on a row names the artwork that scene "
-            "carries, by the names on the list above and nothing else. Every "
-            "usable name should have an intentional placement. Assets flagged "
-            "unusable or reference-only must not be forced into a scene. "
+            "carries, by the names on the list above and nothing else. "
+            "SEQUENTIAL ARTWORK COVERAGE: When you have multiple production artworks (art1, art2, art3, etc.), "
+            "each scene must feature a DIFFERENT artwork across the reel (e.g. Scene 1 -> art1, Scene 2 -> art2, "
+            "Scene 3 -> art3, etc.). Do NOT repeat the same artwork across multiple scenes while leaving other artworks unused! "
+            "Every available production artwork must be showcased across the reel. "
+            "Assets flagged REFERENCE ONLY or unusable must not be placed into scenes. "
             "Use a valid supplied logo on the last row when available. "
             "The scene prompts that follow hold you to this, row by row.\n\n")
            if _asset_names(assets) else "")
@@ -1985,7 +2018,9 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
 
         + ((("ARTWORK THIS SCENE CARRIES (your storyboard): "
              + ", ".join(f"asset:{n}" for n in planned)
-             + ". Each must appear in this scene's markup or CSS, or the "
+             + ". Feature this artwork as the single hero focal point of this scene, "
+             "fully visible and unclipped (NEVER use diagonal polygon clip-paths). "
+             "Each must appear in this scene's markup or CSS, or the "
              "scene comes back.\n") if planned else "")
            # Named off the real list rather than hard-coded. The example used
            # to read `asset:logo` whether or not a logo existed, which is a
@@ -2010,7 +2045,8 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         + "Still in force from the design turn, not repeated here: THE LAYER "
           "CONTRACT, HOW MOTION WORKS (every animation ends in `both`, e.g. "
           f"`rise 800ms {ease_pick(idx)[1]} both`; time starts at 0 in this "
-          "scene), SHAPE DIRECTION and WHAT WILL BE REJECTED.\n"
+          "scene), SHAPE & EDITORIAL FRAMING (no diagonal polygon clip-paths), "
+          "ONE HERO FOCAL POINT (no multi-product tilted collages), and WHAT WILL BE REJECTED.\n"
           f"THE SAFE AREA: essential copy inside {SAFE_AREA}.\n\n"
 
         + "REPLY WITH ONLY THIS JSON OBJECT, in a ```json fenced code block "

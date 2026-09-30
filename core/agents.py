@@ -120,7 +120,7 @@ CATEGORIES = {
         "emoji": "🔊",
         "color": "audio",
         "desc": "Voice-over, narration, music & audio explainers",
-        "agents": ["ElevenLabs", "Suno"],
+        "agents": ["ElevenLabs", "Suno", "NotebookLM"],
     },
     "development": {
         "label": "Web, App & Tools",

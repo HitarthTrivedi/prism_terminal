@@ -74,6 +74,12 @@ DISCLOSED LIMITATIONS (not hidden — a wrong number is worse than a gap)
 from __future__ import annotations
 
 from . import skills as _SK
+# The unit picker (mm / inch / mil) has one conversion table, in
+# gerber_form.py, because the client's Excel form needed it first. Reusing
+# it here — rather than a second copy — is why a value picked in the GUI's
+# "Measurements in" box and a value written into a client's cell can never
+# quietly disagree on what 0.25 mm is in inch.
+from .gerber_form import _in_units as _to_unit, UNITS as _DISPLAY_UNITS
 
 import math
 import os
@@ -1531,7 +1537,17 @@ def panel(layers: list[GerberLayer]) -> dict:
         groups: dict[tuple, list] = {}
         for f in cands:
             x0, y0, x1, y1 = f.bounds
-            key = (round((x1 - x0) / _UNIT_TOL_MM), round((y1 - y0) / _UNIT_TOL_MM))
+            w_key = round((x1 - x0) / _UNIT_TOL_MM)
+            h_key = round((y1 - y0) / _UNIT_TOL_MM)
+            # A real panel with some copies rotated 90 deg to pack the
+            # frame better is still one board, not two — sorted so a
+            # board and its own rotated twin land in the same bucket.
+            # Un-sorted, a panel of e.g. 28 boards one way and 8 more of
+            # the SAME board turned 90 deg split into two size groups,
+            # and max() below silently kept only the bigger one: a real
+            # customer job came back 28-in-a-4x7-grid when the panel was
+            # actually 36, the missing 8 being exactly the rotated ones.
+            key = tuple(sorted((w_key, h_key)))
             groups.setdefault(key, []).append(f)
         if not groups:
             continue
@@ -1562,8 +1578,16 @@ def panel(layers: list[GerberLayer]) -> dict:
             ax0, ay0, ax1, ay1 = fb
         else:
             ax0, ay0, ax1, ay1 = ux0, uy0, ux1, uy1
-        w = units[0].bounds[2] - units[0].bounds[0]
-        h = units[0].bounds[3] - units[0].bounds[1]
+        # units[0] is not necessarily this board's own orientation any
+        # more — a mixed-rotation group can start with a rotated copy —
+        # so the reported single-board size is the DOMINANT orientation
+        # among the real units, not just whichever happened to be first.
+        orient_tally: dict[tuple, int] = {}
+        for f in units:
+            ow = round(f.bounds[2] - f.bounds[0], 4)
+            oh = round(f.bounds[3] - f.bounds[1], 4)
+            orient_tally[(ow, oh)] = orient_tally.get((ow, oh), 0) + 1
+        w, h = max(orient_tally, key=orient_tally.get)
         # Boards fill most of their panel. Two rows of a title block inside
         # a drawing frame do not — one drill drawing offered exactly that.
         if sum(f.area for f in units) < _PANEL_FILL * (ax1 - ax0) * (ay1 - ay0):
@@ -2335,33 +2359,51 @@ def mm_to_mil(v: float) -> float:
     return v / MM_PER_INCH * 1000.0
 
 
-def _fmt(v, mil=True) -> str:
+_UNIT_LABEL = {"mm": "mm", "inch": "in", "mil": "mil"}
+
+
+def _fmt(v, mil=True, unit: str = "mm") -> str:
     if v is None:
         return "not measured"
     # Two decimal places, by the customer's instruction: their own check
     # lists are written that way, and a third digit reads as false precision
-    # when a person diffs these against a CAM reading.
-    return f"{v:.2f} mm ({mm_to_mil(v):.1f} mil)" if mil else f"{v:.2f} mm"
+    # when a person diffs these against a CAM reading. inch keeps the same
+    # 4-decimal convention gerber_form.py uses for a client's cell — two
+    # decimals of inch rounds a 0.25 mm track to 0.01 in, which is a
+    # different, wrong track width.
+    if unit == "mm" or unit not in _DISPLAY_UNITS:
+        return f"{v:.2f} mm ({mm_to_mil(v):.1f} mil)" if mil else f"{v:.2f} mm"
+    return f"{_to_unit(v, unit)} {_UNIT_LABEL[unit]}   ({v:.2f} mm)"
 
 
-def _rule_note(job: dict, key: str) -> str:
+def _rule_note(job: dict, key: str, unit: str = "mm") -> str:
     """`(design rule allows 3.94 mil)` — the limit beside the reading."""
     rules = job.get("rules") or {}
     allowed = rules.get(key)
     if not allowed:
         return ""
-    return f"   (design rule allows {mm_to_mil(allowed):.2f} mil)"
+    if unit == "mm" or unit not in _DISPLAY_UNITS:
+        return f"   (design rule allows {mm_to_mil(allowed):.2f} mil)"
+    return f"   (design rule allows {_to_unit(allowed, unit)} {_UNIT_LABEL[unit]})"
 
 
-def agent_brief(job: dict, context: str = "") -> str:
+def agent_brief(job: dict, context: str = "", unit: str = "mm") -> str:
     """The instruction handed to a writing agent — numbers, never a file.
 
     This is the one place this text is built. Both the terminal's /gerber and
     the GUI's dialog call it, so a security-critical sentence like "the
     Gerber files themselves are confidential and are NOT attached" cannot
     drift into being worded — or omitted — differently in one of the two.
+
+    `unit` is the person's "Measurements in" choice — mm, inch or mil.
+    Without it here, the writing agent (and the customer reading its reply)
+    saw mm even when the dialog's own unit picker said otherwise; the picker
+    only ever reached the client's-Excel-form export, never this brief.
     """
     a = job["answers"]
+    size = _size_text(a.get("pcb_size_mm"), unit) or "not measured"
+    array = (_size_text(a.get("array_size_mm"), unit)
+             if a.get("array_size") else "not an array (single board)")
     text = (
         f"{context}\n\n" if context else
         "Reply with the measured figures below.\n\n"
@@ -2371,15 +2413,15 @@ def agent_brief(job: dict, context: str = "") -> str:
         "recalculate, round differently, or invent any number that is not "
         "here. The Gerber files themselves are confidential and are NOT "
         "attached.\n\n"
-        f"  PCB size            {a['pcb_size']}\n"
-        f"  Array size          {a.get('array_size') or 'not an array (single board)'}\n"
+        f"  PCB size            {size}\n"
+        f"  Array size          {array}\n"
         f"  PCBs per array      {a.get('pcbs_per_array', 1)}\n"
-        f"  Min track width     {_fmt(a['min_track_width_mm'])}\n"
-        f"  Min track spacing   {_fmt(a['min_track_spacing_mm'])}\n"
-        f"  Min drill size      {_fmt(a['min_drill_mm'])}\n"
+        f"  Min track width     {_fmt(a['min_track_width_mm'], unit=unit)}\n"
+        f"  Min track spacing   {_fmt(a['min_track_spacing_mm'], unit=unit)}\n"
+        f"  Min drill size      {_fmt(a['min_drill_mm'], unit=unit)}\n"
         f"  Number of drills    {a['drill_count']}\n"
-        f"  Min pad pitch       {_fmt(a.get('min_pitch_mm'))}\n"
-        f"  Min SMT pad         {_smt_text(a)}\n"
+        f"  Min pad pitch       {_fmt(a.get('min_pitch_mm'), unit=unit)}\n"
+        f"  Min SMT pad         {_smt_text(a, unit)}\n"
     )
     if job["warnings"]:
         text += ("\nCaveats that must be repeated to the customer if they "
@@ -2389,41 +2431,55 @@ def agent_brief(job: dict, context: str = "") -> str:
     return text + _SK.addendum("gerber.writeup")
 
 
-def _smt_text(a: dict) -> str:
+def _smt_text(a: dict, unit: str = "mm") -> str:
     if a.get("min_smt_pad_mm"):
-        return (f"{a['min_smt_pad']} ({mm_to_mil(a['min_smt_pad_mm']):.1f} mil "
-                "narrow side)")
+        narrow = _fmt(a["min_smt_pad_mm"], unit=unit)
+        return f"{a['min_smt_pad']} — narrow side {narrow}"
     if a.get("smt_pad_count") == 0 and a.get("smt_pads_known"):
         return "none — every pad has a hole (no SMT)"
     return "not measured"
 
 
-def answers_text(job: dict) -> str:
-    """The nine numbers, and nothing else. This is what gets quoted from."""
+def _size_text(mm_pair, unit: str = "mm") -> str | None:
+    """"12.70 x 8.40 mm   [0.50 x 0.33 in]" — or the reverse, if `unit` is
+    what the person actually asked to see. Always carries the other unit
+    alongside it, so a figure never has to be taken on trust."""
+    if not mm_pair or not mm_pair[0]:
+        return None
+    w_mm, h_mm = mm_pair
+    if unit == "mm" or unit not in _DISPLAY_UNITS:
+        return (f"{w_mm:.2f} x {h_mm:.2f} mm   "
+                f"[{w_mm / MM_PER_INCH:.2f} x {h_mm / MM_PER_INCH:.2f} in]")
+    label = _UNIT_LABEL[unit]
+    return (f"{_to_unit(w_mm, unit)} x {_to_unit(h_mm, unit)} {label}   "
+            f"[{w_mm:.2f} x {h_mm:.2f} mm]")
+
+
+def answers_text(job: dict, unit: str = "mm") -> str:
+    """The nine numbers, and nothing else. This is what gets quoted from.
+
+    `unit` is whatever the person picked in "Measurements in" (mm, inch or
+    mil) — every dimension below is shown in that unit first, with mm
+    alongside for a cross-check. Everything that is a count, not a length
+    (layers, holes, boards), never converts."""
     a = job["answers"]
-    b = job["board"]
-    size = a["pcb_size"] or "not measured"
-    if b.get("width_mm"):
-        size += (f"   [{b['width_mm'] / MM_PER_INCH:.2f} x "
-                 f"{b['height_mm'] / MM_PER_INCH:.2f} in]")
+    size = _size_text(a.get("pcb_size_mm"), unit) or "not measured"
     layers = a.get("layers")
     layer_txt = str(layers) if layers else "not measured"
     if a.get("plane_layers"):
         layer_txt += (f"   ({a['routed_layers']} routed + "
                       f"{a['plane_layers']} solid plane)")
     if a.get("array_size"):
-        array_txt = a["array_size"]
-        aw, ah = a["array_size_mm"]
-        array_txt += f"   [{aw / MM_PER_INCH:.2f} x {ah / MM_PER_INCH:.2f} in]"
+        array_txt = _size_text(a.get("array_size_mm"), unit)
         count_txt = f"{a['pcbs_per_array']}   ({a['array_grid']} — across x up)"
     else:
         array_txt = "not an array — a single board"
         count_txt = "1"
-    pitch_txt = _fmt(a.get("min_pitch_mm"))
+    pitch_txt = _fmt(a.get("min_pitch_mm"), unit=unit)
     if a.get("min_pitch_mm"):
         pitch_txt += (f"   — centre to centre, {a['min_pitch_pairs']} pair(s), "
                       f"on {a['min_pitch_layer']}")
-    smt_txt = _smt_text(a)
+    smt_txt = _smt_text(a, unit)
     if a.get("min_smt_pad_mm"):
         smt_txt += f"   — on {a['min_smt_pad_layer']}"
     lines = [
@@ -2431,13 +2487,13 @@ def answers_text(job: dict) -> str:
         f"1. PCB size             {size}",
         f"2. Array size           {array_txt}",
         f"3. PCBs in the array    {count_txt}",
-        f"4. Min track width      {_fmt(a['min_track_width_mm'])}"
-        + _rule_note(job, "min_track_width_mm"),
-        f"5. Min track spacing    {_fmt(a['min_track_spacing_mm'])}"
+        f"4. Min track width      {_fmt(a['min_track_width_mm'], unit=unit)}"
+        + _rule_note(job, "min_track_width_mm", unit),
+        f"5. Min track spacing    {_fmt(a['min_track_spacing_mm'], unit=unit)}"
         + (f"   — {a['spacing_pairs_at_min']} place(s) on the board are this "
            f"tight" if a.get("spacing_pairs_at_min") else "")
-        + _rule_note(job, "min_track_spacing_mm"),
-        f"6. Min drill size       {_fmt(a['min_drill_mm'])}",
+        + _rule_note(job, "min_track_spacing_mm", unit),
+        f"6. Min drill size       {_fmt(a['min_drill_mm'], unit=unit)}",
         f"7. Number of drills     "
         f"{a['drill_count'] if a['drill_count'] is not None else 'not measured'}",
         f"8. Min pad pitch        {pitch_txt}",
@@ -2446,12 +2502,18 @@ def answers_text(job: dict) -> str:
     return "\n".join(lines)
 
 
-def summary_text(job: dict) -> str:
-    """The workings behind the five numbers — so they can be argued with."""
+def summary_text(job: dict, unit: str = "mm") -> str:
+    """The workings behind the five numbers — so they can be argued with.
+
+    `unit` matches whatever answers_text()/agent_brief() were shown in —
+    the point of "workings" is to let a person check the headline figure
+    against how it was built, and that only works if both are in the same
+    unit."""
     out: list[str] = []
     b = job["board"]
     if b.get("width_mm"):
-        out.append(f"SIZE      {b['width_mm']:.2f} x {b['height_mm']:.2f} mm"
+        size_line = _size_text((b["width_mm"], b["height_mm"]), unit)
+        out.append(f"SIZE      {size_line}"
                    + (f", area {b['area_mm2']:.0f} mm²" if b.get("area_mm2") else ""))
         out.append(f"          via {b['method']} in {b['source']}"
                    + (f" — {b['shape']}" if b.get("shape") else ""))
@@ -2465,8 +2527,7 @@ def summary_text(job: dict) -> str:
         if row["widths"]:
             out.append("   track widths actually drawn:")
             for w in row["widths"]:
-                out.append(f"      {w['width_mm']:.2f} mm "
-                           f"({mm_to_mil(w['width_mm']):5.1f} mil)   "
+                out.append(f"      {_fmt(w['width_mm'], unit=unit)}   "
                            f"{w['segments']:6d} segments, "
                            f"{w['length_mm'] / 1000:7.2f} m of trace")
         if row.get("markings"):
@@ -2475,7 +2536,7 @@ def summary_text(job: dict) -> str:
                        "excluded")
         sp = row["spacing"]
         if sp and sp.get("min_mm"):
-            out.append(f"   minimum clearance {_fmt(sp['min_mm'])} "
+            out.append(f"   minimum clearance {_fmt(sp['min_mm'], unit=unit)} "
                        f"across {sp['islands']} conductors")
             if sp.get("with_markings_skipped"):
                 out.append("   (the lettering-included figure was skipped on "
@@ -2483,12 +2544,17 @@ def summary_text(job: dict) -> str:
                            "second full pass; ask if you need it)")
             elif sp.get("with_markings_mm"):
                 out.append(f"   (counting the lettering too it would be "
-                           f"{_fmt(sp['with_markings_mm'])} — real copper, "
-                           "not track spacing)")
+                           f"{_fmt(sp['with_markings_mm'], unit=unit)} — real "
+                           "copper, not track spacing)")
             if sp["histogram"]:
                 top = sorted(sp["histogram"].items(), key=lambda kv: kv[0])[:8]
-                out.append("   gap distribution: " + ",  ".join(
-                    f"{mm_to_mil(g):.0f} mil ×{n}" for g, n in top))
+                if unit == "mm" or unit not in _DISPLAY_UNITS:
+                    out.append("   gap distribution: " + ",  ".join(
+                        f"{mm_to_mil(g):.0f} mil ×{n}" for g, n in top))
+                else:
+                    lbl = _UNIT_LABEL[unit]
+                    out.append("   gap distribution: " + ",  ".join(
+                        f"{_to_unit(g, unit)} {lbl} ×{n}" for g, n in top))
                 out.append("   ↑ the busiest bucket is the design rule the board "
                            "was routed to; a lone tighter gap is one footprint, "
                            "not the whole board.")
@@ -2508,8 +2574,7 @@ def summary_text(job: dict) -> str:
         out.append(f"DRILLS    from {d['source']} ({how})")
         for t in d["tools"]:
             flag = "" if t["hits"] else "   ← declared but never used"
-            out.append(f"      T{t['tool']:<4} {t['dia_mm']:6.2f} mm "
-                       f"({mm_to_mil(t['dia_mm']):6.1f} mil)   "
+            out.append(f"      T{t['tool']:<4} {_fmt(t['dia_mm'], unit=unit)}   "
                        f"{t['hits']:5d} holes{flag}")
         out.append(f"      {'TOTAL':<5} {'':6} {'':8}   {d['total']:5d} holes")
     return "\n".join(out).rstrip()

@@ -774,6 +774,28 @@ AGENT_REGISTRY = {
         "fast — a clean product or scene photo in seconds, generated "
         "straight in the chat",
         "Free", "10–20s", 45,
+        # The 15 Sep check above only ever tried a TEXT prompt — no
+        # reference photos — which is exactly why the attachment path
+        # went unverified: a real run with 6 reference images came back
+        # "Google Gemini has no file-upload field on this page" on every
+        # attempt. Confirmed live end-to-end (22 Sep 2026, driving the
+        # real page directly): a freshly loaded page has ZERO
+        # <input type='file'> elements anywhere on it — not hidden, not
+        # late, none — until the button beside the composer, aria-label
+        # "Upload & tools", is clicked. Clicking it alone is enough: it
+        # mounts a hidden <input class="hidden-file-input" type="file">
+        # (no need to also click the "Upload files" item in the menu it
+        # opens, which is the one path that hands off to the native OS
+        # file picker Selenium cannot drive), and assigning a file to it
+        # directly produced a real attachment chip and enabled the send
+        # button — despite the input's own `accept` list being document
+        # types only (.pdf, .docx, …) with no image extension in it at
+        # all; that attribute is evidently just a picker-dialog hint here,
+        # not an enforced filter, so it does not need matching.
+        upload_trigger_selectors=(
+            "button[aria-label='Upload & tools']",
+            "button[aria-label*='Upload & tools' i]",
+        ),
     ),
     # Sits in BOTH visual and presentation: the same Magic Studio prompt makes
     # a post or a deck, and the reason to pick it is the same either way.
@@ -987,7 +1009,8 @@ def resolve_agent(stage: str, name: str) -> dict | None:
 
 
 def alternatives_for(stage: str, tried: list | tuple = (),
-                     cfg: dict | None = None, limit: int = 2) -> list[str]:
+                     cfg: dict | None = None, limit: int = 2,
+                     query: str = "") -> list[str]:
     """Other tools that could do this stage, best first.
 
     Used when a tool cannot finish — most often a free tier running out
@@ -1007,8 +1030,23 @@ def alternatives_for(stage: str, tried: list | tuple = (),
 
     Local agents are excluded. They are Prism's own renderers, not web tools,
     and a stage that failed in a browser is not fixed by handing it to one.
+
+    Canva is excluded from "visual"/"presentation" unless the user's own
+    words actually asked for something editable (wants_canva) — the same
+    signal that already keeps the PRIMARY tool from routing an ordinary
+    image request through Canva (NO_CANVA_INSTRUCTION), just never
+    reused here before. A real run asked for a photorealistic product
+    composite from reference photos; ChatGPT hit its free-tier limit,
+    and the fallback — going by catalogue order alone, "Canva first
+    because most business visual work is a post or a brochure" — handed
+    the job to a template builder that cannot use reference photos at
+    all and was never going to produce what was asked for, on the very
+    request this signal exists to keep away from Canva in the first
+    place.
     """
     seen = {t for t in tried if t}
+    if stage in ("visual", "presentation") and not wants_canva(query):
+        seen.add("Canva")
     picked = set((cfg or {}).get("agents", {}).values())
     catalogue = CATEGORIES.get(stage, {}).get("agents", [])
 

@@ -1540,25 +1540,53 @@ def _verify_page_attachments(driver, basenames: list[str], timeout: float = 6.0)
         return res;
     """
     executed_dom_check = False
+    # A real upload lands progressively -- the browser reads and thumbnails
+    # each file in turn, so a 6-file batch can still be two chips deep half
+    # a second in. Breaking on the FIRST non-empty poll (the old behaviour)
+    # reported whatever partial count happened to be visible at that one
+    # instant as final -- a real run of six photos came back "only 2 of 6
+    # attachment(s) reached ChatGPT" when the other four would have shown up
+    # within another second or two of the SAME upload, not a separate
+    # failure. Now: keep the BEST count any poll has seen, and only stop
+    # once it has held steady (no growth, nothing still marked busy) for a
+    # short grace window, or every file is accounted for, or time runs out.
+    STABLE_GRACE = 1.2
+    best = {"matched_names": [], "chips_count": 0, "has_busy": False, "error_msg": ""}
+    best_signal = 0
+    stable_since = None
     while time.time() < end_time:
         try:
             data = driver.execute_script(js_check, basenames)
-            if isinstance(data, dict):
-                executed_dom_check = True
-                last_res = data
-                if data.get("matched_names") or data.get("chips_count", 0) > 0 or data.get("has_busy") or data.get("error_msg"):
-                    break
         except Exception:
-            pass
+            data = None
+        if isinstance(data, dict):
+            executed_dom_check = True
+            matched = data.get("matched_names") or []
+            chips_cnt = data.get("chips_count", 0) or 0
+            has_busy = bool(data.get("has_busy"))
+            signal = max(len(matched), chips_cnt,
+                        len(basenames) if has_busy else 0)
+            if signal > best_signal:
+                best_signal = signal
+                best = data
+                stable_since = time.time()
+            elif (signal == best_signal and best_signal > 0 and not has_busy
+                  and stable_since is not None
+                  and time.time() - stable_since >= STABLE_GRACE):
+                break
+            if data.get("error_msg") and not best.get("error_msg"):
+                best["error_msg"] = data["error_msg"]
+            if best_signal >= len(basenames):
+                break
         time.sleep(0.5)
 
     if not executed_dom_check:
         return len(basenames), list(basenames), ""
 
-    matched = last_res.get("matched_names", [])
-    chips_cnt = last_res.get("chips_count", 0)
-    has_busy = last_res.get("has_busy", False)
-    err = last_res.get("error_msg", "")
+    matched = best.get("matched_names", [])
+    chips_cnt = best.get("chips_count", 0)
+    has_busy = best.get("has_busy", False)
+    err = best.get("error_msg", "")
 
     if matched:
         count = len(matched)
@@ -1594,6 +1622,27 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
         # as sources itself (_nb_sources) — and says so with "" here, so
         # this is not the "answer blind" warning below.
         return 0
+
+    # Some composers never mount <input type='file'> at all until an attach
+    # button is used first — confirmed live on Google Gemini (22 Sep 2026,
+    # by reading its own DOM): a freshly loaded page has ZERO file inputs
+    # anywhere on it, not a hidden or late one, until its own composer '+'
+    # is clicked. No amount of waiting for `sel` below ever finds one on a
+    # page like that; a real run reported "Google Gemini has no
+    # file-upload field on this page" for exactly this reason, on every
+    # attempt, not an occasional late-render miss the WebDriverWait
+    # already covers. Silent and best-effort: a tool that already has its
+    # input present is unaffected, and a stale trigger selector just does
+    # nothing rather than breaking the tools that never needed one.
+    for trig_sel in agent_cfg.get("upload_trigger_selectors", ()):
+        try:
+            trig = driver.find_elements(By.CSS_SELECTOR, trig_sel)
+            if trig and trig[0].is_displayed():
+                trig[0].click()
+                time.sleep(0.6)
+                break
+        except Exception:
+            continue
 
     # WAIT for it, don't just look once. run() navigates to the tool and
     # sleeps `page_wait` (4 seconds by default) before getting here, and four
@@ -1642,13 +1691,20 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
     verified_count = 0
     verified_names: list[str] = []
     error_detail = ""
+    # Each file's own preview takes a moment to render, several MB of real
+    # photos more than a moment — a fixed 5s window undercounted a 6-file
+    # batch of camera photos that was still legitimately rendering when the
+    # window closed. Scales with how many files there actually are to wait
+    # for; the stability check above still returns early once they are all
+    # in, so this only matters when the upload is genuinely still working.
+    verify_timeout = min(24.0, 5.0 + 1.5 * max(0, len(paths) - 1))
 
     # Attempt bulk upload
     try:
         target.send_keys("\n".join(paths))
         _dispatch_upload_events(driver, target)
         verified_count, verified_names, error_detail = _verify_page_attachments(
-            driver, basenames, timeout=5.0)
+            driver, basenames, timeout=verify_timeout)
     except Exception as e:
         bulk_reason = str(e).strip().splitlines()[0][:120] if str(e).strip() else "no detail"
 
@@ -1666,7 +1722,7 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
                     pass
         if sent:
             verified_count, verified_names, error_detail = _verify_page_attachments(
-                driver, basenames, timeout=4.0)
+                driver, basenames, timeout=max(4.0, verify_timeout - 1.0))
 
     # Verification outcome check
     if verified_count == 0:
@@ -7408,6 +7464,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # producing the very PDF the customer wants.)
 
             nb_files: list = []          # what NotebookLM downloaded itself
+            # `got` is only ever counted inside the generic else-branch below
+            # (the image-wait/artwork loop); every OTHER branch here — Apollo,
+            # Canva, ElevenLabs, NotebookLM — skips straight past it, yet
+            # `_make_editable(..., made_image=bool(got))` after this dispatch
+            # reads it unconditionally. Defined here so every branch has it:
+            # "cannot access local variable 'got'" on a NotebookLM voice-over
+            # fallback, 17 Sep 2026.
             got: int = 0
             if agent_cfg.get("search_tool") == "apollo":
                 # Deliberately does NOT get `context`. That blob opens with
@@ -8707,7 +8770,7 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
             continue
 
         tried = [info.get("agent")]
-        for alternative in A.alternatives_for(stage, tried, cfg):
+        for alternative in A.alternatives_for(stage, tried, cfg, query=query):
             if should_stop and should_stop():
                 return
             if skipped():

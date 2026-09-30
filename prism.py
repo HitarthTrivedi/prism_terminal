@@ -1298,7 +1298,9 @@ def _step_measured(cfg, arg: str, attachments: list):
         ui.warn(str(e))
     ui.info("   drawing the parts…")
     drawn = SF.render_sheet(report, out_dir)
-    ui.ok(f"drawing sheet   → {drawn['png'] or drawn['html']}")
+    ui.ok(f"drawing sheet   → {drawn['png']}")
+    for name, path in drawn.get("flats", {}).items():
+        ui.ok(f"  {name} flat pattern → {path}")
     return report, out_dir, drawn
 
 

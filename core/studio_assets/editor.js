@@ -301,26 +301,11 @@
     + '<button class="studio-btn" id="studio-add-box" title="Add a colour block">+ Shape</button>'
     + '<input id="studio-file" type="file" accept="image/*" hidden>'
     + '<span class="studio-spacer"></span>'
-    + '<div class="studio-render-widget" id="studio-render-widget" style="display:none">'
-    + '  <div class="studio-render-meta">'
-    + '    <span class="studio-render-title" id="studio-render-title">Rendering MP4…</span>'
-    + '    <span class="studio-render-eta" id="studio-render-eta">calculating…</span>'
-    + '  </div>'
-    + '  <div class="studio-render-track">'
-    + '    <div class="studio-render-bar" id="studio-render-bar" style="width:0%"></div>'
-    + '  </div>'
-    + '  <span class="studio-render-pct" id="studio-render-pct">0%</span>'
-    + '</div>'
     + '<button class="studio-btn" id="studio-zoom-out">−</button><button class="studio-btn" id="studio-zoom-in">+</button>'
     + '<span class="studio-status" id="studio-status">Ready</span>'
     + '<button class="studio-btn" id="studio-save">Save</button>'
     + '<button class="studio-btn primary" id="studio-render">Render MP4</button>';
   document.body.appendChild(top);
-
-  var topProgress = document.createElement('div');
-  topProgress.id = 'studio-top-progress';
-  topProgress.innerHTML = '<div class="studio-top-progress-bar" id="studio-top-progress-bar"></div>';
-  document.body.appendChild(topProgress);
   var left = document.createElement('aside'); left.id = 'studio-left';
   left.innerHTML = '<section class="studio-section"><p class="studio-kicker">Scenes</p><div id="studio-scenes"></div></section>'
     + '<section class="studio-section"><p class="studio-kicker">Layers</p><div id="studio-layers"></div></section>';
@@ -348,125 +333,7 @@
   q('#studio-scrub').max = total(); q('#studio-scrub').oninput = function () { seek(+this.value); };
   q('#studio-play').onclick = toggle; q('#studio-play-2').onclick = toggle;
   q('#studio-save').onclick = function () { post('/save', null, function (ok) { status(ok ? 'Saved' : 'Save failed'); }); };
-
-  var renderPollTimer = null;
-  function fmtSec(sec) {
-    if (sec == null || isNaN(sec)) return 'calculating…';
-    sec = Math.round(sec);
-    if (sec <= 0) return 'finishing…';
-    if (sec < 60) return '~' + sec + 's remaining';
-    var m = Math.floor(sec / 60), s = sec % 60;
-    return '~' + m + 'm ' + (s < 10 ? '0' : '') + s + 's remaining';
-  }
-
-  function startRenderTracking() {
-    var widget = q('#studio-render-widget');
-    var topBar = q('#studio-top-progress-bar');
-    var title = q('#studio-render-title');
-    var eta = q('#studio-render-eta');
-    var bar = q('#studio-render-bar');
-    var pct = q('#studio-render-pct');
-    var renderBtn = q('#studio-render');
-
-    if (!widget) return;
-    widget.style.display = 'flex';
-    widget.classList.remove('complete', 'error');
-    if (q('#studio-status')) q('#studio-status').style.display = 'none';
-    if (renderBtn) {
-      renderBtn.disabled = true;
-      renderBtn.textContent = 'Rendering…';
-    }
-    title.textContent = 'Rendering MP4…';
-    eta.textContent = 'preparing engine…';
-    bar.style.width = '0%';
-    if (topBar) topBar.style.width = '0%';
-    pct.textContent = '0%';
-
-    clearInterval(renderPollTimer);
-    renderPollTimer = setInterval(pollRenderProgress, 500);
-  }
-
-  function pollRenderProgress() {
-    fetch('/render-progress')
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (data) {
-        if (!data) return;
-        var widget = q('#studio-render-widget');
-        var topBar = q('#studio-top-progress-bar');
-        var title = q('#studio-render-title');
-        var eta = q('#studio-render-eta');
-        var bar = q('#studio-render-bar');
-        var pct = q('#studio-render-pct');
-        var renderBtn = q('#studio-render');
-
-        if (!widget) return;
-
-        if (data.status === 'rendering') {
-          var p = Math.max(0, Math.min(100, Math.round(data.percent || 0)));
-          bar.style.width = p + '%';
-          if (topBar) topBar.style.width = p + '%';
-          pct.textContent = p + '%';
-
-          if (data.done && data.total) {
-            title.textContent = 'Rendering ' + data.done + '/' + data.total;
-          } else {
-            title.textContent = 'Rendering MP4…';
-          }
-
-          if (data.eta_seconds != null) {
-            eta.textContent = fmtSec(data.eta_seconds);
-          } else if (data.stage === 'starting') {
-            eta.textContent = 'preparing browser…';
-          } else {
-            eta.textContent = 'calculating ETA…';
-          }
-        } else if (data.status === 'done') {
-          clearInterval(renderPollTimer);
-          bar.style.width = '100%';
-          if (topBar) topBar.style.width = '100%';
-          pct.textContent = '100%';
-          widget.classList.add('complete');
-          title.textContent = 'Render complete!';
-          var elapsed = data.elapsed_seconds ? Math.round(data.elapsed_seconds) + 's' : 'done';
-          eta.textContent = 'Ready · finished in ' + elapsed;
-          if (renderBtn) {
-            renderBtn.disabled = false;
-            renderBtn.textContent = 'Render MP4';
-          }
-          setTimeout(function () {
-            if (topBar) topBar.style.width = '0%';
-          }, 4000);
-        } else if (data.status === 'error') {
-          clearInterval(renderPollTimer);
-          widget.classList.add('error');
-          title.textContent = 'Render failed';
-          eta.textContent = (data.error || 'Unknown error').slice(0, 45);
-          if (renderBtn) {
-            renderBtn.disabled = false;
-            renderBtn.textContent = 'Render MP4';
-          }
-        }
-      })
-      .catch(function () {});
-  }
-
-  q('#studio-render').onclick = function () {
-    startRenderTracking();
-    post('/render', null, function (ok) {
-      if (!ok) {
-        clearInterval(renderPollTimer);
-        var widget = q('#studio-render-widget');
-        if (widget) {
-          widget.classList.add('error');
-          q('#studio-render-title').textContent = 'Render failed';
-          q('#studio-render-eta').textContent = 'Could not reach server';
-        }
-        q('#studio-render').disabled = false;
-        q('#studio-render').textContent = 'Render MP4';
-      }
-    });
-  };
-
+  q('#studio-render').onclick = function () { post('/render', null, function (ok) { status(ok ? 'Rendering…' : 'Render failed'); }); };
   q('#studio-undo').onclick = function () { if (undo.length) { redo.push(JSON.stringify(all())); restore(undo.pop()); } };
   q('#studio-redo').onclick = function () { if (redo.length) { undo.push(JSON.stringify(all())); restore(redo.pop()); } };
   q('#studio-snap').onclick = function () { snap = !snap; this.classList.toggle('active', snap); };
@@ -548,10 +415,4 @@
   });
   addEventListener('resize', fit);
   window.__edApply(all()); showScene(0);
-  try {
-    fetch('/render-progress')
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (d) { if (d && d.status === 'rendering') startRenderTracking(); })
-      .catch(function () {});
-  } catch (e) {}
 })();

@@ -52,7 +52,6 @@ import json
 import pathlib
 import re
 import threading
-import time
 
 from . import reel_web
 
@@ -422,117 +421,22 @@ def serve(spec: dict, fps: int | None = None,
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     ensure_stable_ids(spec)
-    fps_val = int(fps or spec.get("fps", reel_web.DEFAULT_FPS))
-    existing = clean_edits(spec.get(EDITS_KEY) or [])
-    html = editable_html(spec, fps_val).encode("utf-8")
-
-    total_est = 0
-    try:
-        _, total_est = reel_web._plan(with_timing(spec, existing), fps_val)
-    except Exception:
-        total_est = 0
-
-    render_state: dict = {
-        "status": "idle",
-        "stage": "idle",
-        "done": 0,
-        "total": total_est,
-        "percent": 0,
-        "start_time": 0.0,
-        "elapsed_seconds": 0.0,
-        "eta_seconds": None,
-        "speed_fps": 0.0,
-        "error": None,
-        "out_path": None,
-    }
-
-    def reset_progress(num_edits: int = 0):
-        render_state.update({
-            "status": "rendering",
-            "stage": "starting",
-            "done": 0,
-            "percent": 0,
-            "start_time": time.time(),
-            "elapsed_seconds": 0.0,
-            "eta_seconds": None,
-            "speed_fps": 0.0,
-            "error": None,
-        })
-
-    def set_progress(done: int, total: int):
-        now = time.time()
-        st = render_state.get("start_time") or now
-        elapsed = max(0.001, now - st)
-        total = max(1, total or render_state.get("total") or 1)
-        done = min(done, total)
-        percent = int(done / total * 100)
-        fps_speed = (done / elapsed) if (done > 0 and elapsed > 0.1) else 0.0
-        remaining_frames = max(0, total - done)
-        eta = (remaining_frames / fps_speed) if (fps_speed > 0.5 and remaining_frames > 0) else None
-
-        render_state.update({
-            "status": "rendering",
-            "stage": "encoding",
-            "done": done,
-            "total": total,
-            "percent": percent,
-            "elapsed_seconds": round(elapsed, 1),
-            "eta_seconds": round(eta, 1) if eta is not None else None,
-            "speed_fps": round(fps_speed, 1),
-        })
-
-    def set_done(out_path: str = ""):
-        now = time.time()
-        st = render_state.get("start_time") or now
-        elapsed = round(max(0.1, now - st), 1)
-        tot = render_state.get("total") or 1
-        render_state.update({
-            "status": "done",
-            "stage": "complete",
-            "done": tot,
-            "total": tot,
-            "percent": 100,
-            "elapsed_seconds": elapsed,
-            "eta_seconds": 0,
-            "out_path": out_path,
-        })
-
-    def set_error(err: str):
-        render_state.update({
-            "status": "error",
-            "stage": "failed",
-            "error": str(err),
-        })
+    html = editable_html(spec, fps).encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):          # silence per-request stderr
             pass
 
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(html)))
+            if self.path not in ("/", "/index.html"):
+                self.send_response(404)
                 self.end_headers()
-                self.wfile.write(html)
                 return
-            if self.path in ("/render-progress", "/render-status"):
-                origin = self.headers.get("Origin", "")
-                if render_state["status"] == "rendering":
-                    st = render_state.get("start_time") or time.time()
-                    render_state["elapsed_seconds"] = round(max(0.0, time.time() - st), 1)
-                body = json.dumps(render_state).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                if origin and (origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:")):
-                    self.send_header("Access-Control-Allow-Origin", origin)
-                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            self.send_response(404)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
             self.end_headers()
+            self.wfile.write(html)
 
         def do_OPTIONS(self):
             origin = self.headers.get("Origin", "")
@@ -572,8 +476,6 @@ def serve(spec: dict, fps: int | None = None,
                 self.end_headers()
                 return
             edits = clean_edits(data.get("edits"))
-            if self.path == "/render":
-                reset_progress(len(edits))
             body = json.dumps({"ok": True, "edits": len(edits)}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -585,9 +487,8 @@ def serve(spec: dict, fps: int | None = None,
             if callback is not None:
                 try:
                     callback(edits)
-                except Exception as cb_err:             # noqa: BLE001
-                    render_state["status"] = "error"
-                    render_state["error"] = str(cb_err)
+                except Exception:                       # noqa: BLE001
+                    pass    # a broken handler must not kill the server
 
         def _refine(self):
             origin = self.headers.get("Origin", "")
@@ -641,11 +542,5 @@ def serve(spec: dict, fps: int | None = None,
             server.server_close()
         except Exception:                               # noqa: BLE001
             pass
-
-    stop.set_progress = set_progress
-    stop.set_done = set_done
-    stop.set_error = set_error
-    stop.reset_progress = reset_progress
-    stop.get_render_state = lambda: dict(render_state)
 
     return url, stop

@@ -662,7 +662,7 @@ def ensure_accent_applied(spec: dict) -> dict:
         return spec
 
     design = spec.setdefault("design", {})
-    existing_css = str(design.get("css") or "")
+    existing_css = design.get("css", "")
     accent_rules = (
         f"\n/* Auto-applied client brand accent ({accent}) */\n"
         f":root {{ --accent: {accent}; }}\n"
@@ -693,6 +693,14 @@ def brand_faults(spec: dict) -> list[str]:
                      for sc in spec.get("scenes") or [])
             ).lower()
     if "var(--accent" in blob.replace(" ", "") or accent in blob:
+        return []
+    # Auto-heal the design spec with the client's accent
+    ensure_accent_applied(spec)
+    new_blob = (str((spec.get("design") or {}).get("css", "")) + " " +
+                " ".join(str(sc.get("html", "")) + " " + str(sc.get("css", ""))
+                         for sc in spec.get("scenes") or [])
+                ).lower()
+    if "var(--accent" in new_blob.replace(" ", "") or accent in new_blob:
         return []
     return [f"the client's accent colour {accent} appears nowhere in the "
             "design — use var(--accent) for the element the eye goes to first "
@@ -743,18 +751,6 @@ def _drop_missing(text: str) -> str:
                   text, flags=re.I)
     # Anything left is an attribute we do not know; empty it.
     text = re.sub(r"asset:[A-Za-z0-9_-]+", "", text)
-    return text
-
-
-def strip_citations(text: str) -> str:
-    """Remove AI citation markers and footnote tokens like
-    :contentReference[oaicite:0]{index=0}, [oaicite:0], 【4:0†source】."""
-    import re
-    if not text:
-        return ""
-    text = re.sub(r":?contentReference\[[^\]]*\](\{[^\}]*\})?", "", text)
-    text = re.sub(r"\[oaicite:[^\]]*\]", "", text)
-    text = re.sub(r"【[^】]*】", "", text)
     return text
 
 
@@ -906,15 +902,11 @@ def _scope(css: str, root: str, prefix: str, renames: dict) -> str:
                            (_scope_selector(s, root) for s in prelude.split(","))
                            if p)
         out.append(f"{scoped or root}{{{body}}}")
-    return "".join(out)
-
-
 def sanitize_scene_css(css: str) -> str:
     """Neutralize destructive polygon clip-paths on images and cards.
     A model told to make an 'editorial crop' sometimes writes
     clip-path: polygon(...) which slices diagonally through products and text.
     """
-    css = str(css or "").strip()
     if not css:
         return ""
     return re.sub(r"clip-path\s*:\s*polygon\([^)]+\)\s*;?", "/* clip-path sanitized */", css, flags=re.I)
@@ -927,7 +919,7 @@ def scope_css(css: str, idx: int) -> str:
         return ""
     root, prefix = f"#s{idx}", f"s{idx}-"
     renames: dict[str, str] = {}
-    out = _scope(css, root, prefix, renames) or ""
+    out = _scope(css, root, prefix, renames)
     if renames:
         # The keyframes were renamed, so every reference to them has to move
         # too. Restricted to animation declarations on purpose: a scene may
@@ -980,7 +972,7 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         # Resolve only usable assets; boards remain references, never tiles
         # picked implicitly by scene number.
         uris = _asset_uris(asset_table, scene_index=i)
-        html = strip_citations(_drop_missing(_place_assets(sc.get("html") or "", uris)))
+        html = _drop_missing(_place_assets(sc.get("html") or "", uris))
         # A scene may name the cut it wants ("push", "squeeze", "zoom") and
         # get it from the library in the harness. Sanitised rather than
         # trusted: this string becomes a class attribute, and a design is
@@ -1456,8 +1448,6 @@ def imagery_instructions(request: str, has_own_artwork: bool = False,
         "  · Never combine multiple proposed scenes into one bitmap. One "
         "image with several panels, phones, cards, or alternatives is a "
         "failed result and is discarded.\n"
-        "  · DO NOT make a collage, collection spread, or multi-product group. "
-        "Every single image file must feature EXACTLY ONE individual subject in isolation.\n"
         "  · Each file contains ONE clear subject only, with generous empty "
         "space around it so the video can crop, animate, and place live text "
         "beside it.\n\n"
@@ -2423,10 +2413,7 @@ def followup_instructions(change: str, spec: dict, new_assets: str = "",
             f"{context.strip()[:6000]}\n\n")
            if context.strip() else "")
         + ((f"NEW ARTWORK made or attached for this change — use it by "
-            f"name, exactly like the rest:\n{new_assets}\n\n"
-            f"IMPORTANT: You MUST incorporate these new artwork asset(s) into the reel! "
-            f"Update the scenes that need visual imagery by embedding <img class='hero' src='asset:<name>' alt=''> "
-            f"or background-image: url(asset:<name>) with proper positioning and animation. Return the updated scenes in your JSON.\n\n")
+            f"name, exactly like the rest:\n{new_assets}\n\n")
            if new_assets.strip() else "")
         + (f"Artwork already in the reel: {have}.\n\n" if have else "")
         + "REPLY WITH ONLY THIS JSON OBJECT, in a ```json fenced block:\n"
@@ -2493,7 +2480,7 @@ def parse_followup(text: str, total: int) -> dict | None:
                     continue
                 if n < 1:
                     continue
-                sc = {"html": strip_citations(str(r["html"]))}
+                sc = {"html": str(r["html"])}
                 if str(r.get("css", "")).strip():
                     sc["css"] = str(r["css"])
                 for key in ("cut", "type"):
@@ -2730,8 +2717,6 @@ def parse_spec(text: str) -> dict:
             if isinstance(sc, dict) and str(sc.get("html", "")).strip()]
     if not keep:
         raise ReelError("The scenes carry no markup — nothing to render.")
-    for sc in keep:
-        sc["html"] = strip_citations(str(sc["html"]))
     spec["scenes"] = keep
     # Do this at authoring time, not only when the owner later opens Studio:
     # the JSON next to an MP4 is the permanent editable project source.

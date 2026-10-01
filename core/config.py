@@ -280,6 +280,11 @@ RUN_STAMP = "%Y-%m-%d %H-%M"
 _run: dict = {"task": None, "dir": None, "title": None}
 
 
+def reset_run() -> None:
+    """Clear any current run directory or state so the next run starts clean."""
+    _run.update(task=None, dir=None, title=None, continued=False)
+
+
 def begin_run(task: str, title: str = "") -> str:
     """Open a fresh folder for one run of `task` and make it current, so
     every save_artifact(task=…) until the next begin_run lands in it.
@@ -293,7 +298,7 @@ def begin_run(task: str, title: str = "") -> str:
     import datetime
     task = (task or "").strip()
     if not task:
-        _run.update(task=None, dir=None, title=None)
+        _run.update(task=None, dir=None, title=None, continued=False)
         return artifacts_root()
     title = tidy_title(title) or fallback_title(task)
     parent = os.path.join(artifacts_root(), _clean_name(title, limit=80) or "Task")

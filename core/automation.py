@@ -1835,6 +1835,115 @@ def _prompt_was_sent(driver, element, wanted: str, timeout: int = 12) -> bool:
     return False
 
 
+def _submit_prompt(driver, agent_cfg: dict, agent_name: str, prompt: str,
+                   *, has_attachments: bool = False) -> None:
+    """Put a prompt in an agent composer and prove the site accepted it.
+
+    Keeping this operation together matters for recovery: a ChromeDriver
+    failure before this function returns means Prism has not established that
+    the tool received the prompt, so it is safe for the caller to reopen the
+    tab and make one fresh attempt.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    operation = "waiting for the message box"
+    try:
+        textarea = WebDriverWait(driver, agent_cfg.get("input_wait", 15)).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, agent_cfg["textarea_selector"]))
+        )
+        try:
+            textarea.clear()
+        except Exception:
+            pass
+
+        operation = "putting the prompt in the message box"
+        if not _fast_type(driver, textarea, prompt):
+            # JS insertion did not take on this site — fall back to
+            # per-keystroke typing (slow but universal).
+            lines = prompt.split("\n")
+            for i, line in enumerate(lines):
+                if line:
+                    textarea.send_keys(line)
+                if i < len(lines) - 1:
+                    textarea.send_keys(Keys.SHIFT, Keys.ENTER)
+        time.sleep(1)
+
+        # Uploading or starting a fresh chat may re-render the composer.  Do
+        # not let a detached element turn an empty-looking composer into a
+        # false successful send.
+        operation = "checking that the prompt landed"
+        if not _text_landed(_composer_text(driver, textarea), prompt):
+            textarea = driver.find_element(By.CSS_SELECTOR,
+                                           agent_cfg["textarea_selector"])
+            _fast_type(driver, textarea, prompt)
+            time.sleep(1)
+        if not _text_landed(_composer_text(driver, textarea), prompt):
+            raise RuntimeError(
+                f"the prompt would not go into {agent_name}'s message box — "
+                "nothing was sent")
+
+        # A new-chat composer can become visible before React has wired it to
+        # the send action.  Give the page a short, explicit settle after text
+        # is proven present.
+        time.sleep(1.5)
+
+        operation = "submitting the prompt"
+        selectors = [s.strip() for s in
+                     agent_cfg.get("submit_selector", "").split(",")
+                     if s.strip()]
+        for fallback_sel in ("button[data-testid='send-button']",
+                             "button[aria-label*='Send']",
+                             "button[type='submit']"):
+            if fallback_sel not in selectors:
+                selectors.append(fallback_sel)
+
+        deadline = time.time() + (35 if has_attachments else 12)
+        sent = False
+        while time.time() < deadline:
+            for selector in selectors:
+                try:
+                    for button in driver.find_elements(By.CSS_SELECTOR, selector):
+                        disabled = driver.execute_script(
+                            "return arguments[0].disabled || "
+                            "arguments[0].getAttribute('aria-disabled') === 'true';",
+                            button)
+                        if not disabled and button.is_displayed():
+                            try:
+                                button.click()
+                            except Exception:
+                                driver.execute_script("arguments[0].click();", button)
+                            if _prompt_was_sent(driver, textarea, prompt, timeout=2):
+                                sent = True
+                                break
+                    if sent:
+                        break
+                except Exception:
+                    pass
+            if sent:
+                break
+            try:
+                textarea.send_keys(Keys.ENTER)
+                if _prompt_was_sent(driver, textarea, prompt, timeout=2):
+                    sent = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        operation = "confirming that the prompt was accepted"
+        if not sent and not _prompt_was_sent(driver, textarea, prompt, timeout=6):
+            raise RuntimeError(
+                f"{agent_name} would not accept the prompt — it is still "
+                "sitting in the message box")
+    except Exception as error:
+        # Selenium's native errors otherwise say only "Message:" and an
+        # address-only stack trace.  The operation turns that into a useful
+        # diagnostic without hiding the original exception as __cause__.
+        raise RuntimeError(f"{agent_name}: {operation}: {error}") from error
 def _within(selector_list: str, descendant: str) -> str:
     """"<list> img" done properly — `<a> img, <b> img`, not `<a>, <b> img`.
 
@@ -1895,8 +2004,10 @@ def _harvest_images(driver, agent_cfg, stage: str,
     # newly-generated artwork.
     exclude_hashes = set()
     exclude_sizes = set()
+    exclude_stems = set()
     for item in (exclude_files or []):
         p = item.get("path") if isinstance(item, dict) else item
+        name = item.get("name") if isinstance(item, dict) else ""
         if p and os.path.exists(p):
             try:
                 sz = os.path.getsize(p)
@@ -1905,6 +2016,12 @@ def _harvest_images(driver, agent_cfg, stage: str,
                     exclude_hashes.add(hashlib.md5(ef.read()).hexdigest())
             except Exception:
                 pass
+        for cand in (p, name):
+            if cand:
+                base = os.path.basename(str(cand))
+                stem = os.path.splitext(base)[0].lower().strip()
+                if len(stem) >= 3:
+                    exclude_stems.add(stem)
 
     # Inside the reply first — that is where a generated image usually sits and
     # the ordering there is the order it was asked for. But ChatGPT's image UI
@@ -1928,18 +2045,53 @@ def _harvest_images(driver, agent_cfg, stage: str,
         pass
     for img in imgs:
         try:
-            # Skip any image element that is part of a user-turn prompt container,
-            # chat upload thumbnail, or composer preview.
-            is_user_element = driver.execute_script("""
-                const el = arguments[0];
-                return Boolean(el.closest && el.closest(
+            # Strictly verify this image is a genuine generated assistant image,
+            # NOT a user attachment, prompt thumbnail, web search citation, or avatar.
+            is_valid_generated = driver.execute_script(r"""
+                const img = arguments[0];
+                if (!img) return false;
+                const src = img.currentSrc || img.src || '';
+                if (!src) return false;
+                // Exclude user-turn prompts, attachment chips, composers
+                if (img.closest(
                     '[data-message-author-role="user"], [data-message-role="user"], ' +
-                    '[data-testid*="user-turn"], [data-testid*="user-message"], ' +
-                    '.user-message, form, [data-testid*="attachment"], ' +
-                    '[data-testid*="composer"], [aria-label*="user" i]'
-                ));
+                    '.user-message, form, [data-testid*="composer"], [data-testid*="attachment"], ' +
+                    '[data-testid*="user-message"], [data-testid*="user-turn"], [class*="user-turn"]'
+                )) return false;
+
+                // Immediate pass: OpenAI DALL-E CDN URLs are ALWAYS generated assistant images
+                const isOpenAiDalle = /oaidalleapiprodscus\.blob\.core\.windows\.net|files\.oaiusercontent\.com|chatgpt\.com\/backend-api\/files/i.test(src);
+                if (isOpenAiDalle) return true;
+
+                const turn = img.closest('article, section[data-testid^="conversation-turn-"], [data-testid^="conversation-turn-"], [class*="conversation-turn"]');
+                if (turn && turn.querySelector('[data-message-author-role="user"], [data-message-role="user"]')) {
+                    return false;
+                }
+                // Exclude web search citations, source cards, search result thumbnails
+                if (img.closest(
+                    'a[href^="http://"], a[href^="https://"]:not([href*="chatgpt.com"]):not([href*="openai.com"]), ' +
+                    '[data-testid*="source"], [data-testid*="citation"], [class*="citation"], ' +
+                    '[class*="source-card"], [class*="attribution"], [class*="search-result"], ' +
+                    '[aria-label*="source" i], [aria-label*="citation" i], details, [class*="searched"]'
+                )) return false;
+                // Exclude UI avatars, navbars, and toolbar icon buttons
+                if (img.closest(
+                    '[class*="avatar"], [data-testid*="avatar"], nav, header, footer, ' +
+                    'button[aria-label*="copy" i], button[aria-label*="thumb" i], button[aria-label*="feedback" i]'
+                )) return false;
+                const alt = (img.getAttribute('alt') || '').toLowerCase();
+                if (alt.includes('avatar') || alt === 'user' || alt === 'chatgpt') return false;
+                const rect = img.getBoundingClientRect();
+                if (rect.width > 0 && rect.width < 120 && rect.height > 0 && rect.height < 120) return false;
+                return true;
             """, img)
-            if is_user_element:
+            if not is_valid_generated:
+                continue
+
+            alt = (img.get_attribute("alt") or "").lower()
+            title = (img.get_attribute("title") or "").lower()
+            aria = (img.get_attribute("aria-label") or "").lower()
+            if any(stem in alt or stem in title or stem in aria for stem in exclude_stems):
                 continue
 
             src = img.get_attribute("src") or ""
@@ -3180,11 +3332,19 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 1,
             if turn_sel:
                 turns0 = _count(turn_sel)
             continue
+        img_present = False
+        try:
+            img_present = bool(driver.execute_script("""
+                const dalle = document.querySelector('img[src*="blob.core.windows.net"], img[src*="files.oaiusercontent.com"], img[src*="backend-api/files"], [data-testid*="dalle"] img, [data-testid*="image-pane"] img, img[alt*="Generated image" i]');
+                return Boolean(dalle && ((dalle.naturalWidth || 0) >= 256 || (dalle.width || 0) >= 256));
+            """))
+        except Exception:
+            pass
         if total != last_len:
             grown = grown or total > baseline
             last_len = total
             last_change = time.time()
-        elif (grown and time.time() - start >= min_wait
+        elif ((grown or (img_present and time.time() - start >= 15)) and time.time() - start >= min_wait
               and time.time() - last_change >= stable_for
               and has_marker() and not still_generating()):
             settled = True
@@ -3279,18 +3439,70 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
     # (sizes and sources) has to sit still too, and while the page itself
     # says it is still creating the image, nothing is done regardless.
     js = r"""
+        function isGeneratedAssistantImage(img) {
+            if (!img) return false;
+            const src = img.currentSrc || img.src || '';
+            if (!src) return false;
+            // Exclude user-turn prompts, attachment chips, composers
+            if (img.closest(
+                '[data-message-author-role="user"], [data-message-role="user"], ' +
+                '.user-message, form, [data-testid*="composer"], [data-testid*="attachment"], ' +
+                '[data-testid*="user-message"], [data-testid*="user-turn"], [class*="user-turn"]'
+            )) {
+                return false;
+            }
+
+            // Immediate pass: OpenAI DALL-E CDN URLs are ALWAYS generated assistant images
+            const isOpenAiDalle = /oaidalleapiprodscus\.blob\.core\.windows\.net|files\.oaiusercontent\.com|chatgpt\.com\/backend-api\/files/i.test(src);
+            if (isOpenAiDalle) return true;
+
+            const turn = img.closest('article, section[data-testid^="conversation-turn-"], [data-testid^="conversation-turn-"], [class*="conversation-turn"]');
+            if (turn && turn.querySelector('[data-message-author-role="user"], [data-message-role="user"]')) {
+                return false;
+            }
+            // Exclude web search citations, source cards, search result thumbnails
+            if (img.closest(
+                'a[href^="http://"], a[href^="https://"]:not([href*="chatgpt.com"]):not([href*="openai.com"]), ' +
+                '[data-testid*="source"], [data-testid*="citation"], [class*="citation"], ' +
+                '[class*="source-card"], [class*="attribution"], [class*="search-result"], ' +
+                '[aria-label*="source" i], [aria-label*="citation" i], details, [class*="searched"]'
+            )) {
+                return false;
+            }
+            // Exclude UI avatars, navbars, and toolbar icon buttons
+            if (img.closest(
+                '[class*="avatar"], [data-testid*="avatar"], nav, header, footer, ' +
+                'button[aria-label*="copy" i], button[aria-label*="thumb" i], button[aria-label*="feedback" i]'
+            )) {
+                return false;
+            }
+            const alt = (img.getAttribute('alt') || '').toLowerCase();
+            if (alt.includes('avatar') || alt === 'user' || alt === 'chatgpt') return false;
+            return true;
+        }
+
         let n = 0, px = 0, sig = '';
+        const seenSrc = new Set();
         for (const img of document.querySelectorAll('img')) {
+          if (!isGeneratedAssistantImage(img)) continue;
+          const src = img.currentSrc || img.src || '';
+          if (!src || seenSrc.has(src)) continue;
+          const rect = img.getBoundingClientRect();
+          if (rect.width > 0 && rect.width < 120 && rect.height > 0 && rect.height < 120) {
+            continue;
+          }
           if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256) {
+            seenSrc.add(src);
             n++;
             px += img.naturalWidth * img.naturalHeight;
-            sig += (img.currentSrc || img.src || '').slice(-48) + ';';
+            sig += src.slice(-48) + ';';
           }
         }
         const stopBtn = Boolean(document.querySelector('button[aria-label*="Stop" i], button[data-testid*="stop" i]'));
-        const textBusy = /creating image|generating image|rendering image|image is being (?:created|generated)|creating your image|searching\s+\d+\s+websites|thinking/i
+        const spinning = Boolean(document.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [data-testid*="generating"]'));
+        const textBusy = /creating image|generating image|rendering image|image is being (?:created|generated)|creating your image/i
                        .test(document.body.innerText || '');
-        const busy = stopBtn || textBusy;
+        const busy = stopBtn || spinning || textBusy;
         return [n, px + ':' + sig, busy];
     """
     # Capture the pre-generation page after Send but before the first poll:
@@ -3327,10 +3539,14 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
             ui.info(f"   🖼️   {last} new image(s) so far…")
         elif last:
             steady += 4
-            # Images that have been sitting there unchanged for 20s — and
-            # the page is not saying it is still drawing — are all there is.
-            if steady >= 20 and not busy:
+            # Images that have been sitting there unchanged and not busy are finished!
+            if (steady >= 12 and not busy) or (last >= want and not busy and steady >= 4):
                 break
+        elif (n > 0 or new_n > 0) and not busy and (time.time() - start >= 8):
+            # If the image was already generated on the page (or before this loop), accept it
+            last = max(last, new_n if new_n > 0 else n)
+            ui.info(f"   🖼️   {last} completed image(s) ready")
+            break
         elif grace is not None and not busy and time.time() - start >= grace:
             break   # nothing ever appeared — not this turn's kind of reply
     return last
@@ -3341,8 +3557,9 @@ def _chatgpt_is_busy(driver) -> bool:
     try:
         return bool(driver.execute_script("""
             const stopBtn = document.querySelector('button[aria-label*="Stop"], button[data-testid*="stop"]');
+            const spinning = document.querySelector('[class*="animate-spin"], [class*="animate-pulse"]');
             const busy = /creating image|generating image|rendering image|creating your image/i.test(document.body.innerText || '');
-            return Boolean(stopBtn || busy);
+            return Boolean(stopBtn || spinning || busy);
         """))
     except Exception:
         return False
@@ -3704,14 +3921,36 @@ def _keep_failed_spec(sources) -> str:
         return ""
 
 
+def _blank_native_webdriver_error(error: object) -> bool:
+    """Whether ChromeDriver returned its address-only, message-less failure.
+
+    The affected Linux build returns "Message:" followed only by native stack
+    addresses. It can wrap that error in a RuntimeError, so inspect the
+    exception chain rather than trusting the outer message.
+    """
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).replace("\r", "")
+        before, marker, _stack = message.partition("Stacktrace:")
+        if marker and before.strip().lower() in ("", "message:"):
+            return True
+        current = (getattr(current, "__cause__", None) or
+                   getattr(current, "__context__", None))
+    return False
+
+
 def _browser_is_gone(error: object) -> bool:
     """True when the failure is the browser itself, not the step.
 
     Matched on the message rather than the exception class because
     undetected_chromedriver re-raises through several of Selenium's types and
-    the wording is the only thing common to all of them.
+    the wording is the only thing common to all of them. A native blank
+    ChromeDriver error is also a dead/unusable session in practice.
     """
-    return any(marker in str(error).lower() for marker in _BROWSER_GONE)
+    return (_blank_native_webdriver_error(error) or
+            any(marker in str(error).lower() for marker in _BROWSER_GONE))
 
 
 # What a step is called to a person — the plan screen's words, so the chat a
@@ -5394,6 +5633,7 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
         listing = _adopt_assets(spec, attachments)
 
     driver = None
+    files = []
     if images.strip():
         # The picture first, in the tool that can draw — a fresh tab, since
         # this is a new job, not a continuation. Harvested off the page the
@@ -5410,15 +5650,81 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
             _open_tab(driver, maker)
             driver.get(maker_cfg["url"])
             _time.sleep(maker_cfg.get("page_wait", 4))
-            emit("waiting", {"stage": "artwork", "seconds": 300})
+            import re
+            m = re.search(r'\b([1-6])\s*(?:new\s*)?(?:images?|pictures?|artworks?|photos?|assets?)\b', images, re.I)
+            word_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+            if m:
+                want = int(m.group(1))
+            else:
+                m_word = re.search(r'\b(one|two|three|four|five|six)\s+(?:new\s*)?(?:images?|pictures?|artworks?|photos?|assets?)\b', images, re.I)
+                if m_word:
+                    want = word_map[m_word.group(1).lower()]
+                elif any(p in images.lower() for p in ("images", "pictures", "artworks", "assets", "photos")):
+                    want = min(4, max(2, len((spec.get("_scenes") or [])) - 1))
+                else:
+                    want = 1
+
+            emit("waiting", {"stage": "artwork", "seconds": 75 * want})
             _reask(driver, maker_cfg,
                    _web.followup_imagery_instructions(images, spec),
-                   wait=90)
-            ui.info("   ⏳  waiting for the picture(s) to finish rendering…")
-            _wait_for_images(driver, maker_cfg, 1, cap=300)
+                   wait=-1)
+            ui.info(f"   ⏳  waiting for artwork asset 1 of {want} to finish rendering…")
+            got = _wait_for_images(driver, maker_cfg, 1, cap=80, baseline_count=0)
+            if got:
+                ui.info(f"   🖼️   artwork asset 1 of {want} completed")
+            else:
+                ui.warn("   ⚠️  could not generate artwork asset 1")
+
+            for num in range(2, want + 1):
+                settle_deadline = _time.time() + 30
+                while _time.time() < settle_deadline:
+                    if not _chatgpt_is_busy(driver):
+                        break
+                    _time.sleep(2)
+
+                before_dom = int(driver.execute_script(r"""
+                    return document.querySelectorAll('img[src*="blob.core.windows.net"], img[src*="files.oaiusercontent.com"], img[src*="backend-api/files"]').length;
+                """) or got)
+
+                followup_prompt = (
+                    f"Now generate artwork asset {num} of {want} for this reel using DALL-E. "
+                    "Make it a different single clear subject with an isolated background and no text. "
+                    "Do NOT search the web. Use the image tool now."
+                )
+                _reask(driver, maker_cfg, followup_prompt, wait=-1)
+                ui.info(f"   ⏳  waiting for artwork asset {num} of {want} to finish rendering…")
+
+                wait_start = _time.time()
+                asset_finished = False
+                per_asset_cap = 75
+                while _time.time() - wait_start < per_asset_cap:
+                    _time.sleep(3)
+                    busy = _chatgpt_is_busy(driver)
+                    try:
+                        cur_dom = int(driver.execute_script(r"""
+                            return document.querySelectorAll('img[src*="blob.core.windows.net"], img[src*="files.oaiusercontent.com"], img[src*="backend-api/files"]').length;
+                        """) or 0)
+                    except Exception:
+                        cur_dom = before_dom
+
+                    if cur_dom > before_dom and not busy:
+                        asset_finished = True
+                        break
+                    if not busy and (_time.time() - wait_start) > 20 and cur_dom <= before_dom:
+                        break
+
+                if asset_finished:
+                    got += 1
+                    ui.info(f"   🖼️   artwork asset {got} of {want} completed")
+                else:
+                    ui.warn(f"   ⚠️  could not generate artwork asset {num} — proceeding with {got} image(s)")
+                    break
+
             files = _harvest_images(
                 driver, maker_cfg, "artwork",
-                exclude_files=(images or []) + (pipeline_files or []))
+                exclude_files=attachments or [])
+            if want > 1 and len(files) > want:
+                files = files[-want:]
             made = [f["path"] for f in files if f.get("path")]
             if made:
                 listing = (listing + "\n" if listing else "") + \
@@ -5444,6 +5750,16 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
     driver.get(design_url)
     _time.sleep(agent_cfg.get("page_wait", 4))
     wait = followup_wait(agent_cfg)
+
+    # Upload newly generated/attached artwork to the reopened design conversation
+    if files:
+        img_uploads = [f for f in files if f.get("path") and not str(f.get("path", "")).lower().endswith(
+            (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"))]
+        if img_uploads:
+            try:
+                _upload_files(driver, agent_cfg, img_uploads, agent_name)
+            except Exception:
+                pass
 
     def ask(prompt, expect=_web.SCENE_EXPECT):
         emit("waiting", {"stage": "design", "seconds": wait})
@@ -6825,7 +7141,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # did not). See config.begin_run.
     run_title = ((routing or {}).get("_title") or C.fallback_title(query))
     cur_dir = C.current_run_dir()
-    if (followup or resume_urls or custom_stages) and cur_dir and os.path.isdir(cur_dir):
+    if (followup or resume_urls) and cur_dir and os.path.isdir(cur_dir):
         C.continue_run(cur_dir, task=query, title=run_title)
     else:
         C.begin_run(query, title=run_title)
@@ -7252,8 +7568,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # Studio's imagery stage. Both are producers for the second list
             # below — the files an EARLIER stage generated (a logo, a deck)
             # travel only to the stages that make the deliverable.
-            producer = stage in ("visual", "media", "development",
-                                 "presentation", "format", "artwork")
+            producer = (stage in ("visual", "media", "development",
+                                  "presentation", "format", "artwork", "design")
+                        or stage_idx == design_feeder
+                        or stage_idx == motion_feeder)
             # Source video is never sent to browser tools for a local edit.
             # The writing/audio stages need the brief and script, not hundreds
             # of megabytes of client footage; the local renderer receives the
@@ -7262,9 +7580,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                   and agent_cfg.get("runner") != "elevenlabs")
             # Producers also receive files GENERATED by earlier stages
             # (e.g. the logo the visual stage just made) — those can't
-            # travel in a text handoff at all.
-            send_files = (browser_attachments if include_attachment else []) + \
-                         (pipeline_files if producer else [])
+            # travel in a text handoff at all. Audio files are kept for
+            # local renderers and never uploaded to ChatGPT.
+            gen_uploads = [
+                f for f in (pipeline_files if producer else [])
+                if not str(f.get("path", "")).lower().endswith(
+                    (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"))
+            ]
+            send_files = (browser_attachments if include_attachment else []) + gen_uploads
             went_up = 0
             # A chip left in the composer by an earlier run would go out
             # with this message -- see _clear_staged_attachments. Done on
@@ -7299,13 +7622,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # this tool decides whether their text is pasted in as well.
                 context += F.context_block(browser_attachments,
                                            uploaded=bool(went_up))
-            if producer and pipeline_files:
+            if producer and gen_uploads:
                 # Not always pictures any more — _harvest_files also lands
                 # generated documents, decks, code and archives here, so the
                 # wording has to fit whatever actually came through rather
                 # than always saying "image".
-                names = ", ".join(f["name"] for f in pipeline_files)
-                kinds = {f.get("kind", "image") for f in pipeline_files}
+                names = ", ".join(f["name"] for f in gen_uploads)
+                kinds = {f.get("kind", "image") for f in gen_uploads}
                 noun = "image file(s)" if kinds == {"image"} else "file(s)"
                 context += (
                     f"An earlier pipeline stage GENERATED these {noun}, "
@@ -7654,16 +7977,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # a page nobody asked anything.
                 nothing_was_sent = False
                 for idx, prompt in enumerate(questions, 1):
+                    prompt_phase = "constructing the prompt"
                     try:
                         ui.info(f"   → prompt {idx}/{len(questions)}: {prompt[:80]}…")
-                        textarea = WebDriverWait(driver, agent_cfg.get("input_wait", 15)).until(
-                            EC.presence_of_element_located(
-                                (By.CSS_SELECTOR, agent_cfg["textarea_selector"]))
-                        )
-                        try:
-                            textarea.clear()
-                        except Exception:
-                            pass
 
                         if stage == "audio" or agent_name == "ElevenLabs" or agent_cfg.get("runner") == "elevenlabs":
                             sources = [t for ts in reversed(list(all_responses.values())) for t in ts if str(t).strip()]
@@ -7689,6 +8005,17 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 full_prompt = _maker_brief(agent_name, agent_cfg) + full_prompt
                                 full_prompt = _chat_header(run_title, stage) + full_prompt
                         full_prompt = _bmp_safe(full_prompt)  # strip emoji ChromeDriver can't type
+                        prompt_phase = "waiting for the message box"
+                        textarea = WebDriverWait(
+                            driver, agent_cfg.get("input_wait", 15)).until(
+                                EC.presence_of_element_located(
+                                    (By.CSS_SELECTOR,
+                                     agent_cfg["textarea_selector"])))
+                        try:
+                            textarea.clear()
+                        except Exception:
+                            pass
+                        prompt_phase = "putting the prompt in the message box"
                         if not _fast_type(driver, textarea, full_prompt):
                             # JS insertion didn't take on this site — fall back
                             # to per-keystroke typing (slow but universal).
@@ -7735,6 +8062,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         # sent at all (see agents.py's page_wait comments).
                         time.sleep(1.5)
 
+                        prompt_phase = "submitting the prompt"
                         # Submit — try the button, fall back to Enter.
                         # When attachments or rich content are present, the page may keep the
                         # send button disabled for several seconds while uploading/indexing.
@@ -7797,7 +8125,33 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             _smart_wait(driver, agent_cfg, 120,
                                        should_stop=stage_halt)
                     except Exception as e:
-                        ui.err(f"   prompt error: {e}")
+                        # The blank native ChromeDriver failure happens before
+                        # the first ChatGPT composer is usable. No prompt has
+                        # been submitted at this point, so one fresh tab is
+                        # safe and avoids making the person restart a whole
+                        # pipeline that has already completed research.
+                        if (idx == 1 and prompt_phase != "submitting the prompt"
+                                and _blank_native_webdriver_error(e)):
+                            ui.warn(
+                                "   ChromeDriver returned a blank error while "
+                                f"{prompt_phase}; reopening {agent_name} and "
+                                "retrying the prompt once")
+                            try:
+                                _open_agent_page(agent_name, agent_cfg, stage)
+                                _submit_prompt(
+                                    driver, agent_cfg, agent_name, full_prompt,
+                                    has_attachments=bool(attachments or send_files))
+                                ui.info(f"   ✓  prompt {idx}/{len(questions)} "
+                                        "sent after browser recovery")
+                                if idx < len(questions):
+                                    _smart_wait(driver, agent_cfg, 120,
+                                                should_stop=stage_halt)
+                                continue
+                            except Exception as recovery_error:
+                                e = recovery_error
+                        if _browser_is_gone(e):
+                            raise e
+                        ui.err(f"   prompt error while {prompt_phase}: {e}")
                         nothing_was_sent = True
 
                 if nothing_was_sent and not all_responses.get(stage):
@@ -7853,13 +8207,54 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     if stage == "artwork" and got >= min_needed:
                         ui.ok(f"   ✓  {got} artwork images generated — ready for reel design")
                     elif stage == "artwork" and got < min_needed:
-                        js_img_count = (
-                            "let n = 0; "
-                            "for (const img of document.querySelectorAll('img')) { "
-                            "  if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256) n++; "
-                            "} "
-                            "return n;"
-                        )
+                        js_img_count = r"""
+                            function isGen(img) {
+                                if (!img) return false;
+                                const src = img.currentSrc || img.src || '';
+                                if (!src) return false;
+                                if (img.closest(
+                                    '[data-message-author-role="user"], [data-message-role="user"], ' +
+                                    '.user-message, form, [data-testid*="composer"], [data-testid*="attachment"], ' +
+                                    '[data-testid*="user-message"], [data-testid*="user-turn"], [class*="user-turn"]'
+                                )) return false;
+
+                                // Immediate pass: OpenAI DALL-E CDN URLs are ALWAYS generated assistant images
+                                const isOpenAiDalle = /oaidalleapiprodscus\.blob\.core\.windows\.net|files\.oaiusercontent\.com|chatgpt\.com\/backend-api\/files/i.test(src);
+                                if (isOpenAiDalle) return true;
+
+                                const turn = img.closest('article, section[data-testid^="conversation-turn-"], [data-testid^="conversation-turn-"], [class*="conversation-turn"]');
+                                if (turn && turn.querySelector('[data-message-author-role="user"], [data-message-role="user"]')) {
+                                    return false;
+                                }
+                                if (img.closest(
+                                    'a[href^="http://"], a[href^="https://"]:not([href*="chatgpt.com"]):not([href*="openai.com"]), ' +
+                                    '[data-testid*="source"], [data-testid*="citation"], [class*="citation"], ' +
+                                    '[class*="source-card"], [class*="attribution"], [class*="search-result"], ' +
+                                    '[aria-label*="source" i], [aria-label*="citation" i], details, [class*="searched"]'
+                                )) return false;
+                                if (img.closest(
+                                    '[class*="avatar"], [data-testid*="avatar"], nav, header, footer, ' +
+                                    'button[aria-label*="copy" i], button[aria-label*="thumb" i], button[aria-label*="feedback" i]'
+                                )) return false;
+                                const alt = (img.getAttribute('alt') || '').toLowerCase();
+                                if (alt.includes('avatar') || alt === 'user' || alt === 'chatgpt') return false;
+                                const rect = img.getBoundingClientRect();
+                                if (rect.width > 0 && rect.width < 120 && rect.height > 0 && rect.height < 120) return false;
+                                return true;
+                            }
+                            let n = 0;
+                            const seenSrc = new Set();
+                            for (const img of document.querySelectorAll('img')) {
+                                if (!isGen(img)) continue;
+                                const src = img.currentSrc || img.src || '';
+                                if (!src || seenSrc.has(src)) continue;
+                                if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256) {
+                                    seenSrc.add(src);
+                                    n++;
+                                }
+                            }
+                            return n;
+                        """
                         asset_roles = {
                             1: "a brand emblem or clean wordmark",
                             2: "the flagship hero product or main equipment",
@@ -7901,19 +8296,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 busy = _chatgpt_is_busy(driver)
                                 try:
                                     cur_dom = int(driver.execute_script(js_img_count) or 0)
-                                    searching = bool(driver.execute_script(r"""
-                                        return /searching\s+\d+\s+websites|searched\s+\d+\s+websites/i.test(document.body.innerText || '');
-                                    """))
                                 except Exception:
                                     cur_dom = before_dom
-                                    searching = False
 
                                 if cur_dom > before_dom and not busy:
                                     asset_finished = True
                                     break
-                                # If ChatGPT went into web search mode instead of drawing, don't stall
-                                if searching and (time.time() - wait_start) > 25:
-                                    ui.warn("   ⚠️  ChatGPT initiated web search instead of image generation; proceeding with existing artwork")
+                                # If ChatGPT settled without drawing after an honest wait, move on
+                                if not busy and (time.time() - wait_start) > 20 and cur_dom <= before_dom:
                                     break
 
                             if asset_finished:

@@ -737,6 +737,26 @@ def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
             pass
         server = _connect(ec, timeout)
 
+    def _reopen(i):
+        """Reconnect before recipient `i`; False when it cannot be done.
+
+        An exception out of here used to escape the loop and discard `sent`:
+        the caller then believed nothing had gone out and offered to send the
+        same people again (review finding 1, 2026-10-01). Now everyone not yet
+        sent is reported as failed with the reason, and the sends that did
+        happen are still returned."""
+        try:
+            _fresh()
+            return True
+        except Exception as e:                          # noqa: BLE001
+            err = f"could not reconnect to the mail server: {e}"
+            ui.err(f"   ✗   {err}")
+            for j in range(i, len(recipients) + 1):
+                rj = recipients[j - 1]
+                failed.append((rj["email"], err))
+                report(j, rj, False, err)
+            return False
+
     def _attempt(msg):
         try:
             server.send_message(msg)
@@ -757,12 +777,14 @@ def send_bulk(cfg: dict, recipients: list[dict], subject: str, body: str,
                         f"{len(recipients) - i + 1} not attempted")
                 break
             if in_session >= every:          # proactively cycle before the cap
-                _fresh()
+                if not _reopen(i):
+                    break
                 in_session = 0
             msg = _build_message(ec, r, subject, body, files)
             ok, err = _attempt(msg)
             if not ok and _session_limit(err):   # session/rate limit → fresh session, retry once
-                _fresh()
+                if not _reopen(i):
+                    break
                 in_session = 0
                 ok, err = _attempt(msg)
             if ok:

@@ -146,7 +146,7 @@ SUMMARY_FALLBACK_ORDER = ["brains", "content", "research"]
 # ── Sensible generic web-UI selectors for tools we don't hand-tune ────────────
 _GENERIC = {
     "textarea_selector": "textarea, div[contenteditable='true'][role='textbox'], div[contenteditable='true']",
-    "response_selector": "[data-message-author-role='assistant'], .response, .message, .prose, .markdown",
+    "response_selector": "[data-message-author-role='assistant'], [data-markdown-text-style='assistant-message'], .response, .message, .prose, .markdown",
     "submit_selector": "button[type='submit'], button[aria-label*='Send'], button[data-testid='send-button']",
 }
 
@@ -533,7 +533,14 @@ AGENT_REGISTRY = {
         # framework's OWN state never saw it, and the run reports "would
         # not accept the prompt" on a page that looks, to the eye, ready.
         page_wait=10,
-        textarea_selector="#prompt-textarea",
+        # A chain: ChatGPT dropped the old id="prompt-textarea" (Oct 2026) for
+        # a bare ProseMirror contenteditable labelled "Ask ChatGPT", which made
+        # every run time out on "waiting for the message box". Keep the id for
+        # buckets that still have it; the rest are the editor's own markers.
+        textarea_selector=(
+            "#prompt-textarea, "
+            "form div.ProseMirror[contenteditable='true'], "
+            "div[contenteditable='true'][aria-label='Ask ChatGPT']"),
         # A CHAIN, not one selector. OpenAI rolls the conversation DOM out in
         # buckets, so two customers on the same day can see different markup:
         # the long-standing div[data-message-author-role] and a newer
@@ -549,6 +556,7 @@ AGENT_REGISTRY = {
         response_selector=(
             "[data-message-author-role='assistant'], "
             "[data-message-role='assistant'], "
+            "[data-markdown-text-style='assistant-message'], "
             ".markdown.prose"),
         submit_selector="button[data-testid='send-button']",
         # A switch, not an instruction. Which way it falls is decided by the
@@ -574,7 +582,8 @@ AGENT_REGISTRY = {
         # is a <section data-turn="assistant">; the per-message toolbar's
         # regenerate control is hover-only but present in the DOM.
         busy_selector="button[data-testid='stop-button']",
-        turn_selector="section[data-turn='assistant']",
+        turn_selector=("section[data-turn='assistant'], "
+                       "[data-content-search-unit-key$=':assistant']"),
         regenerate_selector=("button[aria-label='Regenerate'], "
                              "button[aria-label*='Try again' i], "
                              "button[aria-label*='Retry' i], "

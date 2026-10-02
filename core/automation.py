@@ -2448,7 +2448,7 @@ def _harvest_files(driver, agent_cfg, stage: str, ignore_names=(),
             // stage (or be clicked/downloaded in its place).
             const scopes = [
                 ...document.querySelectorAll("[data-message-author-role='assistant'], "
-                    + "[data-message-role='assistant'], .agent-turn, "
+                    + "[data-message-role='assistant'], .agent-turn, [data-content-search-unit-key$=':assistant'], "
                     + "section[data-testid^='conversation-turn-']:has(.agent-turn)")
             ];
             const scope = scopes.at(-1) || document;
@@ -2822,7 +2822,7 @@ def _click_download_control(driver, agent_cfg: dict) -> bool:
         clicked = bool(driver.execute_script(r"""
             const scopes = [...document.querySelectorAll(
                 "[data-message-author-role='assistant'], "
-                + "[data-message-role='assistant'], .agent-turn, "
+                + "[data-message-role='assistant'], .agent-turn, [data-content-search-unit-key$=':assistant'], "
                 + "section[data-testid^='conversation-turn-']:has(.agent-turn)")];
             const scope = scopes.at(-1);
             if (!scope) return false;
@@ -2896,7 +2896,8 @@ def _click_download_control(driver, agent_cfg: dict) -> bool:
                 .filter(el => typeRe.test((el.innerText || '').trim()));
             const respEls = document.querySelectorAll(
                 "[data-message-author-role='assistant'] *, "
-                + "[data-message-role='assistant'] *");
+                + "[data-message-role='assistant'] *, "
+                + "[data-content-search-unit-key$=':assistant'] *");
             const byText = [...respEls].filter(el => {
                 const t = (el.innerText || '').trim();
                 return t.length >= 10 && t.length < 300
@@ -2985,7 +2986,7 @@ def _current_chatgpt_file_card(driver) -> bool:
         return bool(driver.execute_script(r"""
             const scopes = [...document.querySelectorAll(
                 "[data-message-author-role='assistant'], "
-                + "[data-message-role='assistant'], .agent-turn, "
+                + "[data-message-role='assistant'], .agent-turn, [data-content-search-unit-key$=':assistant'], "
                 + "section[data-testid^='conversation-turn-']:has(.agent-turn)")];
             const scope = scopes.at(-1);
             if (!scope) return false;
@@ -3344,7 +3345,19 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 1,
             grown = grown or total > baseline
             last_len = total
             last_change = time.time()
-        elif ((grown or (img_present and time.time() - start >= 15)) and time.time() - start >= min_wait
+        elif ((grown or (img_present and time.time() - start >= 15)
+               # A reply already complete before the first reading never
+               # "grows"; a tool idle for 8s with text on the page and no
+               # stop button is finished all the same -- but only when that
+               # text can be proved to be THIS reply: the one and only
+               # assistant turn on the page (a fresh chat). With earlier
+               # turns on screen, old text and a reply that has not started
+               # look identical, and settling would hand back the previous
+               # answer as the new one (a follow-up, a Studio scene turn).
+               or (total > 0 and time.time() - last_change >= 8
+                   and time.time() - start >= 20
+                   and bool(turn_sel) and _count(turn_sel) == 1))
+              and time.time() - start >= min_wait
               and time.time() - last_change >= stable_for
               and has_marker() and not still_generating()):
             settled = True
@@ -3631,7 +3644,7 @@ def _wait_for_files(driver, cap: int = 60, grace: int = 12,
         # distinguishes them from prose.
         "const assistantScopes = [...document.querySelectorAll("
         "\"[data-message-author-role='assistant'], "
-        "[data-message-role='assistant'], .agent-turn, "
+        "[data-message-role='assistant'], .agent-turn, [data-content-search-unit-key$=':assistant'], "
         "section[data-testid^='conversation-turn-']:has(.agent-turn)\")];"
         "const assistantScope = assistantScopes.at(-1) || document;"
         "const respEls = assistantScope.querySelectorAll('*');"

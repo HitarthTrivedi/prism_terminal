@@ -404,11 +404,25 @@ def seed_profile(force: bool = False) -> bool:
     if force and os.path.exists(PROFILE_DIR):
         shutil.rmtree(PROFILE_DIR, ignore_errors=True)
     os.makedirs(PROFILE_DIR, exist_ok=True)
-    shutil.copytree(src_default, os.path.join(PROFILE_DIR, "Default"),
-                    dirs_exist_ok=True, ignore=_PROFILE_SKIP)
+    try:
+        shutil.copytree(src_default, os.path.join(PROFILE_DIR, "Default"),
+                        dirs_exist_ok=True, ignore=_PROFILE_SKIP)
+    except shutil.Error as exc:
+        # Windows: a running Chrome holds some files open (Network\Cookies
+        # first among them) and copytree raises only AFTER copying everything
+        # else. That copy is a working profile — the login tabs about to open
+        # are where the person signs in anyway — so keep it. Raising here
+        # failed the whole Login tabs press, silently, on the first click of a
+        # fresh Windows install (09-Oct-2026).
+        skipped = exc.args[0] if exc.args and isinstance(exc.args[0], list) else []
+        ui.warn(f"Copied your Chrome logins except {len(skipped)} file(s) Chrome "
+                "had open — sign in again in the tabs Prism opens.")
     local_state = os.path.join(src, "Local State")
     if os.path.exists(local_state):
-        shutil.copy2(local_state, os.path.join(PROFILE_DIR, "Local State"))
+        try:
+            shutil.copy2(local_state, os.path.join(PROFILE_DIR, "Local State"))
+        except OSError:
+            pass                # Chrome writes a fresh one on first start
     return True
 
 

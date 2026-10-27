@@ -528,34 +528,52 @@ def _hatch_area(e) -> float:
 # AI's own direct read of the same drawing, 38.80 m: a client's real file, not
 # a corner case built to test with.
 
-def _collapse_duct_pairs(segments: list) -> tuple[float, int]:
-    """The route length of one layer's straight LINE segments, treating a
-    matched pair of near-parallel, near-equal-length lines a small constant
-    distance apart as ONE run (its two edges), not two — and dropping the
-    short perpendicular stub that closes the open end of a paired run, which
-    is not route length at all, just the drawing closing the rectangle.
+def _unit_dir(a, b, length: float | None = None) -> tuple[float, float]:
+    length = _dist(a, b) if length is None else length
+    if length <= 0:
+        return (0.0, 0.0)
+    return ((b[0] - a[0]) / length, (b[1] - a[1]) / length)
 
-    A line with no match is kept at its own full, un-halved length — this
-    only ever acts on a genuine double-line pair; an ordinary single-line
-    (centreline/schematic) run, on its own layer, is untouched. Two SEPARATE
-    same-length parallel runs (e.g. a flow pipe and a return pipe) are safe
-    by construction as long as the drawing keeps them on separate layers,
-    which is the normal convention this whole module already relies on
-    elsewhere — this function only ever compares lines within ONE layer's
-    own list, never across layers.
 
-    Returns (total_length, pairs_found) — the caller turns a non-zero
-    `pairs_found` into a visible note, never a silent correction: this is a
-    geometric inference, not a measurement, and the module's whole promise
-    is that nothing here is silently trusted."""
+def _duct_runs(segments: list) -> list[dict]:
+    """One layer's straight LINE segments, resolved into real runs —
+    {"a", "b", "length", "offset", "kind"} each, `kind` one of:
+
+      "pair"       a matched double-line edge pair (rule 1): near-parallel,
+                   near-equal-length, a small constant distance apart —
+                   counted once, at the average of its two edges.
+      "transition" a tapering reducer between two different-width pairs
+                   (rule 2, added 23 Oct 2026, found on the same real file
+                   rule 1 came from: a reducer is drawn as two short lines
+                   that CONVERGE, not run parallel, so rule 1's own pairing
+                   correctly leaves them unmatched — but counting both
+                   diagonals in full double-counts the transition by about
+                   its own length. Detected the same way a pair's own
+                   offset is validated: both ends sit a plausible duct-width
+                   apart (20-2000 mm), just a DIFFERENT width at each end —
+                   that difference is what makes it a transition and not a
+                   pair — and the transition itself is no longer than the
+                   widest confirmed pair on the layer, so an unrelated long
+                   diagonal line elsewhere can never be mistaken for one.
+      "single"     no match — an ordinary single-line (centreline/
+                   schematic) run, counted at its own full length, exactly
+                   as before rule 1 ever existed.
+      "bridged"    two collinear, same-width "pair" runs with a small gap
+                   between them, joined into one continuous run (rule 2's
+                   gap-bridging, revisited with real topology — see below).
+
+    A short perpendicular stub that closes a pair's open end (not route
+    length, just the drawing closing the rectangle) is dropped entirely —
+    it appears in none of the kinds above.
+
+    Two SEPARATE same-length parallel runs (e.g. a flow pipe and a return
+    pipe) are safe by construction as long as the drawing keeps them on
+    separate layers, which is the normal convention this whole module
+    already relies on elsewhere — this function only ever compares lines
+    within ONE layer's own list, never across layers."""
     n = len(segments)
     lengths = [_dist(a, b) for a, b in segments]
-    dirs = []
-    for (a, b), length in zip(segments, lengths):
-        if length <= 0:
-            dirs.append((0.0, 0.0))
-            continue
-        dirs.append(((b[0] - a[0]) / length, (b[1] - a[1]) / length))
+    dirs = [_unit_dir(a, b, length) for (a, b), length in zip(segments, lengths)]
 
     used = [False] * n
     pairs: list[tuple[int, int, float]] = []
@@ -592,7 +610,11 @@ def _collapse_duct_pairs(segments: list) -> tuple[float, int]:
             used[i] = used[j] = True
             pairs.append((i, j, off))
 
-    total = sum((lengths[i] + lengths[j]) / 2 for i, j, _off in pairs)
+    runs: list[dict] = []
+    for i, j, off in pairs:
+        a, b = segments[i]
+        runs.append({"a": a, "b": b, "length": (lengths[i] + lengths[j]) / 2,
+                    "offset": off, "kind": "pair", "seg_idxs": (i, j)})
 
     for k in range(n):
         if used[k] or lengths[k] <= 0:
@@ -607,10 +629,307 @@ def _collapse_duct_pairs(segments: list) -> tuple[float, int]:
                 break
         if is_cap:
             used[k] = True
-            continue
-        total += lengths[k]
 
-    return total, len(pairs)
+    # rule 2: a tapering transition's two converging sides, counted once.
+    leftover = [k for k in range(n) if not used[k] and lengths[k] > 0]
+    widest_pair = max((r["length"] for r in runs), default=0.0)
+    for a_i in range(len(leftover)):
+        i = leftover[a_i]
+        if used[i]:
+            continue
+        for b_i in range(a_i + 1, len(leftover)):
+            j = leftover[b_i]
+            if used[j]:
+                continue
+            cross = abs(dirs[i][0] * dirs[j][1] - dirs[i][1] * dirs[j][0])
+            if cross <= 0.05:
+                continue                      # parallel -- rule 1 already owns this
+            if abs(lengths[i] - lengths[j]) > 0.08 * max(lengths[i], lengths[j]):
+                continue
+            start_gap = _dist(segments[i][0], segments[j][0])
+            end_gap = _dist(segments[i][1], segments[j][1])
+            if not (20.0 <= start_gap <= 2000.0 and 20.0 <= end_gap <= 2000.0):
+                continue
+            if widest_pair and max(lengths[i], lengths[j]) > widest_pair:
+                continue                      # longer than any confirmed duct width -- not a transition
+            used[i] = used[j] = True
+            runs.append({"a": segments[i][0], "b": segments[j][1],
+                        "length": (lengths[i] + lengths[j]) / 2, "offset": None,
+                        "kind": "transition"})
+            break
+
+    for k in range(n):
+        if used[k] or lengths[k] <= 0:
+            continue
+        a, b = segments[k]
+        runs.append({"a": a, "b": b, "length": lengths[k], "offset": None, "kind": "single"})
+        used[k] = True
+
+    # rule 2 revisited, 25 Oct 2026: bridge a small gap between two
+    # collinear, same-width "pair" runs into one continuous run — UNLESS
+    # some OTHER segment on this same layer has an endpoint landing inside
+    # that gap, which means a branch ties into the trunk exactly there (a
+    # tee/cross junction, not a break in an otherwise continuous run).
+    #
+    # The original version of this idea bridged every such gap and was
+    # rejected before shipping: on a real file, a trunk that takes
+    # branches off BOTH sides at the same point reads as one continuous
+    # run straight through its own body, silently adding the trunk's own
+    # width (400-800mm per occurrence there) as if it were missing duct.
+    # This version adds the real topology check that was missing — found
+    # by reproducing that exact file (`hvac_tender_complex.dxf`,
+    # M-DUCT-SUPPLY): every real gap in it has a crossing branch's
+    # endpoint landing exactly inside the gap (confirmed at (13275, 16400)
+    # and (13725, 15600), where two branches cross the trunk from opposite
+    # sides at the same point) — so this check correctly leaves all of
+    # them un-bridged, same as before this rule existed. A gap with
+    # nothing tied into it — a trunk split into two LINE entities for no
+    # topological reason — is bridged.
+    def _axis(r):
+        (ax, ay), (bx, by) = r["a"], r["b"]
+        if abs(ay - by) < 1.0:
+            return ("H", round(ay, 1))
+        if abs(ax - bx) < 1.0:
+            return ("V", round(ax, 1))
+        return None
+
+    bridged_away: set[int] = set()
+    pair_idxs = [idx for idx, r in enumerate(runs) if r["kind"] == "pair"]
+    for a_i in range(len(pair_idxs)):
+        i_idx = pair_idxs[a_i]
+        if i_idx in bridged_away:
+            continue
+        ri = runs[i_idx]
+        axi = _axis(ri)
+        if not axi:
+            continue
+        for b_i in range(len(pair_idxs)):
+            j_idx = pair_idxs[b_i]
+            if j_idx == i_idx or j_idx in bridged_away:
+                continue
+            rj = runs[j_idx]
+            if _axis(rj) != axi:
+                continue
+            if abs(ri["offset"] - rj["offset"]) > 5.0:
+                continue
+            dim = 0 if axi[0] == "H" else 1
+            a1, b1 = sorted((ri["a"][dim], ri["b"][dim]))
+            a2, b2 = sorted((rj["a"][dim], rj["b"][dim]))
+            if b1 >= a2:
+                continue                       # rj is not to the "right" of ri
+            gap = a2 - b1
+            if not (1.0 < gap < 2000.0):
+                continue
+            y0 = axi[1]
+            band = max(ri["offset"], rj["offset"], 5.0)
+            # ri/rj's OWN boundary endpoints sit exactly at the gap's own
+            # edges (b1, a2) -- excluded by raw segment index, not by
+            # coordinate, because a genuine crossing branch can legitimately
+            # land exactly on one of those same coordinates (confirmed on
+            # the real file: the branch ties in exactly at the trunk pair's
+            # own endpoint, not a little inside it).
+            own = set(ri.get("seg_idxs", ())) | set(rj.get("seg_idxs", ()))
+            branched = False
+            for s_idx, (sa, sb) in enumerate(segments):
+                if s_idx in own:
+                    continue
+                for pt in (sa, sb):
+                    if (b1 - 1.0 <= pt[dim] <= a2 + 1.0
+                            and abs(pt[1 - dim] - y0) < band):
+                        branched = True
+                        break
+                if branched:
+                    break
+            if branched:
+                continue                       # a real junction -- do not bridge
+            pts = sorted((ri["a"], ri["b"], rj["a"], rj["b"]),
+                        key=lambda p: p[dim])
+            runs[i_idx] = {"a": pts[0], "b": pts[-1],
+                          "length": ri["length"] + gap + rj["length"],
+                          "offset": (ri["offset"] + rj["offset"]) / 2,
+                          "kind": "bridged", "seg_idxs": tuple(own)}
+            bridged_away.add(j_idx)
+            ri = runs[i_idx]
+            break
+
+    if bridged_away:
+        runs = [r for idx, r in enumerate(runs) if idx not in bridged_away]
+
+    return runs
+
+
+def _collapse_duct_pairs(segments: list) -> tuple[float, int, int, int]:
+    """Thin wrapper over `_duct_runs()`: the route length of one layer's
+    straight LINE segments, plus how many genuine pairs, tapering
+    transitions and bridged branch-take-off gaps were found -- the caller
+    turns each into a visible note, never a silent correction: these are
+    geometric inferences, not measurements, and the module's whole promise
+    is that nothing here is silently trusted.
+
+    Returns (total_length, pairs_found, transitions_found, bridged_found)."""
+    runs = _duct_runs(segments)
+    total = sum(r["length"] for r in runs)
+    pairs_found = sum(1 for r in runs if r["kind"] == "pair")
+    transitions_found = sum(1 for r in runs if r["kind"] == "transition")
+    bridged_found = sum(1 for r in runs if r["kind"] == "bridged")
+    return total, pairs_found, transitions_found, bridged_found
+
+
+# ── rule 3: duct/pipe sizes from the drawing's own TEXT labels ─────────────
+# Found testing the duct-pairing fix above against an independent reading of
+# the same real file: the fix gets the ROUTE length right, but a route
+# length alone cannot be priced -- GI ductwork is billed in m² of sheet per
+# size and gauge, not metres of centreline, and the size (e.g. "800x400")
+# is written right there on the drawing as plain text, which this module
+# never read at all. `_DUCT_SIZE_RE` / `_PIPE_SIZE_RE` find a size in any
+# TEXT/MTEXT string; each label is matched to the nearest run by point-to-
+# segment distance, then propagated to every other run in the same
+# straight-line "chain" (same orientation, same line, same width) -- so a
+# trunk broken into several LINE entities by branch take-offs still gets
+# the one size label meant for the whole run, instead of the single
+# nearest segment guessing wrong when two different labels are roughly
+# equidistant from a segment in the middle.
+_DUCT_SIZE_RE = re.compile(r"(\d{2,4})\s*[xX×]\s*(\d{2,4})")
+_PIPE_SIZE_RE = re.compile(r"\bDN\s*(\d{1,4})\b", re.IGNORECASE)
+_SIZE_LABEL_MAX_MM = 3000.0           # a label further than this from every
+                                       # run on the layer is not describing it
+
+
+def _duct_size_labels(texts: list[tuple[tuple[float, float], str]]
+                      ) -> list[tuple[tuple[float, float], str, str]]:
+    """(position, size string, "duct"|"pipe") for every TEXT/MTEXT entity
+    that names a duct size ("800x400", spacing/case tolerant) or a pipe
+    size ("DN80")."""
+    out = []
+    for pos, content in texts:
+        m = _DUCT_SIZE_RE.search(content)
+        if m:
+            out.append((pos, f"{m.group(1)}x{m.group(2)}", "duct"))
+            continue
+        m = _PIPE_SIZE_RE.search(content)
+        if m:
+            out.append((pos, f"DN{m.group(1)}", "pipe"))
+    return out
+
+
+def _point_segment_distance(p, a, b) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    dx, dy = bx - ax, by - ay
+    length2 = dx * dx + dy * dy
+    if length2 <= 0:
+        return _dist(p, a)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+    return _dist(p, (ax + t * dx, ay + t * dy))
+
+
+def _chain_key(run: dict, tol: float = 5.0):
+    """Two runs share a key when they sit on the same straight line, the
+    same duct/pipe width apart -- the signal used to propagate one size
+    label across several LINE entities a branch take-off has split one
+    run into. A diagonal (a transition) is never chained -- it belongs to
+    neither side's label."""
+    (ax, ay), (bx, by) = run["a"], run["b"]
+    off = round((run["offset"] or 0.0) / tol) * tol
+    if abs(ay - by) <= tol:
+        return ("h", round(ay / tol) * tol, off)
+    if abs(ax - bx) <= tol:
+        return ("v", round(ax / tol) * tol, off)
+    return ("d", id(run))
+
+
+def _duct_sizes_for_layer(layer: str, segments: list,
+                          labels: list[tuple[tuple[float, float], str, str]],
+                          expected_kind: str
+                          ) -> list[dict]:
+    """One entry per distinct size found on this layer: {"layer", "size",
+    "kind", "length"} (length in the drawing's own raw unit, same as
+    lengths_by_layer). A run with no label close enough to trust is left
+    out -- silence, not a guessed size.
+
+    `expected_kind` ("duct" or "pipe", from the layer's own name) restricts
+    matching to labels of that same kind only -- caught testing against a
+    real file: a nearby "DN32" pipe label was the closest text to a duct
+    run and got attached to it, producing a nonsensical "duct, DN32" entry.
+    A duct layer is sized from duct-pattern text, a pipe layer from
+    pipe-pattern text, never the other one just because it was closer."""
+    same_kind = [l for l in labels if l[2] == expected_kind]
+    if not same_kind:
+        return []
+    runs = [r for r in _duct_runs(segments) if r["kind"] in ("pair", "single", "bridged")]
+    if not runs:
+        return []
+    chains: dict = {}
+    for r in runs:
+        chains.setdefault(_chain_key(r), []).append(r)
+
+    out = []
+    for members in chains.values():
+        best = None
+        for r in members:
+            for pos, size, kind in same_kind:
+                d = _point_segment_distance(pos, r["a"], r["b"])
+                if best is None or d < best[0]:
+                    best = (d, size, kind)
+        if best is None or best[0] > _SIZE_LABEL_MAX_MM:
+            continue
+        _, size, kind = best
+        out.append({"layer": layer, "size": size, "kind": kind,
+                    "length": sum(r["length"] for r in members)})
+    return out
+
+
+_MM_PER_DRAWING_UNIT = {
+    "millimeters": 1.0, "centimeters": 10.0, "meters": 1000.0,
+    "inches": 25.4, "feet": 304.8,
+}
+
+
+def _duct_size_area(entry: dict, unit: str) -> dict:
+    """Adds length_m and, for a duct (not a pipe), area_m2 -- sheet area,
+    perimeter x length, the number a GI ductwork rate actually prices
+    against. Only when the drawing's unit is one `measure()` can convert
+    with confidence; left out otherwise rather than guessed."""
+    to_mm = _MM_PER_DRAWING_UNIT.get(unit)
+    if not to_mm:
+        return entry
+    length_m = entry["length"] * to_mm / 1000.0
+    entry["length_m"] = round(length_m, 2)
+    if entry["kind"] == "duct":
+        m = _DUCT_SIZE_RE.search(entry["size"])
+        if m:
+            w, h = float(m.group(1)), float(m.group(2))
+            perimeter_m = 2.0 * (w + h) / 1000.0
+            entry["area_m2"] = round(perimeter_m * length_m, 2)
+    return entry
+
+
+# ── rule 4: a corner in a single-line run is an elbow ──────────────────────
+# Safe by construction, unlike the branch-take-off gap this module
+# deliberately does NOT bridge (see HVAC_DRAWING_RULES.md): it only ever
+# looks at two single-line segments that already share an exact endpoint --
+# a hard topological fact read straight off the coordinates, never a fuzzy
+# proximity guess -- so it carries none of that one's false-positive risk
+# of merging two unrelated runs that happen to sit nearby.
+
+def _elbow_count(segments: list) -> int:
+    singles = [r for r in _duct_runs(segments) if r["kind"] == "single"]
+    seen: set = set()
+    for i in range(len(singles)):
+        ai, bi = singles[i]["a"], singles[i]["b"]
+        di = _unit_dir(ai, bi)
+        for j in range(i + 1, len(singles)):
+            aj, bj = singles[j]["a"], singles[j]["b"]
+            dj = _unit_dir(aj, bj)
+            cross = abs(di[0] * dj[1] - di[1] * dj[0])
+            if cross <= 0.3:                  # near-parallel -- a straight run, not a turn
+                continue
+            for p in (ai, bi):
+                for q in (aj, bj):
+                    if _dist(p, q) < 1.0:
+                        seen.add((round(p[0]), round(p[1])))
+    return len(seen)
 
 
 # ── measurement ────────────────────────────────────────────────────────────
@@ -656,6 +975,10 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
     block_pos: dict[str, list] = {}
     block_scales: dict[str, list] = {}
     layer_geom: dict[str, dict] = {}
+    # Every TEXT/MTEXT on the drawing, position + content -- rule 3 reads
+    # duct/pipe sizes out of these when hvac=True; always collected (cheap)
+    # so the gate lives in one place, where it's used, not here too.
+    text_entities: list[tuple[tuple[float, float], str]] = []
 
     def extend(layer: str, pts, closed: bool):
         g = layer_geom.setdefault(layer, {"minx": 1e300, "miny": 1e300,
@@ -696,6 +1019,11 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
                 add(lengths, layer, _arc_length(e))
             elif t == "HATCH":
                 add(areas, layer, _hatch_area(e))
+            elif t in ("TEXT", "MTEXT"):
+                content = e.dxf.text if t == "TEXT" else e.text
+                if content:
+                    text_entities.append(
+                        ((float(e.dxf.insert.x), float(e.dxf.insert.y)), str(content)))
             elif t == "INSERT":
                 name = e.dxf.name
                 if not name.startswith("*"):   # anonymous/system blocks
@@ -718,21 +1046,58 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
             # must not sink the whole takeoff — skip it, keep going.
             continue
 
+    duct_sizes: list[dict] = []
+    size_labels = _duct_size_labels(text_entities) if hvac else []
     for layer, segments in line_segments.items():
+        # Rule 3 only ever looks at a layer that names itself duct or pipe
+        # work ("M-DUCT-SUPPLY", "M-PIPE-CHW-S") -- caught testing against
+        # the real file: proximity alone wrongly matched A-WALL (the
+        # architectural perimeter, which naturally runs right past the
+        # ductwork's own size labels) to "800x400 SA". A layer's own name
+        # is the one signal this whole module already trusts elsewhere
+        # (block_layers' legend -- see measure()'s own comment on INSERT).
+        expected_kind = ("duct" if "duct" in layer.lower()
+                         else "pipe" if "pipe" in layer.lower() else "")
         if hvac:
-            total, pair_count = _collapse_duct_pairs(segments)
+            total, pair_count, transition_count, bridged_count = _collapse_duct_pairs(segments)
         else:
             # The plain, original sum -- every other trade's drawings keep
             # measuring exactly as they always did; HVAC_DRAWING_RULES.md's
             # rules only ever apply when `hvac` says so.
             total = sum(_dist(a, b) for a, b in segments)
-            pair_count = 0
+            pair_count = transition_count = bridged_count = 0
         add(lengths, layer, total)
         if pair_count:
             read_notes.append(
                 f"{layer}: read {pair_count} pair(s) of lines as one run's "
                 "two edges, not two separate runs (a duct/pipe/tray drawn "
                 "to its real width) — verify before pricing.")
+        if transition_count:
+            read_notes.append(
+                f"{layer}: read {transition_count} tapering transition(s) "
+                "(e.g. a reducer) as one length each, not both converging "
+                "sides — HVAC_DRAWING_RULES.md rule 2, verify before pricing.")
+        if bridged_count:
+            read_notes.append(
+                f"{layer}: bridged {bridged_count} gap(s) between collinear "
+                "same-width duct lines into one continuous run — no branch "
+                "ties in at that point, so read as the trunk continuing "
+                "through, not a break; HVAC_DRAWING_RULES.md rule 2, verify "
+                "before pricing.")
+        if hvac and expected_kind:
+            for entry in _duct_sizes_for_layer(layer, segments, size_labels, expected_kind):
+                duct_sizes.append(_duct_size_area(entry, unit))
+            elbows = _elbow_count(segments)
+            if elbows:
+                read_notes.append(
+                    f"{layer}: {elbows} corner(s) found in the single-line "
+                    "run(s) — read as elbow fittings, not route length; "
+                    "HVAC_DRAWING_RULES.md rule 4.")
+    if hvac and size_labels and not duct_sizes:
+        read_notes.append(
+            "Duct/pipe size text was found on the drawing but none of it "
+            "sat close enough to a measured run to trust — sizes left out "
+            "rather than guessed; HVAC_DRAWING_RULES.md rule 3.")
 
     try:
         site = _site_facts(unit_code, lengths, layer_geom, block_pos, block_scales)
@@ -747,6 +1112,11 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
         "areas_by_layer": dict(sorted(areas.items())),
         "block_counts": dict(sorted(blocks.items())),
         "block_layers": {k: sorted(v) for k, v in sorted(block_layers.items())},
+        # HVAC_DRAWING_RULES.md rule 3: one entry per distinct duct/pipe
+        # size actually found and trusted, empty when hvac=False or no
+        # size text was readable. Additive -- lengths_by_layer is
+        # untouched and stays the single per-layer total it always was.
+        "duct_sizes": duct_sizes,
         # From the entities actually walked, NOT doc.layers.entries — a
         # minimal-mode DWG→DXF conversion can leave the formal layer TABLE
         # nearly empty (confirmed: 2 table entries vs. 64 real layer names
@@ -959,6 +1329,16 @@ def write_quantities_csv(q: dict, path: str) -> None:
             w.writerow(["area", layer, f"{area:.2f}", f"square {q['unit']}"])
         for name, count in q["block_counts"].items():
             w.writerow(["count", name, count, "nos"])
+        # HVAC_DRAWING_RULES.md rule 3: one row per distinct duct/pipe size
+        # actually found and trusted, with its own sheet area when it's a
+        # duct -- the number a GI ductwork rate prices against, not just
+        # the plain route length above.
+        for entry in (q.get("duct_sizes") or []):
+            name = f"{entry['layer']} — {entry['size']}"
+            if entry["kind"] == "duct" and "area_m2" in entry:
+                w.writerow(["duct size", name, f"{entry['area_m2']:.2f}", "sq m"])
+            elif "length_m" in entry:
+                w.writerow(["duct size", name, f"{entry['length_m']:.2f}", "m"])
         # A rule (HVAC_DRAWING_RULES.md rule 1, today) inferred rather than
         # purely measured a number -- stays in the file this re-opens as,
         # not only the live app's own screen, so it survives being emailed
@@ -1002,6 +1382,29 @@ def summary_text(q: dict) -> str:
         lines.append("LENGTHS BY LAYER:")
         lines += [f"  {layer}: {length:.2f} {q['unit']}"
                   for layer, length in q["lengths_by_layer"].items()]
+        lines.append("")
+    if q.get("duct_sizes"):
+        # HVAC_DRAWING_RULES.md rule 3: real sizes read off the drawing's
+        # own TEXT, per duct/pipe run -- use these directly; the length
+        # above is the same run's plain total, this is the size split.
+        # Several branch take-offs on one layer can share one size, each
+        # its own short "chain" -- aggregated here (layer, size, kind) so
+        # the writer sees one line per size, not a dozen near-duplicates.
+        agg: dict[tuple[str, str, str], dict] = {}
+        for entry in q["duct_sizes"]:
+            key = (entry["layer"], entry["size"], entry["kind"])
+            bucket = agg.setdefault(key, {"length_m": 0.0, "area_m2": 0.0})
+            bucket["length_m"] += entry.get("length_m", entry["length"])
+            bucket["area_m2"] += entry.get("area_m2", 0.0)
+        lines.append("DUCT/PIPE SIZES (read from the drawing's own size "
+                     "text — use these real sizes directly in the BOQ, do "
+                     "not mark them 'TBC — to HVAC schedule'):")
+        for (layer, size, kind), bucket in agg.items():
+            if kind == "duct" and bucket["area_m2"]:
+                lines.append(f"  {layer} {size}: {bucket['length_m']:.2f} m "
+                             f"run, {bucket['area_m2']:.2f} m² sheet area")
+            else:
+                lines.append(f"  {layer} {size}: {bucket['length_m']:.2f} m")
         lines.append("")
     if q["areas_by_layer"]:
         lines.append("AREAS BY LAYER:")
@@ -1190,7 +1593,7 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
                       has_template: bool = False, legend: str = "",
                       scoped: bool = False, brief_text: str = "",
                       allow_derived: bool = True, has_cad: bool = True,
-                      standards_text: str = "") -> str:
+                      standards_text: str = "", hvac: bool = False) -> str:
     """`allow_derived` is the difference between a takeoff and an estimate.
 
     A survey/civil drawing legitimately contains no CCTV, cabling or fibre
@@ -1268,9 +1671,7 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "you have not been given.\n"
         "  (d) Work like the estimator who wrote the best of these: open "
         "with a short reference table of the measured figures you used "
-        "(feature, layer or block, value, unit); when two layers look like "
-        "the same feature (a duplicate or misspelt name), decide — count it "
-        "once or keep both — and say why; size storage, power and "
+        "(feature, layer or block, value, unit); size storage, power and "
         "switching from the device counts with the arithmetic shown; where "
         "the drawing already has poles, walls or structures, use them as "
         "mounting or routing points before adding new ones; and keep every "
@@ -1278,6 +1679,48 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "plausible for the site's actual size and stated on the line.\n"
         "Do not skip this and jump to formatting."
     ) if has_cad else ""
+    # HVAC_DRAWING_RULES.md's write-up half -- kept in its own block, out of
+    # the generic cad_note above, and appended ONLY when hvac=True. The BOQ
+    # add-on writes for many trades (ELV, CCTV, cabling, plumbing, fire
+    # hydrants...) from the same formatting_prompt(); a rule learned from
+    # one real HVAC file must never quietly start shaping an ELV or
+    # plumbing BOQ too, the same standing rule the measurement side
+    # (core.boq.measure(..., hvac=...)) already follows. Store anything
+    # else learned for the HVAC sector's write-up here, in this same
+    # block, not mixed into the clauses above.
+    hvac_note = (
+        "\n\nHVAC-SPECIFIC WRITE-UP RULES (this BOQ was asked for as HVAC):\n"
+        "  (e) TWO SIMILARLY-NAMED LAYERS ARE NOT AUTOMATICALLY A DUPLICATE "
+        "— caught on a real file: a layer pair named like an old/new naming "
+        "convention (e.g. a legacy prefix vs a current one) was assumed to "
+        "be the same system measured twice, and the 'legacy' half was "
+        "dropped from the BOQ entirely — it was a real, separate half of "
+        "the building with its own equipment and different sizes, not a "
+        "duplicate at all. So: compare the actual figures, not just the "
+        "names. Two layers whose lengths or counts are IDENTICAL or within "
+        "a percent or two of each other are very likely the same geometry "
+        "traced twice — pick the one to keep, state which and why, and say "
+        "so under that line. Two layers whose figures DIFFER by more than "
+        "a small margin are more likely two real, separate things (two "
+        "zones, two halves, two systems) — in that case NEVER drop either "
+        "one. Price both, under their own line items, and flag it for the "
+        "designer to confirm which naming convention is current or whether "
+        "they are genuinely separate. When you are not sure which case "
+        "this is, keep both — the failure mode that actually happened was "
+        "dropping real, paid-for ductwork because it looked like a "
+        "duplicate; there is no equivalent failure mode from keeping an "
+        "actual duplicate priced twice, because you still say so on the "
+        "line and the reader can net it out. Silence that drops a measured "
+        "quantity is the one mistake not to make.\n"
+        "  (f) Block counts can include a drawing's own LEGEND/KEY — a "
+        "single reference instance of a symbol, drawn once for reference, "
+        "not an installed item. Prism's measurement cannot tell a legend "
+        "instance apart from a real one, so if the count for any terminal, "
+        "damper, valve or fitting type looks like it could include one, say "
+        "so plainly next to that figure and tell the reader to cross-check "
+        "it against a terminal/equipment schedule if the drawing has one — "
+        "never silently subtract or silently trust the raw count either."
+    ) if (has_cad and hvac) else ""
     if not has_cad:
         # Spec mode: no drawing exists at all. Everything is derived from the
         # stated requirement, so the rules are about being explicit and
@@ -1369,7 +1812,7 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
     )
     instructions = (
         f"Your task is: produce a professional Bill of Quantities (BOQ) "
-        f"document.{context}{ground_truth}{cad_note}"
+        f"document.{context}{ground_truth}{cad_note}{hvac_note}"
         f"{step2}{derive_rule}{scope_rule} {structure}{plausibility_rule} "
         "Leave Rate/Amount columns blank for the quantity surveyor to fill "
         "in. Present it as clean tables. Note prominently at the top that "

@@ -135,9 +135,11 @@ def verify_key(api_key: str, model: str = "") -> str:
     if not api_key.startswith("sk-or-"):
         return ("An OpenRouter key starts with 'sk-or-' — this doesn't "
                 "look like one.")
+    # /models is public: it answers 200 to any key, even a made-up one, so it
+    # proves nothing about the key. /key is the one that checks it (401 if bad).
     try:
         resp = requests.get(
-            "https://openrouter.ai/api/v1/models",
+            "https://openrouter.ai/api/v1/key",
             headers={"Authorization": f"Bearer {api_key}"}, timeout=20)
     except Exception as e:                                  # noqa: BLE001
         return (f"Couldn't reach OpenRouter to check the key ({e}).\nIf "
@@ -154,7 +156,8 @@ def verify_key(api_key: str, model: str = "") -> str:
                 "may not be usable.")
     if model:
         try:
-            ids = {m.get("id") for m in resp.json().get("data", [])}
+            listing = requests.get("https://openrouter.ai/api/v1/models", timeout=20)
+            ids = {m.get("id") for m in listing.json().get("data", [])}
             if ids and model not in ids:
                 return (f"The key works, but '{model}' isn't on OpenRouter's "
                         "current model list.")

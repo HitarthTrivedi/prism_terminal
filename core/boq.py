@@ -20,24 +20,36 @@ walks LINE/LWPOLYLINE/POLYLINE geometry, and add to it, in its own shape,
 the next time a real client file finds another one.
 
 .dwg is a proprietary binary format ezdxf cannot read directly. It must be
-converted to .dxf (an open, documented format) FIRST, on the user's own
-machine, with one of:
+converted to .dxf (an open, documented format) FIRST, with one of:
 
-  • GNU LibreDWG (free, scriptable, recommended):
-        macOS   →  brew install libredwg          (gives the `dwg2dxf` CLI)
-        Linux   →  build LibreDWG from source (many current Debian/Ubuntu
-                    repositories do not package the `dwg2dxf` utility)
+  • Prism's own bundled `dwg2dxf` (GNU LibreDWG) — on an Apple Silicon Mac or
+    64-bit Windows, nothing to install: _ensure_bundled_dwg2dxf() copies it
+    into ~/.prism/tools/dwg2dxf/ the first time a .dwg is opened, and
+    find_dwg_converter() finds it there on every run after. See
+    core/vendor/dwg2dxf/README.md for exactly what's bundled, where it came
+    from, and a real failure mode found while verifying it (read that before
+    touching the validation in dwg_to_dxf() below — it is load-bearing).
     Coverage of newer/exotic DWG features is not perfect — good enough for
     ordinary 2D architectural drawings, which is the common case here.
 
-  • ODA File Converter (free, more complete, GUI-first but scriptable):
+  • GNU LibreDWG, installed by hand, on platforms Prism has no bundled copy
+    for (an Intel Mac, Linux, 32-bit Windows):
+        macOS   →  brew install libredwg          (gives the `dwg2dxf` CLI)
+        Linux   →  build LibreDWG from source (many current Debian/Ubuntu
+                    repositories do not package the `dwg2dxf` utility)
+
+  • ODA File Converter (free, more complete, GUI-first but scriptable),
+    always honoured first if it's already installed — more reliable than
+    dwg2dxf (full DWG spec, not a reverse-engineered reader) and worth
+    recommending to a customer who hits real conversion problems:
         https://www.opendesign.com/guestfiles/oda_file_converter
     On Windows it installs under %ProgramFiles%\\ODA\\ODAFileConverter*\\ and
     does NOT add itself to PATH — find_dwg_converter() globs that location, so
     no PATH surgery is needed there. On Linux, put `ODAFileConverter` on PATH.
 
-ensure_dxf() detects whichever is installed; if neither is, it raises a clear
-error naming both options rather than failing obscurely.
+ensure_dxf() detects whichever is available (bundled dwg2dxf counts); if
+none is, it raises a clear error naming the install options rather than
+failing obscurely.
 
 KNOWN LIMITATIONS (disclosed, not hidden):
   • Curved polyline segments (bulges) are measured exactly for LWPOLYLINE;
@@ -64,8 +76,6 @@ import tempfile
 
 from . import skills as _SK
 
-_CONVERTER_CANDIDATES = ["dwg2dxf", "ODAFileConverter", "ODAFileConverter.exe"]
-
 # An explicit path, for anyone who has a reason — same escape hatch
 # core/ffmpeg.py offers as PRISM_FFMPEG.
 ENV_CONVERTER = "PRISM_DWG_CONVERTER"
@@ -83,6 +93,64 @@ class BoqError(Exception):
 
 
 # ── DWG → DXF ──────────────────────────────────────────────────────────────
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _dwg2dxf_platform_tag() -> str | None:
+    """Vendor subfolder name (under core/vendor/dwg2dxf/) for this machine,
+    or None if Prism carries no bundled dwg2dxf for it — those machines fall
+    through to PATH / a manual install exactly as before this existed. See
+    core/vendor/dwg2dxf/README.md for what's bundled and why only these two."""
+    system = platform.system()
+    machine = platform.machine().lower()
+    if system == "Darwin" and machine in ("arm64", "aarch64"):
+        return "macos-arm64"
+    if system == "Windows" and machine in ("amd64", "x86_64"):
+        return "win64"
+    return None
+
+
+def _ensure_bundled_dwg2dxf() -> None:
+    """Install Prism's own bundled dwg2dxf into ~/.prism/tools/dwg2dxf/<tag>/
+    the first time it's needed, so find_dwg_converter()'s existing tools-dir
+    scan (below) picks it up with no other change to this file. A cheap
+    no-op once it's there. Never raises — a failed install just means the
+    tools-dir glob finds nothing new and the search falls through to PATH /
+    an installed converter / "please install one", same as before this
+    function existed."""
+    tag = _dwg2dxf_platform_tag()
+    if not tag:
+        return
+    exe_name = "dwg2dxf.exe" if tag.startswith("win") else "dwg2dxf"
+    src_dir = os.path.join(_HERE, "vendor", "dwg2dxf", tag)
+    src_exe = os.path.join(src_dir, exe_name)
+    if not os.path.isfile(src_exe):
+        return  # this checkout/build doesn't carry a vendor copy
+
+    try:
+        from . import ffmpeg as _ffmpeg
+        dst_dir = os.path.join(_ffmpeg.tools_dir(), "dwg2dxf", tag)
+    except Exception:
+        return
+    dst_exe = os.path.join(dst_dir, exe_name)
+
+    # Already installed, same size as the one we ship: nothing to do. Not a
+    # hash check — this runs on every find_dwg_converter() call, and a
+    # cross-platform stat is cheap where re-hashing a bundled DLL set is not.
+    if (os.path.isfile(dst_exe)
+            and os.path.getsize(dst_exe) == os.path.getsize(src_exe)):
+        return
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+        for name in os.listdir(src_dir):
+            if name == "README.md":
+                continue
+            shutil.copy2(os.path.join(src_dir, name), os.path.join(dst_dir, name))
+        os.chmod(dst_exe, 0o755)  # PyInstaller's own datas don't promise the +x bit survives
+    except OSError:
+        pass  # read-only tools dir, disk full, permissions — not fatal, see docstring
+
 
 def _installed_converter_paths() -> list[str]:
     """Where a DWG converter actually lands when somebody installs one.
@@ -175,9 +243,20 @@ def _oda_version_key(exe_path: str) -> tuple[int, int, int]:
 def find_dwg_converter() -> str | None:
     """The DWG→DXF converter this machine should use, or None.
 
-    Four places, in the order core/ffmpeg.py already established for FFmpeg:
-    an explicit override, Prism's own tools directory, PATH, and then the
-    places an installer actually puts these — see _installed_converter_paths.
+    ODA File Converter is preferred over dwg2dxf at every stage below — it
+    reads the full DWG spec; dwg2dxf is a reverse-engineered reader that can
+    fail on newer/exotic DWG features (see core/vendor/dwg2dxf/README.md for
+    a real example). So each stage checks ODA's names before dwg2dxf's name,
+    and Prism's own bundled dwg2dxf — installed on first use, see
+    _ensure_bundled_dwg2dxf — is tried dead last, only once every other
+    possibility (an explicit override, anything already on this machine) has
+    come up empty. A customer who installed ODA themselves always gets it;
+    Prism's bundled copy exists for the machines that have nothing at all.
+
+    The places, in the order core/ffmpeg.py already established for FFmpeg:
+    an explicit override, Prism's own tools directory, PATH, the places an
+    installer actually puts these (_installed_converter_paths), and finally
+    Prism's own bundled copy.
 
     Prism's own tools folder is searched BEFORE PATH on purpose: a binary
     somebody placed there deliberately should beat whatever PATH happens to
@@ -189,8 +268,11 @@ def find_dwg_converter() -> str | None:
         return override
 
     # ~/.prism/tools/** — the same directory FFmpeg is fetched into, so a
-    # converter dropped there is found with no PATH change, on any OS. Reached
-    # before PATH, and cheap: a small tree, walked once.
+    # converter dropped there (by a user, or by _ensure_bundled_dwg2dxf
+    # below on an earlier call) is found with no PATH change, on any OS.
+    # Reached before PATH, and cheap: a small tree, walked once. ODA's own
+    # names come first in the glob so a user-dropped ODA always beats a
+    # user-dropped (or Prism-installed) dwg2dxf sitting in the same folder.
     try:
         from . import ffmpeg as _ffmpeg
         tools = _ffmpeg.tools_dir()
@@ -198,27 +280,41 @@ def find_dwg_converter() -> str | None:
         tools = ""
     if tools and os.path.isdir(tools):
         import glob
-        for name in ("dwg2dxf.exe", "dwg2dxf",
-                     "ODAFileConverter.exe", "ODAFileConverter"):
+        for name in ("ODAFileConverter.exe", "ODAFileConverter",
+                     "dwg2dxf.exe", "dwg2dxf"):
             for hit in sorted(glob.glob(os.path.join(tools, "**", name),
                                         recursive=True)):
                 if os.path.isfile(hit):
                     return hit
 
-    # Anything actually on PATH — `dwg2dxf` on macOS/Linux, or an
-    # ODAFileConverter a user deliberately PATH-added. shutil.which() honours
-    # PATHEXT on Windows, so the bare name already covers the .exe.
-    for name in _CONVERTER_CANDIDATES:
+    # Anything actually on PATH — an ODAFileConverter a user deliberately
+    # PATH-added, or `dwg2dxf` on macOS/Linux. shutil.which() honours
+    # PATHEXT on Windows, so the bare name already covers the .exe. ODA's
+    # names checked first, same reasoning as the glob above.
+    for name in ("ODAFileConverter", "ODAFileConverter.exe", "dwg2dxf"):
         found = shutil.which(name)
         if found:
             return found
 
-    # Last: where an installer actually puts these. ODA's Windows installer
-    # adds nothing to PATH, and Homebrew's bin is absent from the environment
-    # a Finder-launched .app inherits — both are "installed, and invisible".
+    # Where an installer actually puts these. ODA's Windows installer adds
+    # nothing to PATH, and Homebrew's bin is absent from the environment a
+    # Finder-launched .app inherits — both are "installed, and invisible".
     for path in _installed_converter_paths():
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
+
+    # Last resort: Prism's own bundled dwg2dxf (Apple Silicon Mac / 64-bit
+    # Windows only — see _dwg2dxf_platform_tag). Installed here, not at the
+    # top of this function, specifically so it never pre-empts a real ODA
+    # install found above.
+    _ensure_bundled_dwg2dxf()
+    if tools and os.path.isdir(tools):
+        import glob
+        for name in ("dwg2dxf.exe", "dwg2dxf"):
+            for hit in sorted(glob.glob(os.path.join(tools, "dwg2dxf", "**", name),
+                                        recursive=True)):
+                if os.path.isfile(hit):
+                    return hit
     return None
 
 def _read_dxf(path: str):
@@ -1444,17 +1540,81 @@ def summary_text(q: dict) -> str:
 _TEMPLATE_EXTS = (".docx", ".doc", ".xlsx", ".xls", ".csv", ".ods", ".pdf")
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
 
+# A PDF with at least this much extractable text MIGHT be a real document
+# (a sample BOQ, a spec) rather than a scanned/vector drawing with no text
+# layer -- "might", because raw text alone isn't enough, see
+# _looks_like_boq_document below. Not zero: a scan can carry a stray OCR
+# layer or a title-block watermark and still have nothing a sample-BOQ read
+# would use.
+# Found live, 2 Nov 2026: a hand-sketched SS locker fabrication drawing
+# (970x450x2000mm, qty 40, dimensions all clearly labelled -- nothing to
+# guess) was filed here as a "sample BOQ" purely because it was a .pdf, with
+# zero extractable text and a title that said "drawing" -- the writer stage
+# correctly refused to invent a BOQ from a document it couldn't read, and
+# "Make with drawing" (addons/boq/dialog.py's own explicit, consent-gated
+# path for exactly this case) never turned on, because cad_path was never
+# set for anything but .dwg/.dxf.
+_PDF_TEXT_MIN_CHARS = 40
+
+# Found live the very next day, 3 Nov 2026, on a DIFFERENT real client file:
+# a real, proper CAD-exported (not scanned) 10-page PDF of pharma trolleys
+# and storage racks -- real vector text, 2,842 characters total, comfortably
+# over _PDF_TEXT_MIN_CHARS above, so the fix above filed it as a "sample
+# BOQ" too, for the opposite reason: not too little text, just the WRONG
+# KIND -- dimension numbers and one-line material/capacity callouts
+# ("900\n1850…", "Material - SS", "Weight Capacity - 30 Kg", "16 SWG Top"),
+# none of it reading anything like a BOQ document. "Has text" was never the
+# real question; "reads like a BOQ" is. A real BOQ -- any trade, any firm's
+# own template, confirmed against every sample BOQ excerpt read in this
+# codebase's own session history -- names its own column set and section
+# shape somewhere in its text; a drawing's extracted text, scanned or real
+# vector, does not, no matter how many characters it has. Two distinct hits
+# required, not one: a drawing's own title block can genuinely say "section"
+# or "qty" once in passing without being a BOQ.
+_BOQ_DOCUMENT_SIGNALS = (
+    "bill of quantities", "bill of quantity", "description", "quantity",
+    "qty", "rate", "amount", "preamble", "sr.no", "sr no", "sr. no",
+    "item no", "unit rate", "provisional sum", "to confirm",
+)
+
+
+def _looks_like_boq_document(text: str) -> bool:
+    """True if `text` (already lowercased by the caller) reads like an
+    actual BOQ/estimate document -- at least two distinct signal terms,
+    not merely some text existing at all. See _BOQ_DOCUMENT_SIGNALS."""
+    return sum(1 for s in _BOQ_DOCUMENT_SIGNALS if s in text) >= 2
+
 
 def classify_inputs(attachments: list[dict]):
     """Sort what the user attached by the ROLE it plays in a BOQ run:
     (cad, templates, images, notes). A screenshot of the drawing's legend
     sheet is not a template and must not be described to the AI as one —
-    they carry completely different instructions."""
+    they carry completely different instructions.
+
+    A .pdf is ambiguous by extension alone -- a sample BOQ and a scanned/
+    exported drawing are both routinely delivered as PDF, and a real
+    (non-scanned) drawing export can carry plenty of extracted text that
+    still is not a BOQ document (dimension labels, material callouts) --
+    see _looks_like_boq_document. Disambiguated by content, using the text
+    CB.files.attach() already extracted (no extra I/O here): read as a BOQ
+    document, it's a template; anything else -- too little text, or real
+    text that doesn't read as one -- is treated as a drawing with no vector
+    geometry to measure (cad), same bucket .dwg/.dxf go in, so "Make with
+    drawing" sees it and the automatic .dwg/.dxf measurement step is what
+    skips it (see addons/boq/dialog.py's _absorb(), which only measures a
+    .dwg/.dxf cad_path -- there is no deterministic measurement for a PDF,
+    only the AI actually looking at it, by explicit choice)."""
     cad, templates, images, notes = [], [], [], []
     for a in attachments:
         ext = os.path.splitext(a.get("path", ""))[1].lower()
         if ext in (".dwg", ".dxf"):
             cad.append(a)
+        elif ext == ".pdf":
+            text = (a.get("text") or "").strip()
+            if len(text) >= _PDF_TEXT_MIN_CHARS and _looks_like_boq_document(text.lower()):
+                templates.append(a)
+            else:
+                cad.append(a)
         elif ext in _IMAGE_EXTS:
             images.append(a)
         elif ext in _TEMPLATE_EXTS:
@@ -1593,8 +1753,22 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
                       has_template: bool = False, legend: str = "",
                       scoped: bool = False, brief_text: str = "",
                       allow_derived: bool = True, has_cad: bool = True,
-                      standards_text: str = "", hvac: bool = False) -> str:
+                      standards_text: str = "", industry_note: str = "",
+                      derivation_example: str = "") -> str:
     """`allow_derived` is the difference between a takeoff and an estimate.
+
+    `industry_note` and `derivation_example` keep this function itself
+    industry-agnostic (found live, 31 Oct 2026: the owner's own standing
+    rule is that a trade-specific write-up rule must live apart and fire
+    only when that trade is named -- the HVAC rules this function used to
+    carry inline, gated on a bare `hvac: bool`, were already breaking that
+    rule, just one `if` away from leaking into every other trade's own
+    BOQ). The CALLER supplies both, already resolved for whatever industry
+    it is writing for (addons/boq/industries.py owns that text on the app
+    side -- this engine-side function never hardcodes a single industry's
+    wording). Empty strings reproduce this function's old ELV/general
+    default behaviour exactly, so every existing caller that passes
+    neither keeps working unchanged.
 
     A survey/civil drawing legitimately contains no CCTV, cabling or fibre
     geometry — nobody has designed those yet. Forbidding un-measured line
@@ -1679,48 +1853,14 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "plausible for the site's actual size and stated on the line.\n"
         "Do not skip this and jump to formatting."
     ) if has_cad else ""
-    # HVAC_DRAWING_RULES.md's write-up half -- kept in its own block, out of
-    # the generic cad_note above, and appended ONLY when hvac=True. The BOQ
-    # add-on writes for many trades (ELV, CCTV, cabling, plumbing, fire
-    # hydrants...) from the same formatting_prompt(); a rule learned from
-    # one real HVAC file must never quietly start shaping an ELV or
-    # plumbing BOQ too, the same standing rule the measurement side
-    # (core.boq.measure(..., hvac=...)) already follows. Store anything
-    # else learned for the HVAC sector's write-up here, in this same
-    # block, not mixed into the clauses above.
-    hvac_note = (
-        "\n\nHVAC-SPECIFIC WRITE-UP RULES (this BOQ was asked for as HVAC):\n"
-        "  (e) TWO SIMILARLY-NAMED LAYERS ARE NOT AUTOMATICALLY A DUPLICATE "
-        "— caught on a real file: a layer pair named like an old/new naming "
-        "convention (e.g. a legacy prefix vs a current one) was assumed to "
-        "be the same system measured twice, and the 'legacy' half was "
-        "dropped from the BOQ entirely — it was a real, separate half of "
-        "the building with its own equipment and different sizes, not a "
-        "duplicate at all. So: compare the actual figures, not just the "
-        "names. Two layers whose lengths or counts are IDENTICAL or within "
-        "a percent or two of each other are very likely the same geometry "
-        "traced twice — pick the one to keep, state which and why, and say "
-        "so under that line. Two layers whose figures DIFFER by more than "
-        "a small margin are more likely two real, separate things (two "
-        "zones, two halves, two systems) — in that case NEVER drop either "
-        "one. Price both, under their own line items, and flag it for the "
-        "designer to confirm which naming convention is current or whether "
-        "they are genuinely separate. When you are not sure which case "
-        "this is, keep both — the failure mode that actually happened was "
-        "dropping real, paid-for ductwork because it looked like a "
-        "duplicate; there is no equivalent failure mode from keeping an "
-        "actual duplicate priced twice, because you still say so on the "
-        "line and the reader can net it out. Silence that drops a measured "
-        "quantity is the one mistake not to make.\n"
-        "  (f) Block counts can include a drawing's own LEGEND/KEY — a "
-        "single reference instance of a symbol, drawn once for reference, "
-        "not an installed item. Prism's measurement cannot tell a legend "
-        "instance apart from a real one, so if the count for any terminal, "
-        "damper, valve or fitting type looks like it could include one, say "
-        "so plainly next to that figure and tell the reader to cross-check "
-        "it against a terminal/equipment schedule if the drawing has one — "
-        "never silently subtract or silently trust the raw count either."
-    ) if (has_cad and hvac) else ""
+    # The caller's own per-industry write-up note -- see this function's
+    # docstring. Used to be a block of HVAC text hardcoded right here,
+    # gated on a bare `hvac: bool`; that text now lives on the app side
+    # (addons/boq/industries.py), the one place per-industry BOQ rules are
+    # supposed to live. Gating is unchanged: a trade-specific note only
+    # makes sense once there is real measured geometry (has_cad) to apply
+    # it to.
+    industry_note = industry_note if has_cad else ""
     if not has_cad:
         # Spec mode: no drawing exists at all. Everything is derived from the
         # stated requirement, so the rules are about being explicit and
@@ -1747,26 +1887,33 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
             "the reader should be able to tell them apart at a glance."
         )
     elif allow_derived:
+        # Found live, 31 Oct 2026: this whole paragraph used to be written
+        # in ELV's own vocabulary (camera spacing, boundary and road
+        # lengths, gate counts) -- every other trade's own BOQ run,
+        # HVAC included, received that same ELV framing and worked
+        # example whether or not any of it applied. The arithmetic
+        # example is now the caller's own `derivation_example` (empty
+        # falls back to the original ELV one, unchanged for a trade with
+        # no override yet); the framing sentence itself is now
+        # trade-agnostic rather than naming ELV's own items by name.
+        example = derivation_example or "'boundary 1091 m ÷ 40 m camera spacing = 28 nos'"
         derive_rule = (
-            " IMPORTANT — how to handle a trade the drawing does not contain: "
-            "a survey or civil drawing legitimately has NO camera, cable, "
-            "conduit or fibre geometry, because that system has not been "
-            "designed yet. Do NOT refuse the job on that basis, and do NOT "
-            "silently pretend those items were measured. Instead DERIVE them "
-            "as a competent ELV/services estimator would: work the quantities "
-            "out from the site's real measured geometry (boundary and road "
-            "lengths, gate and building counts, existing pole positions) "
-            "combined with explicit, stated design assumptions (camera "
-            "spacing, cable-run and slack allowances, termination points). "
-            "Rules for derived items: (a) open the document with a prominent "
-            "warning box stating this is a PROVISIONAL DESIGN-STAGE ESTIMATE "
-            "derived from civil geometry, not a measured take-off, and that "
-            "it must be validated by a site survey and detailed design before "
-            "tendering; (b) under each section heading, state the design "
-            "basis in one or two lines — the actual arithmetic, e.g. 'boundary "
-            "1091 m ÷ 40 m camera spacing = 28 nos'; (c) never present a "
-            "derived quantity as a measured one. Measured civil items, where "
-            "the user asked for them, stay exactly as measured."
+            " IMPORTANT — how to handle an item the drawing's own measured "
+            "geometry does not cover: a system, accessory or whole trade "
+            "the design hasn't detailed yet, or that this drawing doesn't "
+            "show at all. Do NOT refuse the job on that basis, and do NOT "
+            "silently pretend those items were measured. Instead DERIVE "
+            "them as a competent estimator for this trade would: work the "
+            "quantities out from the site's own real measured geometry, "
+            "combined with explicit, stated design assumptions. Rules for "
+            "derived items: (a) open the document with a prominent warning "
+            "box stating this is a PROVISIONAL DESIGN-STAGE ESTIMATE, not a "
+            "measured take-off, and that it must be validated by a site "
+            "survey and detailed design before tendering; (b) under each "
+            f"section heading, state the design basis in one or two lines "
+            f"— the actual arithmetic, e.g. {example}; (c) never present a "
+            "derived quantity as a measured one. Measured items, where the "
+            "user asked for them, stay exactly as measured."
         )
     else:
         derive_rule = (
@@ -1786,6 +1933,27 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         f"\n\nLAYER/BLOCK LEGEND (what these codes mean — use it to write real "
         f"descriptions instead of repeating the raw code):\n{legend}"
     ) if legend.strip() else ""
+    # item 50 (4 Nov 2026) — see addons/boq/dialog.py's own copy of this
+    # comment for the real-job comparison that found it: "add 100mm in
+    # length and breadth for scrap" was read by the writer as a sheet-panel
+    # instruction only ("length and breadth" of a panel) — every tube/rod/
+    # flat-bar CUT LENGTH kept its bare spec figure, with the writer's own
+    # notes saying tubes got no allowance at all. A second, independent run
+    # of the identical PDF and instruction applied the allowance to every
+    # cut piece, tube and rod included — a difference in how one ambiguous
+    # instruction was read, not a measurement error either run made. Scoped
+    # to project_context (the person's own words), the same text this
+    # function already embeds as `context` above, never applied unasked.
+    scrap_block = (
+        "\n\nSCRAP/WASTAGE ALLOWANCE. The project context above asks for a "
+        "cutting allowance. Apply it to EVERY raw-material cut piece, not "
+        "sheet panels alone: the cut length of every tube, pipe, flat bar "
+        "and rod section, AND the length and width of every sheet/plate "
+        "panel. Show both the net (as-designed) and gross (with the "
+        "allowance added) figure on each line, and state the allowance "
+        "used once, plainly, near the top."
+    ) if re.search(r"\bscrap\b|\bwastage\b|\bwaste\b",
+                   project_context or "", re.I) else ""
     ground_truth = (
         " The quantities listed at the end were measured directly from the "
         "CAD drawing's geometry — treat them as ground truth and do not "
@@ -1812,7 +1980,7 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
     )
     instructions = (
         f"Your task is: produce a professional Bill of Quantities (BOQ) "
-        f"document.{context}{ground_truth}{cad_note}{hvac_note}"
+        f"document.{context}{ground_truth}{cad_note}{industry_note}"
         f"{step2}{derive_rule}{scope_rule} {structure}{plausibility_rule} "
         "Leave Rate/Amount columns blank for the quantity surveyor to fill "
         "in. Present it as clean tables. Note prominently at the top that "
@@ -1826,4 +1994,4 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
     # House doctrine for a BOQ, when a skill claims this job — see
     # core/skills.py. Empty when none does, so the prompt is unchanged.
     return (instructions + standards_block + brief_block + legend_block
-            + _SK.addendum("boq.format") + tail)
+            + scrap_block + _SK.addendum("boq.format") + tail)

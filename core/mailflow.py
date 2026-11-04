@@ -150,8 +150,8 @@ Use exactly these keys:
   "customer": "the company name, if stated",
   "contact": "the person's name, if stated",
   "phone": "phone number, if stated",
-  "product": "what they want, in under 15 words, using their own words",
-  "quantity": "the quantity with its unit, e.g. 5000 nos — empty if not stated",
+  "product": "what they want, using their own words. If they listed ONE thing, one short line (under 15 words) is enough. If they listed MULTIPLE distinct items — a table, a numbered list, several lines each with its own quantity — put EVERY item on its own line, exactly as 'description: quantity', one line per item, in the order they wrote them. Never compress a list of several items into one summarising sentence.",
+  "quantity": "the quantity with its unit, e.g. 5000 nos — empty if not stated, or if 'product' above already carries a separate quantity per line",
   "notes": "anything a salesperson would need to know, in one short line"
 }
 
@@ -160,6 +160,9 @@ Rules:
   quantity or a phone number.
 - Do not summarise the whole email — just fill the fields.
 - Copy specifications exactly as written, including numbers and units.
+- A list of items is not a summary: keep every one of them, in full, even
+  if that makes "product" long. Losing an item here means it is never
+  quoted at all.
 
 EMAIL:
 """

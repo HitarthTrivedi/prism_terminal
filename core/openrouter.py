@@ -54,7 +54,8 @@ def _content_blocks(prompt: str, attachments: list[dict] | None) -> str | list[d
 def openrouter_chat(api_key: str, model: str, prompt: str, *,
                      attachments: list[dict] | None = None,
                      temperature: float = 0.3, timeout: int = 180,
-                     retries: int = 1) -> str:
+                     retries: int = 1, max_tokens: int | None = None,
+                     extra: dict | None = None) -> str:
     """One OpenRouter completion. `model` is an OpenRouter model id, e.g.
     "anthropic/claude-sonnet-5.5" — addons/boq/agents.py owns the mapping
     from a Prism Agent's display name to the model id actually sent here.
@@ -64,7 +65,20 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
     raw DXF/DWG bytes, and only ever sent after the SAME consent gate
     (addons/boq/dialog.py's _drawing_consent()) a browser agent's own
     drawing upload already goes through; nothing here decides whether a
-    drawing may be sent at all."""
+    drawing may be sent at all.
+
+    `max_tokens`: left unset keeps every existing caller's behaviour
+    (no cap) — found live testing a vision model on a drawing tile
+    (hvac_takeoff's own AI tag-reading, item 2): with no cap at all, a
+    model can loop repeating the same lines for minutes before stopping
+    itself, which a short reading task never needs. `extra`: merged
+    straight into the request body (e.g. {"reasoning": {"enabled":
+    False}}) — found on the SAME call: a "thinking" model spent its
+    whole token budget on its own chain-of-thought and returned an
+    empty final answer (finish_reason "length") until reasoning was
+    turned off. Neither parameter is read by any caller before this
+    one asked for it, so every existing call keeps behaving exactly as
+    it always has."""
     if not api_key:
         raise RuntimeError(
             "No OpenRouter key set. Add one in Settings → AI tools.")
@@ -78,14 +92,20 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
         "X-Title": "Prism",
     }
     content = _content_blocks(prompt, attachments)
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    if extra:
+        payload.update(extra)
     last = ""
     for attempt in range(retries + 1):
         try:
-            resp = requests.post(OPENROUTER_URL, headers=headers, json={
-                "model": model,
-                "messages": [{"role": "user", "content": content}],
-                "temperature": temperature,
-            }, timeout=timeout)
+            resp = requests.post(OPENROUTER_URL, headers=headers, json=payload,
+                                 timeout=timeout)
         except requests.RequestException as e:
             raise RuntimeError(
                 f"Couldn't reach OpenRouter — check your internet connection. "
@@ -97,7 +117,12 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
             body = {}
 
         if resp.status_code == 200 and body.get("choices"):
-            return body["choices"][0]["message"]["content"]
+            msg = body["choices"][0]["message"]
+            # A "thinking" model can spend its whole token budget on its
+            # own reasoning and return a null `content` (finish_reason
+            # "length") -- fall back to the reasoning text itself rather
+            # than hand every caller a None where they expect a string.
+            return msg.get("content") or msg.get("reasoning") or ""
 
         if resp.status_code in _RETRY_STATUS and attempt < retries:
             delay = 5

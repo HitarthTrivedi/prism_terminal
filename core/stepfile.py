@@ -275,25 +275,142 @@ def load_parts(path: str) -> list[tuple[str, object]]:
 
 # ── measuring ────────────────────────────────────────────────────────────────
 
+def _is_bore(f, ad, cyl, umin: float, umax: float, vmin: float, vmax: float) -> bool:
+    """True when a CYLINDER face is a real hole -- concave, material on the
+    outside and open space on the inside -- rather than a boss, a pin, or a
+    rounded OUTER corner or edge.
+
+    An angular-span test (a hole sweeps 360 degrees, a corner fillet only
+    sweeps a partial arc) was tried first and is WRONG: a slot's two
+    rounded ends are legitimately partial arcs too (180 or even 90 degrees)
+    and are meant to count as holes (see _holes_of's own "a slot's two
+    rounded ends" note) -- that test broke a real, already-pinned drawing
+    test the moment it was tried against Assem1.STEP's own vent slots.
+
+    The reliable test is concave vs convex: sample one real point ON the
+    face (never the face's own area centroid -- that collapses onto the
+    axis for any face sweeping a full circle, which is every plain round
+    hole, making "which way is outward" undefined for the single most
+    common case) and compare its outward surface normal against the
+    direction away from the axis at that same point. A hole's outward
+    normal points back toward the axis (dot < 0, confirmed on real holes
+    in both step_file_demo/PET_CORE_TEST_B.STEP and Assem1.STEP, full
+    circles and slot-end arcs alike); a rounded OUTER corner points away
+    from it (dot > 0, confirmed on PET_CORE_TEST_B.STEP's own 4 corner
+    fillets, R6 "4 PL." -- without this test they read as a phantom
+    "Ø12 x4" hole that is not on the customer's own hole schedule at all)."""
+    u = 0.5 * (umin + umax)
+    v = 0.5 * (vmin + vmax)
+    pnt = ad.Value(u, v)
+    sample = _np.array([pnt.X(), pnt.Y(), pnt.Z()])
+    axis_p, axis_d = cyl.Axis().Location(), cyl.Axis().Direction()
+    axis_pt = _np.array([axis_p.X(), axis_p.Y(), axis_p.Z()])
+    axis_dir = _np.array([axis_d.X(), axis_d.Y(), axis_d.Z()])
+    radial = sample - axis_pt
+    radial = radial - _np.dot(radial, axis_dir) * axis_dir
+    rlen = _np.linalg.norm(radial)
+    if rlen < 1e-6:
+        return True                      # degenerate sample point -- a hole
+    normal = f.normalAt(_cq.Vector(pnt.X(), pnt.Y(), pnt.Z()))
+    return float(_np.dot(_np.array([normal.x, normal.y, normal.z]),
+                         radial / rlen)) < 0
+
+
 def _holes_of(shape) -> list[dict]:
-    """Cylindrical faces grouped by diameter: [{dia_mm, positions}].
+    """Cylindrical faces grouped by AXIS, then by diameter: [{dia_mm, count}].
+
+    Every CYLINDER face anchored at the same axis point is ONE hole, even
+    when it steps through more than one diameter along its length — a
+    counterbore, a countersink lead-in, a thread's own crest bands —
+    reported by the LARGEST diameter seen at that axis, the hole's real
+    overall opening, never invented. Before this, each diameter band at one
+    axis was counted as its own hole: a real customer part
+    (step_file_demo/PET CORE 02 06.STEP) has one threaded, chamfered bore
+    that read as FOUR separate "holes" (16.50 / 18.00 / 19.00 / 24.50 mm) —
+    found by reading that file's own faces directly: same axis point,
+    fifteen near-zero-length cylinder slivers from the thread crests among
+    them, every one a sliver of the same feature, inflating this part's
+    hole table from a true 16 positions to 19.
 
     Positions are distinct cylinder axes, so a hole counted from both its
-    halves stays one hole. A slot's two rounded ends are two positions —
-    honest, and the report says a slot reads that way.
+    halves stays one hole. A slot's two rounded ends are still two
+    positions — genuinely different axes, two circles on the drawing.
+
+    Also excludes a rounded OUTER corner or edge fillet, via _is_bore's
+    concave/convex test — see that function's own docstring for why an
+    angular-span test was tried first and is wrong.
     """
-    groups: dict[float, set] = {}
+    counts: dict[float, int] = {}
+    for inst in _hole_instances(shape):
+        dia = inst["dia_mm"]
+        counts[dia] = counts.get(dia, 0) + 1
+    return [{"dia_mm": dia, "count": n} for dia, n in sorted(counts.items())]
+
+
+def _hole_instances(shape) -> list[dict]:
+    """Every real hole as its own row in 3D: [{dia_mm, axis_pt, axis_dir}].
+
+    The per-instance version of _holes_of's grouped-by-diameter counts --
+    same axis-merge rule (one axis point is one hole, reported by the
+    LARGEST diameter along it) and the same _is_bore concave/convex
+    filter, factored out here because both _holes_of (the counts) and
+    _named_holes (tagging each one for the drawing) need the identical
+    underlying list and must never quietly disagree about what counts as
+    a hole."""
+    by_axis: dict[tuple, dict] = {}
     for f in shape.Faces():
         if f.geomType() != "CYLINDER":
             continue
-        ad = BRepAdaptor_Surface(TopoDS.Face_s(f.wrapped))
+        face = TopoDS.Face_s(f.wrapped)
+        ad = BRepAdaptor_Surface(face)
         cyl = ad.Cylinder()
-        dia = round(2 * cyl.Radius(), 2)
-        p = cyl.Axis().Location()
+        umin, umax, vmin, vmax = BRepTools.UVBounds_s(face)
+        if not _is_bore(f, ad, cyl, umin, umax, vmin, vmax):
+            continue                        # a rounded outer corner, not a hole
+        p, d = cyl.Axis().Location(), cyl.Axis().Direction()
         key = (round(p.X(), 1), round(p.Y(), 1), round(p.Z(), 1))
-        groups.setdefault(dia, set()).add(key)
-    return [{"dia_mm": dia, "count": len(axes)}
-            for dia, axes in sorted(groups.items())]
+        dia = round(2 * cyl.Radius(), 2)
+        rec = by_axis.get(key)
+        if rec is None or dia > rec["dia_mm"]:
+            by_axis[key] = {"dia_mm": dia,
+                            "axis_pt": _np.array([p.X(), p.Y(), p.Z()]),
+                            "axis_dir": _np.array([d.X(), d.Y(), d.Z()])}
+    return list(by_axis.values())
+
+
+_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+
+
+def _named_holes(shape) -> list[dict]:
+    """Every real hole, tagged and assigned to the one view that shows it
+    as a circle: [{tag, dia_mm, axis_pt, axis_dir, view}] -- what
+    _draw_part points a leader arrow at and lists in the per-hole
+    schedule, the way a customer's own hole-callout drawing does (seen on
+    a real sample, step_file_demo/PET_CORE_TEST_B.STEP's own PDF: every
+    hole individually tagged B1-B23 with an arrow on the view it opens
+    on). Tags are "H1", "H2", ... in drawing order -- FRONT VIEW's holes,
+    then TOP VIEW's, then SIDE VIEW's, top-to-bottom and left-to-right
+    within each -- so the same part tags the same way every time it is
+    drawn.
+
+    "view" is whichever of _VIEWS looks most nearly straight down the
+    hole's own axis (the largest |axis_dir . view_normal|) -- the one
+    view where the hole is a circle to point at, not a cylindrical edge
+    seen side-on."""
+    order = {v[0]: i for i, v in enumerate(_VIEWS)}
+    tagged = []
+    for inst in _hole_instances(shape):
+        view = max(_VIEWS, key=lambda v: abs(float(
+            _np.dot(inst["axis_dir"], _np.array(v[1], dtype=float)))))
+        ax_w, ax_h = view[3]
+        tagged.append({**inst, "view": view[0],
+                      "_u": inst["axis_pt"][_AXIS_INDEX[ax_w]],
+                      "_w": inst["axis_pt"][_AXIS_INDEX[ax_h]]})
+    tagged.sort(key=lambda h: (order[h["view"]], -h["_w"], h["_u"]))
+    for i, h in enumerate(tagged, 1):
+        h["tag"] = f"H{i}"
+        del h["_u"], h["_w"]
+    return tagged
 
 
 # ── flat pattern (unfolding a formed sheet-metal part) ──────────────────────
@@ -636,32 +753,37 @@ def _holes_detail(shape, thickness_mm: float) -> list[dict]:
     per-instance version of _holes_of's grouped counts, for placing each
     one on the flat pattern rather than just counting them.
 
-    Not the same face test as _holes_of: that function counts every
-    cylindrical face, which on a real formed part includes the bend
-    faces themselves (a bend's inner/outer radius, doubled, IS what
-    shows up as an extra "hole" diameter in its table -- a pre-existing
-    quirk, out of scope here). A hole drawn on the flat pattern excludes
-    anything long enough to be a bend by the same test _bend_candidates
-    uses, so a fold line is never drawn as a circle."""
+    A hole drawn on the flat pattern excludes anything long enough to be a
+    bend by the same test _bend_candidates uses, so a fold line is never
+    drawn as a circle -- and, like _holes_of, excludes a rounded OUTER
+    corner or edge fillet via _is_bore's concave/convex test (see that
+    function's own docstring).
+
+    Like _holes_of, a stepped/countersunk/threaded hole's several diameter
+    bands at one axis are drawn as ONE circle, labelled with the LARGEST of
+    them -- not whichever face OCCT happened to hand back first (arbitrary
+    iteration order), which could otherwise draw a different number here
+    than the one _holes_of put in the table for the very same hole."""
     min_len = max(5.0, 4 * thickness_mm)
-    seen = set()
-    out = []
+    by_axis: dict[tuple, tuple] = {}   # key -> (dia_mm, axis_pt)
     for f in shape.Faces():
         if f.geomType() != "CYLINDER":
             continue
-        ad = BRepAdaptor_Surface(TopoDS.Face_s(f.wrapped))
+        face = TopoDS.Face_s(f.wrapped)
+        ad = BRepAdaptor_Surface(face)
         cyl = ad.Cylinder()
-        _umin, _umax, vmin, vmax = BRepTools.UVBounds_s(TopoDS.Face_s(f.wrapped))
+        umin, umax, vmin, vmax = BRepTools.UVBounds_s(face)
         if (vmax - vmin) >= min_len:
             continue                        # a bend, not a hole
+        if not _is_bore(f, ad, cyl, umin, umax, vmin, vmax):
+            continue                        # a rounded outer corner, not a hole
         p = cyl.Axis().Location()
         key = (round(p.X(), 1), round(p.Y(), 1), round(p.Z(), 1))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"dia_mm": round(2 * cyl.Radius(), 2),
-                    "axis_pt": _np.array([p.X(), p.Y(), p.Z()])})
-    return out
+        dia = round(2 * cyl.Radius(), 2)
+        if key not in by_axis or dia > by_axis[key][0]:
+            by_axis[key] = (dia, _np.array([p.X(), p.Y(), p.Z()]))
+    return [{"dia_mm": dia, "axis_pt": axis_pt}
+            for dia, axis_pt in by_axis.values()]
 
 
 def _hole_face_of(axis_pt, placed_faces: list, thickness_mm: float):
@@ -1049,14 +1171,36 @@ def write_xlsx(report: dict, path: str) -> str:
                           (4, 14, 10, 10, 10, 16, 12, 12, 40, 44, 12, 12)):
         ws.column_dimensions[col].width = width
 
+    shapes = dict(report.get("_shapes") or [])
     holes_ws = wb.create_sheet("Holes")
-    holes_ws.append(["Part", "Diameter (mm)", "Positions"])
+    holes_ws.append(["Part", "Diameter (mm)", "Positions", "Tags"])
     for cell in holes_ws[1]:
         cell.font = bold
     for part in report["parts"]:
+        # Same tags the drawing and the AI prompt use (flat-pattern ones
+        # when this part has a flat pattern, the formed 3D ones otherwise)
+        # — grouped by diameter here only to keep one row per diameter,
+        # matching this sheet's own existing shape; the estimator reading
+        # a 7-hole Ø6 row still sees which tags those seven are.
+        by_dia: dict[float, list] = {}
+        flat = part.get("flat")
+        if flat and flat.get("holes"):
+            tags, _counts = _flat_named_holes(flat)
+            for tag, h in zip(tags, flat["holes"]):
+                by_dia.setdefault(h["dia_mm"], []).append(tag)
+        else:
+            shape = shapes.get(part["name"])
+            if shape is not None:
+                for h in _named_holes(shape):
+                    by_dia.setdefault(h["dia_mm"], []).append(h["tag"])
         for h in part["holes"]:
-            holes_ws.append([part["name"], h["dia_mm"], h["count"]])
-    for col, width in zip("ABC", (14, 14, 10)):
+            seen_tags: list = []
+            for tag in by_dia.get(h["dia_mm"], []):
+                if tag not in seen_tags:
+                    seen_tags.append(tag)
+            holes_ws.append([part["name"], h["dia_mm"], h["count"],
+                            ", ".join(seen_tags)])
+    for col, width in zip("ABCD", (14, 14, 10, 30)):
         holes_ws.column_dimensions[col].width = width
 
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
@@ -1483,11 +1627,24 @@ class _Canvas:
 
 def _draw_part(sh: _Sheet, index: int, part: dict, shape, mode: str) -> None:
     """One part's band: caption and isometric on the left, front over top in
-    the middle, side over the hole table on the right — the layout of the
-    hand-made sheet, and of the sheet the image model used to draw."""
+    the middle, side over the per-hole schedule on the right — the layout
+    of the hand-made sheet, and of the sheet the image model used to draw.
+
+    Every real hole is tagged (H1, H2, ...) and pointed at with a leader
+    arrow on whichever view shows it as a circle, the way a customer's own
+    hole-callout drawing does it (seen on a real sample, step_file_demo/
+    PET_CORE_TEST_B.STEP's own PDF: every hole individually tagged with an
+    arrow). _named_holes does the tagging; _place_label (already used the
+    same way for the flat pattern's own diameter callouts) routes each tag
+    clear of the view's own geometry and of every other tag already placed,
+    so a tight cluster of holes still reads instead of overlapping."""
     M, W = sh.M, sh.W
     y0 = sh.y
     ext = _extents(shape)
+    named = _named_holes(shape)
+    by_view: dict[str, list] = {}
+    for h in named:
+        by_view.setdefault(h["view"], []).append(h)
     col1, col2, col3 = M, 400, 830
     vw, vh = 350, 230                 # each view's box
     # One scale for all three views of a part, so the front's width and the
@@ -1531,20 +1688,40 @@ def _draw_part(sh: _Sheet, index: int, part: dict, shape, mode: str) -> None:
         sh.dim_h(left, right, bottom + 24, ext[ax_w])
         sh.dim_v(top, bottom, right + 26, ext[ax_h])
 
-    # ── hole table under the side view ────────────────────────────────
+        # ── tag + leader arrow for every hole this view shows as a
+        # circle ──────────────────────────────────────────────────────
+        xmin, _xmax, _ymin, ymax = proj["bb"]
+        tx0, ty0 = left - xmin * scale, top + ymax * scale
+        view_labels: list = []
+        for h in by_view.get(title, []):
+            u = float(h["axis_pt"][_AXIS_INDEX[ax_w]])
+            w_ = float(h["axis_pt"][_AXIS_INDEX[ax_h]])
+            cx, cy = tx0 + u * scale, ty0 - w_ * scale
+            r = max(h["dia_mm"] / 2 * scale, 1.3)
+            lx, ly, leadered = _place_label(
+                (cx, cy), (cx + r + 16, cy - r - 10), h["tag"], 11.5,
+                "start", view_labels)
+            if leadered:
+                sh.line(lx, ly, cx, cy, w=0.7, color="#1a5fb4")
+            sh.arrow(cx, cy, cx - lx, cy - ly)
+            sh.text(lx, ly, h["tag"], size=11.5, weight="bold",
+                    fill="#1a5fb4")
+
+    # ── per-hole schedule under the side view ───────────────────────────
     ty = y_side + vh + 70
     tx = col3 + 40
-    rows = part["holes"]
     sh.text(tx, ty, f"HOLES ({part['name'].upper()})", size=13, weight="bold")
-    if rows:
-        for k, h in enumerate(rows):
-            sh.text(tx, ty + 22 + k * 19, f"Ø{h['dia_mm']:g} x {h['count']}",
-                    size=13)
-        table_h = 30 + len(rows) * 19
+    if named:
+        for k, h in enumerate(named):
+            p = h["axis_pt"]
+            sh.text(tx, ty + 22 + k * 17,
+                    f"{h['tag']:<3s} Ø{h['dia_mm']:g}  "
+                    f"X{p[0]:.2f} Y{p[1]:.2f} Z{p[2]:.2f}", size=11)
+        table_h = 30 + len(named) * 17
     else:
         sh.text(tx, ty + 22, "no holes", size=13, fill="#555")
         table_h = 50
-    sh.rect(tx - 12, ty - 18, 220, table_h, stroke="#777")
+    sh.rect(tx - 12, ty - 18, 280, table_h, stroke="#777")
     # weight line, under the caption side
     sh.text(col1 + 10, y0 + 330, f"volume {part['volume_cm3']:.2f} cm3 · "
             f"{_weights(part['volume_cm3'], mode)}", size=11.5, fill="#444")
@@ -1660,6 +1837,45 @@ def _place_label(anchor_pt: tuple, default_pt: tuple, text: str,
     cx, cy = tried[4]
     placed.append(_label_box(cx, cy, text, size, anchor_mode))
     return cx, cy, True
+
+
+_CROWD = 8   # a repeated pattern at or past this count tags as one GROUP
+
+
+def _flat_named_holes(flat: dict) -> tuple[list[str], dict[float, int]]:
+    """Tags for flat["holes"], aligned one-for-one with that list (same
+    index, same order) so the cutting drawing and the AI prompt can never
+    disagree about which hole "H5" means — both read this one function,
+    not two separate tagging schemes. Also returns the per-diameter count,
+    which both callers need anyway (the drawing's crowd check, the
+    prompt's group note).
+
+    Tag order is reading order (top row first, left to right), computed
+    separately from the alignment above. A repeated pattern at or past
+    _CROWD gets one GROUP tag ("G1") shared by every hole of that one
+    diameter instead of its own tag each — found live on a real part
+    (Assem1.STEP's top panel has an 18-hole Ø3 vent row): eighteen
+    individual leader arrows crossing a space that size read as noise,
+    not information, on the drawing this was built to fix for."""
+    holes = flat["holes"]
+    counts: dict[float, int] = {}
+    for h in holes:
+        counts[h["dia_mm"]] = counts.get(h["dia_mm"], 0) + 1
+    order = sorted(range(len(holes)), key=lambda i: (-holes[i]["y"], holes[i]["x"]))
+    group_tags: dict[float, str] = {}
+    tags: list[str] = [""] * len(holes)
+    rank = 0
+    for idx in order:
+        dia = holes[idx]["dia_mm"]
+        if counts[dia] >= _CROWD:
+            if dia not in group_tags:
+                rank += 1
+                group_tags[dia] = f"G{rank}"
+            tags[idx] = group_tags[dia]
+        else:
+            rank += 1
+            tags[idx] = f"H{rank}"
+    return tags, counts
 
 
 def _draw_flat_pattern(sh: _Sheet, index: int, part: dict, shape,
@@ -1786,16 +2002,26 @@ def _draw_flat_pattern(sh: _Sheet, index: int, part: dict, shape,
         sh.line(X(bl["x1"]), Y(bl["y1"]), X(bl["x2"]), Y(bl["y2"]),
                 w=0.8, color="#b33", dash="4,3")
 
-    labelled_dia: set[float] = set()
+    # Every real hole gets its own tag (H1, H2, ...) — or, past _CROWD
+    # repeats of one diameter, one shared group tag — the same tags
+    # _flat_named_holes hands to the AI prompt, so a customer's own
+    # hole-callout PDF (step_file_demo/PET_CORE_TEST_B.STEP's own: every
+    # hole individually tagged with an arrow) has a real match here too,
+    # and "H5" on the drawing is "H5" in the answer, never two different
+    # holes with the same name.
+    hole_tags, counts = _flat_named_holes(flat)
+    labelled_groups: set[float] = set()
     holes_to_label = []
-    for h in flat["holes"]:
+    for i, h in enumerate(flat["holes"]):
         r = max(h["dia_mm"] / 2 * scale, 1.3)
         cx, cy = X(h["x"]), Y(h["y"])
         sh.circle(cx, cy, r)
         label_boxes.append((cx - r, cy - r, cx + r, cy + r))
-        if h["dia_mm"] not in labelled_dia:
-            labelled_dia.add(h["dia_mm"])
-            holes_to_label.append((cx, cy, r, h["dia_mm"]))
+        if counts[h["dia_mm"]] >= _CROWD:
+            if h["dia_mm"] in labelled_groups:
+                continue
+            labelled_groups.add(h["dia_mm"])
+        holes_to_label.append((cx, cy, r, h["dia_mm"], hole_tags[i]))
 
     # A window cut into a panel, or a slot -- anything that is not a
     # plain round hole -- gets its own width x height labelled the way
@@ -1825,17 +2051,20 @@ def _draw_flat_pattern(sh: _Sheet, index: int, part: dict, shape,
                        color="#a33")
             sh.text(lx, ly, text, size=9.5, fill="#a33")
 
-    # Every hole's own diameter, once per DISTINCT diameter present, so a
-    # repeated size is not re-labelled at every instance and crowded off
-    # the page.
-    for cx, cy, r, dia in holes_to_label:
-        text = f"Ø{dia:g}"
+    # Every hole individually tagged and pointed at, not grouped by size —
+    # "which hole do you mean" always has a real answer on this drawing.
+    # Except a crowded repeated pattern (see _CROWD above), tagged once as
+    # a group — "Gn Ø.. x N" — pointed at its first instance only.
+    for cx, cy, r, dia, tag in holes_to_label:
+        text = (f"{tag} Ø{dia:g} x {counts[dia]}" if tag.startswith("G")
+                else f"{tag} Ø{dia:g}")
         lx, ly, leadered = _place_label(
-            (cx, cy), (cx + r + 3, cy - r - 2), text, 9.5, "start",
+            (cx, cy), (cx + r + 16, cy - r - 10), text, 9.5, "start",
             label_boxes)
         if leadered:
-            sh.line(cx, cy, lx, ly, w=0.6, color="#a33")
-        sh.text(lx, ly, text, size=9.5, fill="#a33")
+            sh.line(lx, ly, cx, cy, w=0.6, color="#1a5fb4")
+        sh.arrow(cx, cy, cx - lx, cy - ly)
+        sh.text(lx, ly, text, size=9.5, weight="bold", fill="#1a5fb4")
 
     # Position dimensions as a CHAIN — the gap from the edge to the first
     # feature, then feature to feature, then the last feature to the far
@@ -2118,67 +2347,121 @@ def auto_brief(report: dict) -> str:
     return "\n".join(lines) + _SK.addendum("step.auto")
 
 
-# ── /step-ask: a question → Groq's advice → an agent's plan → applied ───────
-# The customer's model still never leaves this machine. Groq gets measured
-# numbers and the question; the browser agent gets those plus Groq's advice;
-# and the geometry edits themselves happen HERE, in cadquery, on a copy.
+# ── /step-ask: a question → the model's advice → its own plan → applied ────
+# The customer's model still never leaves this machine. Claude Haiku 5.5
+# (or Claude Sonnet 5.5) gets the measured numbers and the question;
+# reviewing its own advice into a plan is the same call, same model; and
+# the geometry edits themselves happen HERE, in cadquery, on a copy.
 
 PLAN_OPS = ("enlarge_hole", "scale")
 
 
 def _part_lines(report: dict) -> str:
+    """One line per part, then its holes — individually tagged (H1, H2,
+    ...), with a position, so a question like "which hole do you mean" has
+    a real answer to give back: before this, the text only ever said
+    "Ø19.0 x 1" with no name and no position for anything to point at, so
+    no model, however good, could ever answer that question from this
+    prompt alone.
+
+    The SAME tags the drawing uses: a part with a flat pattern reads
+    _flat_named_holes (flat-pattern x/y, "H5" there means the same hole as
+    "H5" drawn on the cutting sheet); one without reads _named_holes on
+    the live shape (formed 3D x/y/z, matching the 3-view drawing's own
+    tags) when the shapes are still on the report (the normal case, during
+    a real run). Falls back to the old grouped-by-diameter line only for a
+    report reloaded from disk, where `_shapes` was stripped before saving
+    (render_sheet needs the same fallback for the same reason)."""
+    shapes = dict(report.get("_shapes") or [])
     lines = []
     for i, part in enumerate(report["parts"], 1):
         L, W, H = part["size_mm"]
         lines.append(f"{i}) {part['name']} — {L:.2f} x {W:.2f} x {H:.2f} mm "
                      f"· wall/sheet t≈{part['thickness_mm']:.2f} mm · "
                      f"volume {part['volume_cm3']:.2f} cm3")
-        if part["holes"]:
+        flat = part.get("flat")
+        shape = shapes.get(part["name"])
+        if flat and flat.get("holes"):
+            tags, counts = _flat_named_holes(flat)
+            seen_groups: set[str] = set()
+            items = []
+            for tag, h in zip(tags, flat["holes"]):
+                if tag.startswith("G"):
+                    if tag in seen_groups:
+                        continue
+                    seen_groups.add(tag)
+                    items.append(f"{tag} Ø{h['dia_mm']:g} x "
+                                f"{counts[h['dia_mm']]} (a repeated pattern "
+                                "— positions vary, see the drawing)")
+                else:
+                    items.append(f"{tag} Ø{h['dia_mm']:g} (flat "
+                                f"X={h['x']:.2f} Y={h['y']:.2f})")
+            lines.append("   holes: " + " · ".join(items))
+            continue
+        named = _named_holes(shape) if shape is not None else []
+        if named:
+            lines.append("   holes: " + " · ".join(
+                f"{h['tag']} Ø{h['dia_mm']:g} (X={h['axis_pt'][0]:.2f} "
+                f"Y={h['axis_pt'][1]:.2f} Z={h['axis_pt'][2]:.2f})"
+                for h in named))
+        elif part["holes"]:
             lines.append("   holes: " + " · ".join(
                 f"Ø{h['dia_mm']:g} x {h['count']}" for h in part["holes"]))
     return "\n".join(lines)
 
 
 def ask_prompt(report: dict, question: str) -> str:
-    """What the chosen model is asked — Groq, or ChatGPT/Claude/Gemini via
-    the fallback chain. Numbers and the question — never the model. The
+    """What the chosen model is asked — Claude Haiku 5.5 by default, or
+    Claude Sonnet 5.5, called directly through OpenRouter. Numbers (and,
+    only with the person's own consent each session, Prism's own rendered
+    picture of the parts) and the question — never the model itself. The
     answer now renders as real Markdown (headers, bold, lists and tables
     all render — see addons/step/workbench.py's _Markdown), so the format
-    instructions ask for that structure directly: a short header per
-    section, bold on the one change that matters, a real list instead of
-    one run-on paragraph. Earlier this told every model to write plain
-    prose with no markdown, because the chat box back then printed pipes
-    and hashes literally — that box is gone. Same prompt for every model,
-    so the difference is the model, not the ask."""
+    instructions ask for that structure directly — but ONLY for an
+    open-ended question. Reported live, 2026-11-06: asked plainly "how
+    many holes are there", Haiku correctly said 23 and named every tag —
+    then also produced a full Makeability / Cost drivers / Changes
+    write-up nobody asked for, because the old prompt demanded that
+    structure unconditionally. The prompt now tells the model to size its
+    answer to the question: a factual one gets a sentence or two, nothing
+    else. Same prompt for every model, so the difference is the model,
+    not the ask."""
     o = report["overall_mm"]
     return (
         f"You are advising a {report['mode']} moulding shop on a customer's "
         "part. The CAD model is confidential and cannot be shown to you — "
-        "everything known about it was measured offline and is below.\n\n"
+        "everything known about it was measured offline and is below. Each "
+        "hole has its own tag (H1, H2, ...) and position — use the tag "
+        "when you mean one specific hole, so the answer can be pinned "
+        "down to exactly which one, not just a diameter that may repeat.\n\n"
         f"Job: {report['file']} · assembly overall "
         f"{o[0]:.2f} x {o[1]:.2f} x {o[2]:.2f} mm · "
         f"{len(report['parts'])} part(s)\n"
         f"{_part_lines(report)}\n\n"
         f"The customer asks: {question}\n\n"
-        "Start with ONE direct sentence that answers the question itself, "
-        "before any supporting detail. Then give short, practical "
-        "suggestions grounded ONLY in the figures above — do not invent "
-        "features you cannot see. Where a suggestion is a hole size change "
-        "or an overall scale change, state it precisely: which part, "
-        "current Ø, new Ø (or scale factor), and why. Say plainly which "
-        "ONE change matters most if the others are minor by comparison — "
-        "do not give every suggestion equal weight. Mark anything that "
-        "would need the customer's designer (ribs, draft, wall changes) as "
-        "their decision, not ours.\n\n"
-        "Write it as Markdown: a short ## header for each section (for "
-        "example Verdict, What holds up, What's wrong), **bold** for the "
-        "one change that matters most and for key figures, and a numbered "
-        "or bulleted list for multiple points — one blank line between "
-        "list items so they render as a real list, not one run-on "
-        "paragraph. A table is fine for a handful of before/after "
-        "numbers; skip it otherwise. Do not cite rule numbers or name "
-        "any reference material — explain the reasoning itself, in your "
-        "own words."
+        "Answer the question actually asked, matched to its own size — "
+        "do not pad a simple question with a full report.\n\n"
+        "A FACTUAL question (how many, which, what size, where) gets ONE "
+        "or TWO plain sentences and nothing else: no headers, no "
+        "'Makeability', no cost drivers, no list of what else you'd need "
+        "to know, no suggestions — just the answer, from the figures "
+        "above. If it names one hole, use its TAG.\n\n"
+        "An OPEN-ENDED question (how do I make this lighter, what would "
+        "you change, review this part) earns the fuller write-up: start "
+        "with ONE direct sentence, then short practical suggestions "
+        "grounded ONLY in the figures above — never invent a feature you "
+        "cannot see. A hole size or scale change must name the part, the "
+        "hole TAG, current Ø, new Ø (or scale factor), and why. Say "
+        "plainly which ONE change matters most — do not weight every "
+        "suggestion equally. Mark anything needing the customer's own "
+        "designer (ribs, draft, wall changes) as their decision, not "
+        "ours. Only here, format as Markdown: a short ## header per "
+        "section, **bold** for the one change that matters most, a "
+        "numbered or bulleted list for multiple points (one blank line "
+        "between items so they render as a real list). A table is fine "
+        "for a handful of before/after numbers; skip it otherwise.\n\n"
+        "Never cite rule numbers or name reference material — explain "
+        "the reasoning itself, in your own words."
         + _SK.addendum("step.ask"))
 
 
@@ -2196,16 +2479,21 @@ def plan_prompt(report: dict, question: str, suggestions: str) -> str:
         f"FIRST ADVISOR SAID:\n{suggestions}\n\n"
         "Prism can execute exactly two operations on the model, locally:\n"
         '  {"op": "enlarge_hole", "part": "<part name or all>", '
-        '"dia_mm": <current>, "new_dia_mm": <bigger>, "why": "..."}\n'
+        '"dia_mm": <current>, "new_dia_mm": <bigger>, '
+        '"hole": "<tag, e.g. H5, or omit>", "why": "..."}\n'
         '  {"op": "scale", "part": "<part name or all>", '
         '"factor": <0.2..5>, "why": "..."}\n\n'
+        '"hole" is optional: give the ONE tag (from the measurements above) '
+        "when the request is about one specific hole, so only that hole "
+        "changes; omit it when every hole of that diameter should change "
+        "together, the same as before.\n\n"
         "Answer format:\n"
         '{"changes": [ ...only the two ops above, only if truly right... ],\n'
         ' "advice":  [ "every other worthwhile suggestion, as a sentence" ]}\n\n'
-        "Rules: use only part names and hole diameters that appear in the "
-        "measurements. A hole can only be enlarged, never shrunk. When no "
-        "executable change is justified, return an empty changes list — an "
-        "honest empty list beats an invented edit."
+        "Rules: use only part names, hole diameters and hole tags that "
+        "appear in the measurements. A hole can only be enlarged, never "
+        "shrunk. When no executable change is justified, return an empty "
+        "changes list — an honest empty list beats an invented edit."
         + _SK.addendum("step.plan"))
 
 
@@ -2219,8 +2507,9 @@ def _valid_change(ch) -> dict | None:
             dia, new = float(ch["dia_mm"]), float(ch["new_dia_mm"])
             if not 0 < dia < new:
                 return None
+            hole = str(ch.get("hole") or "").strip()
             return {"op": "enlarge_hole", "part": part, "dia_mm": round(dia, 2),
-                    "new_dia_mm": round(new, 2), "why": why}
+                    "new_dia_mm": round(new, 2), "hole": hole, "why": why}
         if ch.get("op") == "scale":
             factor = float(ch["factor"])
             if not 0.2 <= factor <= 5 or factor == 1:
@@ -2255,12 +2544,23 @@ def parse_plan(texts: list[str]) -> tuple[dict | None, str]:
     return None, "The agent returned no JSON plan Prism could read."
 
 
-def _enlarged(shape, dia: float, new_dia: float):
-    """Cut a bigger cylinder along every existing axis of the Ø`dia` holes.
-    Enlarge only — shrinking would mean adding material, which a boolean
-    cut cannot do and _valid_change refuses upstream."""
+def _enlarged(shape, dia: float, new_dia: float, hole_tag: str = ""):
+    """Cut a bigger cylinder along every existing axis of the Ø`dia` holes —
+    or, when `hole_tag` names one (e.g. "H5", from _named_holes, the same
+    tags the drawing and the prompts use), only that ONE axis, so "enlarge
+    H5" cannot also enlarge every other hole that happens to share its
+    diameter. Enlarge only — shrinking would mean adding material, which a
+    boolean cut cannot do and _valid_change refuses upstream."""
     bb = shape.BoundingBox()
     span = (bb.xlen ** 2 + bb.ylen ** 2 + bb.zlen ** 2) ** 0.5 or 1.0
+    target_key = None
+    if hole_tag:
+        for h in _named_holes(shape):
+            if h["tag"] == hole_tag:
+                p = h["axis_pt"]
+                target_key = (round(float(p[0]), 1), round(float(p[1]), 1),
+                             round(float(p[2]), 1))
+                break
     seen, cutters = set(), []
     for f in shape.Faces():
         if f.geomType() != "CYLINDER":
@@ -2271,6 +2571,8 @@ def _enlarged(shape, dia: float, new_dia: float):
         ax = cyl.Axis()
         loc, d = ax.Location(), ax.Direction()
         key = (round(loc.X(), 1), round(loc.Y(), 1), round(loc.Z(), 1))
+        if target_key is not None and key != target_key:
+            continue
         if key in seen:
             continue
         seen.add(key)
@@ -2330,15 +2632,19 @@ def apply_plan(path: str, plan: dict, out_path: str) -> dict:
             continue
         for name in names:
             if ch["op"] == "enlarge_hole":
-                shape, n = _enlarged(by_name[name],
-                                     ch["dia_mm"], ch["new_dia_mm"])
+                hole_tag = ch.get("hole") or ""
+                shape, n = _enlarged(by_name[name], ch["dia_mm"],
+                                     ch["new_dia_mm"], hole_tag)
                 if n:
                     by_name[name] = shape
-                    log.append(f"Ø{ch['dia_mm']:g} → Ø{ch['new_dia_mm']:g} "
-                               f"on {name}: {n} hole(s) enlarged")
+                    which = f"{hole_tag} " if hole_tag else ""
+                    log.append(f"{which}Ø{ch['dia_mm']:g} → "
+                               f"Ø{ch['new_dia_mm']:g} on {name}: "
+                               f"{n} hole(s) enlarged")
                 elif ch["part"] != "all":
-                    log.append(f"! no Ø{ch['dia_mm']:g} hole on {name} "
-                               "— skipped")
+                    log.append(f"! no Ø{ch['dia_mm']:g} hole "
+                               f"{f'tagged {hole_tag} ' if hole_tag else ''}"
+                               f"on {name} — skipped")
             elif ch["op"] == "scale":
                 by_name[name] = _scaled(by_name[name], ch["factor"])
                 log.append(f"{name} scaled x {ch['factor']:g}")
@@ -2365,12 +2671,24 @@ def predicted_parts(report: dict, plan: dict) -> list[dict]:
                     ch["part"], p["name"]):
                 continue
             if ch["op"] == "enlarge_hole":
-                for h in p["holes"]:
-                    if abs(h["dia_mm"] - ch["dia_mm"]) <= 0.05:
-                        h["dia_mm"] = ch["new_dia_mm"]
                 merged: dict[float, int] = {}
                 for h in p["holes"]:
                     merged[h["dia_mm"]] = merged.get(h["dia_mm"], 0) + h["count"]
+                if ch.get("hole"):
+                    # One tagged hole: move exactly one position out of its
+                    # old diameter's group and into the new one — the
+                    # other holes sharing that diameter are untouched.
+                    old, new = ch["dia_mm"], ch["new_dia_mm"]
+                    if merged.get(old, 0) > 0:
+                        merged[old] -= 1
+                        if merged[old] <= 0:
+                            del merged[old]
+                        merged[new] = merged.get(new, 0) + 1
+                else:
+                    for dia in [d for d in merged
+                               if abs(d - ch["dia_mm"]) <= 0.05]:
+                        merged[ch["new_dia_mm"]] = (
+                            merged.get(ch["new_dia_mm"], 0) + merged.pop(dia))
                 p["holes"] = [{"dia_mm": d, "count": c}
                               for d, c in sorted(merged.items())]
             elif ch["op"] == "scale":

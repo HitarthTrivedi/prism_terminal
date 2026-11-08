@@ -48,18 +48,31 @@ CATEGORIES = {
         "emoji": "🧠",
         "color": "brains",
         "desc": "Strategy, factual grounding, deep reasoning & technical architecture",
-        "agents": ["Perplexity", "ChatGPT", "Claude", "LAZYCOOK"],
+        # Perplexity pulled from this list (2026-11-08, owner's own urgent
+        # call, same day): Chrome 157 crashes chromedriver natively every
+        # single time it tries Perplexity's own page, proven independent of
+        # cookies/cache/profile state (cleared and still 100% reproducible)
+        # — so leaving it in the fallback chain only ever burns 1-2 minutes
+        # crashing before whatever comes after it gets a turn. Put it back
+        # once a Chrome update fixes this; nothing else here changed.
+        "agents": ["ChatGPT", "Claude", "LAZYCOOK"],
     },
     "research": {
         "label": "Research & Academic",
         "emoji": "📚",
         "color": "research",
         "desc": "Peer-reviewed data, citations & symbolic mathematics",
-        # Perplexity leads here: live web search with sources is the research
-        # job most tasks actually need, and /boq's design-standards stage
-        # picks whatever is set for this category.
-        "agents": ["Perplexity", "Consensus", "WolframAlpha", "Semantic Scholar",
-                   "NotebookLM", "LAZYCOOK"],
+        # Narrowed to general-purpose chat tools (2026-11-08, owner's own
+        # urgent call): Consensus/WolframAlpha/Semantic Scholar/NotebookLM/
+        # LAZYCOOK dropped, Grok/Claude/ChatGPT added as the fallback chain.
+        # Perplexity itself was ALSO meant to lead this list that same day —
+        # live web search with sources is the research job most tasks
+        # actually need — but it was pulled again hours later (same owner
+        # call as "brains" above): Chrome 157 crashes chromedriver on its
+        # page every time, regardless of cookies/cache, so it is parked
+        # here, in this comment, rather than in the list, until Chrome
+        # fixes it. Grok leads in its place for now.
+        "agents": ["Grok", "Claude", "ChatGPT"],
     },
     # Its own category, not a corner of research. A contact database and a
     # web-search model are different machines: one returns rows that were
@@ -92,16 +105,24 @@ CATEGORIES = {
         "emoji": "🎨",
         "color": "visual",
         "desc": "Professional image generation, editable posts & consistent characters",
-        # Canva is first because most business visual work is a post or a
+        # Prism Image (FLUX 3 Klein via OpenRouter) is first, and so is the
+        # default roles.default_agents() hands a fresh install (2026-11-07):
+        # a direct API call, no browser tab, no separate sign-in, and it is
+        # a `local` agent so alternatives_for()'s browser-fallback chain
+        # skips straight past it to Canva/Gemini/etc, same as Reel/Studio/
+        # Motion already do for "media" and "presentation".
+        #
+        # Canva is next because most business visual work is a post or a
         # brochure the customer will want to tweak later, and it is the only
-        # tool here that hands back something still editable.
-        # Google Gemini sits second, not last: alternatives_for() offers the
-        # first TWO untried tools in this order when one fails, so parked at
-        # the end it would never actually be reached. This is what makes it
-        # the real fallback for ChatGPT -- the tool that has hit its own
-        # free-tier image limit twice in one afternoon on this account.
-        "agents": ["Canva", "Google Gemini", "Leonardo.ai", "Adobe Firefly",
-                   "Midjourney", "ChatGPT"],
+        # BROWSER tool here that hands back something still editable.
+        # Google Gemini sits after it, not last: alternatives_for() offers
+        # the first TWO untried (non-local) tools in this order when one
+        # fails, so parked at the end it would never actually be reached.
+        # This is what makes it the real fallback for ChatGPT -- the tool
+        # that has hit its own free-tier image limit twice in one afternoon
+        # on this account.
+        "agents": ["Prism Image", "Canva", "Google Gemini", "Leonardo.ai",
+                   "Adobe Firefly", "Midjourney", "ChatGPT"],
     },
     "media": {
         "label": "Video & Reels",
@@ -852,6 +873,24 @@ AGENT_REGISTRY = {
     ),
 
     # ── Visual & Image ────────────────────────────────────────────────────────
+    # Runs INSIDE Prism — no browser, no ChatGPT/DALL-E account, no upload.
+    # Marked local so automation.py calls core.image_gen directly instead
+    # of driving a Chrome tab, same pattern as Prism Studio/Reel/Motion
+    # below. Default and first choice for the "visual" stage (2026-11-07,
+    # the owner's own call: "replace that particular step where usually
+    # chatgpt is responsible for the generation of images... with image
+    # generation through API key... FLUX 3 Klein... made that thing as the
+    # default and first choice") — CATEGORIES["visual"]["agents"] puts it
+    # first, and roles.default_agents() picks a category's first name for
+    # a fresh install.
+    "Prism Image": _agent(
+        "local://flux_image",
+        "FLUX 3 Klein (Black Forest Labs), called directly through your "
+        "own OpenRouter key — a real generated picture in seconds, no "
+        "browser tab, no separate account to sign into",
+        "API key", "5–15s", 30,
+        local="flux_image",
+    ),
     "Leonardo.ai": _agent(
         "https://app.leonardo.ai",
         "fine-tuned model control and consistent character generation",

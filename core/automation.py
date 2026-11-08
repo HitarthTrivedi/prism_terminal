@@ -6545,12 +6545,30 @@ def _run_footage(prior_text, attachments, cfg: dict, on_progress=None):
 
 def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
                brand: dict | None = None, studio: dict | None = None,
-               on_progress=None):
+               on_progress=None, query: str = "", skill_text: str = ""):
     """Execute an agent that lives in Prism rather than in a browser.
 
     prior_text is either a single string or the earlier stages' outputs,
     newest first — each is tried in turn so one prose-heavy stage can't hide
     the spec written by another.
+
+    `query` is the RUN's own task text — the original ask, or (on a
+    follow-up) main_window's `self._followup_text`, "use this logo" and
+    nothing else. Reel/Studio/Motion never needed it (a design stage ahead
+    of them writes a full spec INTO prior_text instead); "flux_image" does
+    — it has no design stage of its own, so without this a follow-up's
+    real instruction never reached FLUX, only whichever prior stage's
+    leftover text _prompt_from happened to grab (see core.image_gen).
+
+    `skill_text` (2026-11-08): the house doctrine core.skills.block()
+    already renders for a browser agent's own stage, threaded here too —
+    "flux_image" is the only local agent that reads it (see
+    core.image_gen.generate), because it is the only one with no design
+    stage of its own to have already absorbed an occasion-specific skill
+    (a particular festival, a product-launch post, a sale announcement,
+    ...). The caller decides which skill(s) apply, same
+    SK.keys_for(routing, stage) + SK.block() every browser stage already
+    uses — this function only ever passes the rendered text through.
 
     Returns (output_path, message). On failure the path is empty and the
     message explains what went wrong — a local stage must degrade the same
@@ -6566,6 +6584,10 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
         return _run_studio(prior_text, attachments, cfg, brand, studio=studio)
     if kind == "motion":
         return _run_motion(prior_text, attachments, cfg, brand)
+    if kind == "flux_image":
+        from . import image_gen as _image_gen
+        return _image_gen.generate(query, prior_text, cfg, attachments,
+                                   skill_text=skill_text)
     if kind != "reel":
         return "", f"Unknown local agent {kind!r}."
     try:
@@ -7246,10 +7268,72 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         # blob only gives the parser more prose to trip over.
         prior_text = [t for ts in reversed(list(all_responses.values()))
                       for t in ts if t.strip()]
+
+        # The "artwork" stage is not a single-file renderer like Reel/
+        # Studio/Motion — it is several SEPARATE pictures (core.reel_web's
+        # own MAX_GENERATED), each needing a prompt complete enough for a
+        # model with no web access and no memory of this conversation.
+        # FLUX cannot write that prompt itself (it cannot browse, and
+        # "Dhanteras" or "this company in Vadodara" means nothing to a
+        # picture-only model) — core.image_gen.generate_artwork splits
+        # that into a text pass (writes N self-contained briefs, may use
+        # whatever a real research stage already found) and then an image
+        # pass per brief, cut out with core.assets the same way a client's
+        # own flat-background logo already is. Handled entirely here,
+        # never falling through to the single-file path below.
+        if stage == "artwork" and agent_cfg.get("local") == "flux_image":
+            from . import image_gen as _image_gen
+            has_own_artwork = any(
+                str(a.get("path", "")).lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+                for a in (attachments or []))
+            paths, note = _image_gen.generate_artwork(
+                query, prior_text, cfg, has_own_artwork=has_own_artwork)
+            if not paths:
+                ui.err(note)
+                emit("stage_error", {"stage": stage, "error": note, "url": ""})
+                return
+            made = [{"path": p, "kind": "image", "name": os.path.basename(p)}
+                    for p in paths]
+            audio_in_pipeline = [
+                f for f in pipeline_files
+                if f.get("kind") == "audio" or str(f.get("path", "")).lower()
+                .endswith((".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"))]
+            from . import reel_web as _rw
+            pipeline_files[:] = audio_in_pipeline + made[-_rw.MAX_GENERATED:]
+            _save_artifacts(made, query, stage, link="")
+            all_responses[stage] = [note]
+            all_links[stage] = paths[0]
+            delivered["image"] = delivered.get("image", 0) + len(paths)
+            ui.ok(note)
+            for p in paths:
+                ui.info(f"   📁  {p}")
+            emit("stage_done", {"stage": stage, "count": len(paths),
+                                "texts": [note], "url": paths[0],
+                                "timed_out": False})
+            return
+
         # Images an earlier stage GENERATED count as artwork too — that is
         # the whole point of harvesting them. The client's own files come
         # first so their real mark wins the 'logo' slot over anything a
         # model drew.
+        #
+        # House doctrine for THIS stage (2026-11-08), same mechanism a
+        # browser agent's own prompt already gets below (SK.keys_for() +
+        # SK.block()) — flux_image (Prism Image) is the only local agent
+        # that reads it: a single generic design brief cannot cover every
+        # occasion a customer asks for (a festival, a product launch, a
+        # sale, a hiring post, ...) equally well, and a skill is exactly
+        # Prism's own existing mechanism for "different doctrine for a
+        # different kind of deliverable" — this just reaches a local
+        # renderer with it too, not only a browser tab. maker=True: an
+        # image step builds the thing, it does not write one out as text
+        # (see SK.block()'s own maker= docstring).
+        _visual_skill_keys = SK.keys_for(routing, stage)
+        _visual_skill_text = (SK.block(_visual_skill_keys, "browser", maker=True)
+                              if _visual_skill_keys else "")
+        if _visual_skill_text:
+            ui.info(f"   📘  skill: {', '.join(_visual_skill_keys)}")
         out, note = _run_local(agent_cfg["local"], prior_text,
                                (attachments or []) + pipeline_files,
                                cfg, stage, brand=studio_brand,
@@ -7257,7 +7341,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                    stages, stage, all_links),
                                on_progress=lambda d, t: emit(
                                    "local_progress", {"stage": stage,
-                                                      "done": d, "total": t}))
+                                                      "done": d, "total": t}),
+                               query=query, skill_text=_visual_skill_text)
         if out:
             candidates = []
             for item in (pipeline_files or []):
@@ -7296,18 +7381,27 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     emit("stage_error", {"stage": stage, "error": error,
                                          "url": out})
                     return
-            # Keep the internal reel_<timestamp> working name, but make
-            # the customer-facing artifact describe the original request.
+            # Keep the internal reel_<timestamp>/flux_<timestamp> working
+            # name, but make the customer-facing artifact describe the
+            # original request. A local renderer's own file extension says
+            # what it made -- FLUX 3 Klein (the "visual" stage's own local
+            # agent, see agents.py's "Prism Image") writes a .png, Reel/
+            # Studio/Motion write an .mp4 -- so one flag covers both the
+            # artifact's label and the delivered-count bucket without
+            # threading the local `kind` string all the way down here.
+            is_image = out.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
             try:
                 from . import config as _config
-                saved = _config.save_artifact(out, query, kind="reel",
-                                             task=query)
+                saved = _config.save_artifact(
+                    out, query, kind="image" if is_image else "reel",
+                    task=query)
                 ui.info(f"   💾  saved to {saved}")
             except Exception:                           # noqa: BLE001
                 pass       # rendering succeeded; copying is best-effort
             all_responses[stage] = [note]
             all_links[stage] = out
-            delivered["video"] = delivered.get("video", 0) + 1
+            bucket = "image" if is_image else "video"
+            delivered[bucket] = delivered.get(bucket, 0) + 1
             ui.ok(note)
             ui.info(f"   📁  {out}")
             emit("stage_done", {"stage": stage, "count": 1, "texts": [note],

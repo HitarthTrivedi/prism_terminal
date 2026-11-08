@@ -13,12 +13,20 @@ reads their exceptions.
 """
 from __future__ import annotations
 
+import base64
 import json
 import time
 
 import requests
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# A text model's answer and a generated picture are different jobs on
+# OpenRouter's own API, not one endpoint with a flag -- confirmed against
+# OpenRouter's own docs (2026-11-07): /chat/completions returns prose in
+# choices[0].message.content; /images returns the picture itself, base64,
+# in data[0].b64_json. core.image_gen (FLUX 3 Klein, item: "replace the
+# ChatGPT image stage") is the one caller of IMAGES_URL.
+IMAGES_URL = "https://openrouter.ai/api/v1/images"
 _RETRY_STATUS = (429, 500, 502, 503, 504)
 
 
@@ -123,6 +131,79 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
             # "length") -- fall back to the reasoning text itself rather
             # than hand every caller a None where they expect a string.
             return msg.get("content") or msg.get("reasoning") or ""
+
+        if resp.status_code in _RETRY_STATUS and attempt < retries:
+            delay = 5
+            try:
+                delay = min(int(float(resp.headers.get("retry-after", 5))), 20)
+            except (TypeError, ValueError):
+                pass
+            time.sleep(delay)
+            continue
+
+        if resp.status_code == 429:
+            raise RuntimeError(
+                "OpenRouter is rate-limiting your key. Wait a minute and "
+                "try again, or raise your limits at openrouter.ai.")
+        if resp.status_code == 401:
+            raise RuntimeError(
+                "OpenRouter rejected your API key. Re-enter it in "
+                "Settings → AI tools.")
+        err = None
+        if isinstance(body, dict):
+            err = (body.get("error") or {}).get("message")
+        last = err or f"HTTP {resp.status_code}: {json.dumps(body)[:300]}"
+        raise RuntimeError(f"OpenRouter API error ({last})")
+
+    raise RuntimeError(f"OpenRouter did not answer. ({last})")
+
+
+def openrouter_image(api_key: str, model: str, prompt: str, *,
+                     aspect_ratio: str = "1:1", resolution: str = "1K",
+                     timeout: int = 180, retries: int = 1) -> bytes:
+    """One OpenRouter image generation call -- the dedicated Images API
+    (POST /api/v1/images), not /chat/completions: this model's deliverable
+    IS the image, not a text reply describing one. `model` is an
+    OpenRouter image-model id, e.g. "black-forest-labs/flux-3-image-klein".
+    Returns the raw image bytes (decoded from the response's own base64),
+    ready to write straight to a .png file.
+
+    Same retry-on-429/5xx shape and the same rule that a failure raises
+    with the server's own words, as openrouter_chat -- this is its sibling
+    for a provider that answers with pixels instead of tokens."""
+    if not api_key:
+        raise RuntimeError(
+            "No OpenRouter key set. Add one in Settings → AI tools.")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://prism.app",
+        "X-Title": "Prism",
+    }
+    payload = {"model": model, "prompt": prompt, "n": 1,
+              "aspect_ratio": aspect_ratio, "resolution": resolution}
+    last = ""
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(IMAGES_URL, headers=headers, json=payload,
+                                 timeout=timeout)
+        except requests.RequestException as e:
+            raise RuntimeError(
+                f"Couldn't reach OpenRouter — check your internet connection. "
+                f"({e})") from e
+
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+
+        if resp.status_code == 200:
+            data = body.get("data") or []
+            b64 = data[0].get("b64_json", "") if data else ""
+            if not b64:
+                raise RuntimeError(
+                    "OpenRouter answered but sent no image data.")
+            return base64.b64decode(b64)
 
         if resp.status_code in _RETRY_STATUS and attempt < retries:
             delay = 5

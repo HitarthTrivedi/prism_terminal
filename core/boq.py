@@ -1038,6 +1038,7 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
          "lengths_by_layer": {"WALLS": 142.7, ...},   # drawing units
          "areas_by_layer":   {"ROOM-HATCH": 88.4, ...},
          "block_counts":     {"DOOR-900": 12, "WINDOW-1200": 8, ...},
+         "text_entities":    [((12.0, 4.5), "CAM-01"), ...],  # (x, y), content
          "layers": ["0", "WALLS", ...], "entity_count": 431}
 
     `hvac=True` additionally applies HVAC_DRAWING_RULES.md's rules (today:
@@ -1048,6 +1049,20 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
     because they happen to look paired. The caller decides `hvac` from
     whether the person's own request actually says "HVAC" — see
     addons/boq/dialog.py:_measure().
+
+    `text_entities` (added for BOQ-CHANGES-TODO.md item 65): every real
+    TEXT/MTEXT this same walk already reads, position + content — this
+    function has always collected it internally (rule 3 reads duct/pipe
+    sizes out of it when hvac=True) but never handed it back, which is
+    the only reason addons/boq/drawing_reader.py grew its own, SEPARATE
+    ezdxf walk just to read a DXF's own text: the same file was being
+    parsed twice, by two different modules, for two different slices of
+    the same entities. Returning it here instead means every caller --
+    the GUI's own auto-measure on attach, and the AI-recheck step, ELV's
+    own drawing reading -- shares this ONE walk's answer, not three
+    independent ones that can each see something slightly different.
+    Additive only: every existing key keeps its exact previous meaning
+    and value; no existing caller reads or is affected by this one.
     """
     doc, read_notes = _read_dxf(dxf_path)
 
@@ -1213,6 +1228,10 @@ def measure(dxf_path: str, hvac: bool = False) -> dict:
         # size text was readable. Additive -- lengths_by_layer is
         # untouched and stays the single per-layer total it always was.
         "duct_sizes": duct_sizes,
+        # item 65: the raw TEXT/MTEXT this walk already collected (see this
+        # function's own docstring) -- every caller's one shared source for
+        # a DXF's own real text, instead of each re-parsing the file itself.
+        "text_entities": text_entities,
         # From the entities actually walked, NOT doc.layers.entries — a
         # minimal-mode DWG→DXF conversion can leave the formal layer TABLE
         # nearly empty (confirmed: 2 table entries vs. 64 real layer names
@@ -1518,6 +1537,22 @@ def summary_text(q: dict) -> str:
             # Rich terminal panel, which eats "[...]" as a style tag.
             hint = f"  (drawn on layer: {', '.join(lyrs)})" if lyrs else ""
             lines.append(f"  {name}: {count}{hint}")
+    if q.get("text_entities"):
+        # item 65: real TEXT/MTEXT, not a block and not a measured line --
+        # schedule notes, device tags, legend text. Was read internally by
+        # this same walk all along (rule 3's own duct-size matching) but
+        # never shown here; every caller of summary_text() now gets it for
+        # free, no new consent, no AI, regardless of industry.
+        from collections import Counter
+        texts = Counter(content for _, content in q["text_entities"])
+        lines.append("")
+        lines.append("TEXT ON THE DRAWING (every real TEXT/MTEXT entity read "
+                     "directly off the drawing, not estimated — schedule "
+                     "notes, tags, labels not already counted as a block "
+                     "above):")
+        for content, count in texts.items():
+            suffix = f"  (×{count})" if count > 1 else ""
+            lines.append(f"  {content}{suffix}")
     if not (q["lengths_by_layer"] or q["areas_by_layer"] or q["block_counts"]):
         lines.append("No measurable LINE/POLYLINE/HATCH/INSERT geometry found — "
                      "the drawing may use 3D solids or an unsupported entity type.")

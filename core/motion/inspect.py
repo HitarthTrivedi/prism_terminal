@@ -73,6 +73,20 @@ def _node_bounds(node: dict, canvas_w: int, canvas_h: int) -> tuple[float, float
         lead = fs * 0.85 if (node.get("check") or node.get("dot")) else 0.0
         w = len(str(node.get("label", ""))) * fs * 0.56 + fs * 1.9 + lead
         h = fs * 2.0
+    elif node_type == "ui_checklist":
+        fs = float(node.get("font_size", 34) or 34)
+        w = float(node.get("width", 760) or 760)
+        rows = max(1, len(node.get("items") or []))
+        gap = float(node.get("row_gap", fs * 0.9) or fs * 0.9)
+        h = rows * (fs * 1.2 + fs * 0.74 + fs * 0.3) + (rows - 1) * gap
+    elif node_type == "ui_window":
+        w = float(node.get("width", 900) or 900)
+        h = float(node.get("height", 620) or 620)
+    elif node_type == "ui_swatches":
+        d = float(node.get("dot_size", 30) or 30)
+        groups = node.get("groups") or []
+        w = sum(len(g) * d + max(0, len(g) - 1) * d * 0.3 + d * 1.2 for g in groups if isinstance(g, list)) + max(0, len(groups) - 1) * d * 0.7
+        h = d * 1.9
     elif node_type == "cursor":
         size = float(node.get("size", 44) or 44)
         label = str(node.get("label", ""))

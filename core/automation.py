@@ -8753,6 +8753,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     ui.info(f"   ↔  fitted {_f}")
                             except Exception as _e:
                                 ui.warn(f"   couldn't check the text fits the frame ({_e})")
+                            # How the film breathes: holds and bursts, measured
+                            # at low resolution in the real runtime. Reported,
+                            # not repaired — fixing it means asking the writer
+                            # again, which only the API path can do cheaply.
+                            try:
+                                from .motion import rhythm as _rhythm
+                                for _f in _rhythm.faults(_rhythm.probe(validated)):
+                                    ui.warn(f"   ♪  rhythm: {_f}")
+                            except Exception as _e:
+                                ui.warn(f"   couldn't measure the film's rhythm ({_e})")
                             stage_responses = [_json.dumps(validated, ensure_ascii=False)]
 
                 # This stage feeds a renderer, so "it answered" isn't enough —

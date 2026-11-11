@@ -1293,6 +1293,150 @@ class UIInputNode extends Node {
   }
 }
 
+// UIChecklist — rows of work in progress: a coloured dot, a label, a quieter
+// sub-line and a thin underline that fills while the row "works". Each item
+// is {label, sub?, color?, at, fill?} (at: scene-local seconds it appears).
+class UIChecklistNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.items = Array.isArray(props.items) ? props.items : [];
+    this.width = props.width || 760;
+    this.fontSize = props.font_size || 34;
+    this.ink = props.ink || "#111111";
+    this.gap = props.row_gap !== undefined ? props.row_gap : Math.round(this.fontSize * 0.9);
+  }
+  initDOM(box) {
+    const fs = this.fontSize;
+    box.style.transform = `translate(${-this.anchor[0] * 100}%, ${-this.anchor[1] * 100}%)`;
+    box.style.width = `${this.width}px`;
+    box.style.display = "flex"; box.style.flexDirection = "column"; box.style.gap = `${this.gap}px`;
+    box.style.font = `600 ${fs}px/1.2 var(--motion-body-font, Inter, -apple-system, sans-serif)`;
+    box.style.color = this.ink;
+    this._rows = [];
+    const colours = ["#E0533C", "#3B82F6", "#D946A8", "#10B981", "#F59E0B"];
+    this.items.forEach((it, i) => {
+      const colour = it.color || colours[i % colours.length];
+      const row = document.createElement("div");
+      row.style.cssText = "position:relative;display:flex;align-items:flex-start;gap:" + Math.round(fs * 0.5) + "px;opacity:0;padding-bottom:" + Math.round(fs * 0.3) + "px;";
+      const dot = document.createElement("span");
+      dot.style.cssText = `flex:none;margin-top:${Math.round(fs * 0.32)}px;width:${Math.round(fs * 0.3)}px;height:${Math.round(fs * 0.3)}px;border-radius:50%;background:${colour};`;
+      const col = document.createElement("div");
+      const label = document.createElement("div"); label.textContent = String(it.label || "");
+      col.appendChild(label);
+      if (it.sub) {
+        const sub = document.createElement("div"); sub.textContent = String(it.sub);
+        sub.style.cssText = `font-weight:400;font-size:${Math.round(fs * 0.62)}px;color:#6B7280;margin-top:${Math.round(fs * 0.12)}px;`;
+        col.appendChild(sub);
+      }
+      const line = document.createElement("div");
+      line.style.cssText = `position:absolute;left:${Math.round(fs * 0.8)}px;right:0;bottom:0;height:${Math.max(2, Math.round(fs * 0.07))}px;background:${colour};transform-origin:0 50%;transform:scaleX(0);opacity:0.85;`;
+      row.appendChild(dot); row.appendChild(col); row.appendChild(line); box.appendChild(row);
+      this._rows.push({ row, line, at: it.at || 0, fill: it.fill || 1.6 });
+    });
+  }
+  registerContentAnimation(masterTl) {
+    for (const r of this._rows) {
+      masterTl.fromTo(r.row, { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out", immediateRender: false }, r.at);
+      masterTl.fromTo(r.line, { scaleX: 0 }, { scaleX: 1, duration: r.fill, ease: "power1.inOut", immediateRender: false }, r.at + 0.2);
+    }
+  }
+}
+
+// UIWindow — an application window: title bar, a content area for its
+// children (positions are relative to the window's centre, like a panel's),
+// and a scrubber whose thumb travels from 0 to `progress` between `play_at`
+// and `play_at + play_for`.
+class UIWindowNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.width = props.width || 900; this.height = props.height || 620;
+    this.title = String(props.title || "");
+    this.timecode = String(props.timecode || "");
+    this.fill = props.fill || "#FFFFFF";
+    this.contentFill = props.content_fill || "#F3EFE6";
+    this.scrubber = props.scrubber !== false;
+    this.progress = props.progress !== undefined ? props.progress : 1;
+    this.playAt = props.play_at || 0; this.playFor = props.play_for || 2;
+  }
+  initDOM(box) {
+    const w = this.width, h = this.height, bar = Math.round(h * 0.075), foot = this.scrubber ? Math.round(h * 0.11) : 0;
+    box.style.transform = "";
+    box.style.left = `${-w * this.anchor[0]}px`; box.style.top = `${-h * this.anchor[1]}px`;
+    box.style.width = `${w}px`; box.style.height = `${h}px`;
+    box.style.background = this.fill; box.style.borderRadius = `${Math.round(h * 0.03)}px`;
+    box.style.border = "1px solid rgba(0,0,0,0.07)";
+    box.style.boxShadow = "0 2px 4px rgba(0,0,0,0.05), 0 28px 70px rgba(0,0,0,0.12)";
+    box.style.overflow = "hidden";
+    box.style.font = `500 ${Math.round(bar * 0.42)}px/1 var(--motion-body-font, Inter, -apple-system, sans-serif)`;
+    const head = document.createElement("div");
+    head.style.cssText = `position:absolute;left:0;top:0;right:0;height:${bar}px;display:flex;align-items:center;gap:${Math.round(bar * 0.2)}px;padding:0 ${Math.round(bar * 0.4)}px;color:#9CA3AF;`;
+    for (let i = 0; i < 3; i++) {
+      const d = document.createElement("span");
+      d.style.cssText = `width:${Math.round(bar * 0.2)}px;height:${Math.round(bar * 0.2)}px;border-radius:50%;background:#D4D4D8;`;
+      head.appendChild(d);
+    }
+    const t = document.createElement("span"); t.textContent = this.title; t.style.marginLeft = `${Math.round(bar * 0.2)}px`; head.appendChild(t);
+    const content = document.createElement("div");
+    content.style.cssText = `position:absolute;left:${Math.round(w * 0.02)}px;right:${Math.round(w * 0.02)}px;top:${bar}px;bottom:${foot + Math.round(h * 0.02)}px;background:${this.contentFill};border-radius:${Math.round(h * 0.02)}px;`;
+    box.appendChild(head); box.appendChild(content);
+    if (this.scrubber) {
+      const trackW = w - 2 * Math.round(w * 0.04) - (this.timecode ? Math.round(bar * 1.6) : 0);
+      const track = document.createElement("div");
+      track.style.cssText = `position:absolute;left:${Math.round(w * 0.04)}px;bottom:${Math.round(foot * 0.45)}px;width:${trackW}px;height:2px;background:#E4E4E7;`;
+      const thumb = document.createElement("div");
+      const tw = Math.max(2, Math.round(bar * 0.06)), th = Math.round(foot * 0.5);
+      thumb.style.cssText = `position:absolute;left:0;top:${-Math.round(th / 2) + 1}px;width:${tw}px;height:${th}px;background:#111111;`;
+      track.appendChild(thumb); box.appendChild(track);
+      if (this.timecode) {
+        const tc = document.createElement("div"); tc.textContent = this.timecode;
+        tc.style.cssText = `position:absolute;right:${Math.round(w * 0.04)}px;bottom:${Math.round(foot * 0.45) - 6}px;color:#9CA3AF;`;
+        box.appendChild(tc);
+      }
+      this._thumb = thumb; this._trackW = trackW;
+    }
+  }
+  registerContentAnimation(masterTl) {
+    if (this._thumb) {
+      masterTl.fromTo(this._thumb, { x: 0 }, { x: this._trackW * this.progress, duration: Math.max(0.05, this.playFor),
+        ease: "none", immediateRender: false }, this.playAt);
+    }
+  }
+}
+
+// UISwatches — a row of palette chips, each a small card of coloured dots,
+// popping in one after another from `at`.
+class UISwatchesNode extends Node {
+  constructor(props = {}) {
+    super(props);
+    this.groups = Array.isArray(props.groups) ? props.groups : [];
+    this.dot = props.dot_size || 30; this.at = props.at || 0; this.stagger = props.stagger !== undefined ? props.stagger : 0.25;
+  }
+  initDOM(box) {
+    const d = this.dot;
+    box.style.transform = `translate(${-this.anchor[0] * 100}%, ${-this.anchor[1] * 100}%)`;
+    box.style.display = "flex"; box.style.gap = `${Math.round(d * 0.7)}px`; box.style.whiteSpace = "nowrap";
+    this._chips = [];
+    for (const colours of this.groups) {
+      const chip = document.createElement("div");
+      chip.style.cssText = `display:flex;gap:${Math.round(d * 0.3)}px;padding:${Math.round(d * 0.45)}px ${Math.round(d * 0.6)}px;`
+        + "background:#FFFFFF;border:1px solid rgba(0,0,0,0.07);border-radius:" + Math.round(d * 0.55) + "px;"
+        + "box-shadow:0 1px 2px rgba(0,0,0,0.06),0 10px 26px rgba(0,0,0,0.09);opacity:0;";
+      for (const c of (Array.isArray(colours) ? colours : [])) {
+        const dot = document.createElement("span");
+        dot.style.cssText = `width:${d}px;height:${d}px;border-radius:${Math.round(d * 0.3)}px;background:${c};`;
+        chip.appendChild(dot);
+      }
+      box.appendChild(chip); this._chips.push(chip);
+    }
+  }
+  registerContentAnimation(masterTl) {
+    this._chips.forEach((chip, i) => {
+      masterTl.fromTo(chip, { opacity: 0, scale: 0.8, y: 10 }, { opacity: 1, scale: 1, y: 0, duration: 0.45,
+        ease: "back.out(1.6)", immediateRender: false }, this.at + i * this.stagger);
+    });
+  }
+}
+
 // ── Node Factory ──────────────────────────────────────────────────────────────
 function createNodeFromSpec(nodeData) {
   if (!nodeData) return null;
@@ -1310,6 +1454,9 @@ function createNodeFromSpec(nodeData) {
   else if (type === "cursor")                                node = new CursorNode(nodeData);
   else if (type === "ui_pill" || type === "pill")            node = new UIPillNode(nodeData);
   else if (type === "ui_input")                              node = new UIInputNode(nodeData);
+  else if (type === "ui_checklist")                          node = new UIChecklistNode(nodeData);
+  else if (type === "ui_window")                             node = new UIWindowNode(nodeData);
+  else if (type === "ui_swatches")                           node = new UISwatchesNode(nodeData);
   else if (type === "orb")                                   node = new OrbNode(nodeData);
   else if (type === "spline_tree")                           node = new SplineTreeNode(nodeData);
   else if (type === "particle_field")                        node = new ParticleFieldNode(nodeData);
@@ -1342,6 +1489,9 @@ window.OrbNode          = OrbNode;
 window.CursorNode       = CursorNode;
 window.UIPillNode       = UIPillNode;
 window.UIInputNode      = UIInputNode;
+window.UIChecklistNode  = UIChecklistNode;
+window.UIWindowNode     = UIWindowNode;
+window.UISwatchesNode   = UISwatchesNode;
 window.SplineTreeNode   = SplineTreeNode;
 window.ParticleFieldNode = ParticleFieldNode;
 window.createNodeFromSpec = createNodeFromSpec;

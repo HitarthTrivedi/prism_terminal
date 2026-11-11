@@ -81,6 +81,15 @@ _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
   ui_input         — width, height, placeholder, text (types itself from
                       reveal_start at type_rate), send_at (the send button turns
                       from grey to ink). A prompt box.
+  ui_checklist     — items: [{"label","sub","color","at","fill"}], width, font_size.
+                      Rows of work in progress — a coloured dot, a label, a quieter
+                      sub-line, and an underline that fills from "at" over "fill" seconds.
+  ui_window        — width, height, title, timecode, scrubber, progress, play_at,
+                      play_for, content_fill, children. An application window with a
+                      title bar and a scrubber; children sit inside it (positions
+                      relative to its centre). The product's own output, on screen.
+  ui_swatches      — groups: [[colour, ...], ...], at, stagger. A row of palette chips
+                      that pop in one after another — a variation being offered.
   shape_rect       — position, width, height, radius, fill, is_glass (optional).
                       For hairlines, pills, badges and chat bubbles. It is the
                       WRONG primitive for a background or a card: a flat

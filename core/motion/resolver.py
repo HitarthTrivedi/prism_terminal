@@ -182,6 +182,23 @@ def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
                     seg["at"] = float(seg.get("at", 0.0) or 0.0) + offset
                 except (TypeError, ValueError):
                     seg["at"] = offset
+    if node_type == "ui_checklist" and isinstance(node.get("items"), list):
+        for it in node["items"]:
+            if isinstance(it, dict):
+                try:
+                    it["at"] = float(it.get("at", 0.0) or 0.0) + offset
+                except (TypeError, ValueError):
+                    it["at"] = offset
+    if node_type == "ui_window":
+        try:
+            node["play_at"] = float(node.get("play_at", 0.0) or 0.0) + offset
+        except (TypeError, ValueError):
+            node["play_at"] = offset
+    if node_type == "ui_swatches":
+        try:
+            node["at"] = float(node.get("at", 0.0) or 0.0) + offset
+        except (TypeError, ValueError):
+            node["at"] = offset
     if node_type == "ui_input" and node.get("send_at") is not None:
         try:
             node["send_at"] = float(node["send_at"]) + offset

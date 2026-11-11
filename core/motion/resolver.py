@@ -211,6 +211,34 @@ def _continuity_manifest(scenes: List[Dict[str, Any]]) -> Dict[str, List[Dict[st
     return groups
 
 
+_BACKDROP_KEYS = ("spotlight", "vignette_strength", "grain_opacity", "grid", "particles")
+
+
+def _auto_look(spec: Dict[str, Any]) -> None:
+    """A light background gets the flat "paper" look unless the author chose
+    one or set any backdrop value themselves.
+
+    The runtime's only look used to be a dark-tech one — a cyan spotlight
+    fading to navy, a scrolling grid, cyan particles, a 0.58 vignette — and it
+    was painted over every film whatever its background, so a light page came
+    out a blue-grey wash (study of 11-12 Nov 2026). Nobody asks for a navy
+    spotlight on white; a light background is the signal.
+    """
+    project = spec.get("project")
+    if not isinstance(project, dict):
+        return
+    visual = spec.get("visual") if isinstance(spec.get("visual"), dict) else {}
+    if project.get("look") or visual.get("look") or any(k in visual for k in _BACKDROP_KEYS):
+        return
+    bg = project.get("background")
+    if not isinstance(bg, str):
+        return
+    from .inspect import _luma
+    lum = _luma(bg)
+    if lum is not None and lum >= 180:
+        spec["project"] = dict(project, look="paper")
+
+
 def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     """Preprocesses and enriches a validated Motion Specification.
     - Resolves semantic targets in camera tracks
@@ -240,6 +268,7 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     spec = dict(spec)
     scenes = spec.get("scenes", [])
     camera = spec.get("camera", {})
+    _auto_look(spec)
 
     assets_table = spec.get("_assets")
     if assets_table:

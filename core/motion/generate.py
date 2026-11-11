@@ -50,6 +50,19 @@ decisions — and make a genuinely different decision than the last brief
 that felt similar, the same way rule 4 below asks for genuinely different
 easing choices scene to scene."""
 
+_LOOK_GUIDANCE = """LOOK — set project.look, and let the background colour agree with it:
+  paper — a flat light page (an off-white like #FAF9F6, hairline shadows). The
+          default for products, services, explainers, anything friendly or
+          premium. Colour is punctuation, not a field: mostly page, one or two
+          accents. Type and interface (ui_input, ui_pill, cursor) carry it.
+  ink   — a flat dark page. For a serious, cinematic or luxury piece.
+  tech  — the dark-tech backdrop: a cyan spotlight, a scrolling grid, drifting
+          particles, a vignette. Only when the subject is genuinely technical
+          and you want that atmosphere; it is NOT a neutral default and it
+          turns a light background blue-grey.
+A light background with no look is treated as paper."""
+
+
 _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
   text             — content, position, font_size, font_weight, fill, mode (see TEXT MODES).
                       A long headline may use "\\n" for a manual line break —
@@ -474,6 +487,7 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         f"WHAT THE CLIENT ASKED FOR:\n{request}"
         + brand_note + script_note + spine_note + "\n\n"
         + _PALETTE_GUIDANCE + "\n\n"
+        + _LOOK_GUIDANCE + "\n\n"
         + _rulebook(skeleton) + "\n\n"
         "This is turn one of a conversation. Right now, name the project "
         "settings, the camera's overall intent, and a STORYBOARD — one row "
@@ -485,7 +499,7 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         "nothing before or after it:\n"
         "{\n"
         '  "project": {"width": 1080, "height": 1920, "fps": 30, '
-        '"duration": 8.0, "background": "#07091A",\n'
+        '"duration": 8.0, "background": "<a hex>", "look": "paper|ink|tech",\n'
         '    "palette": {"bg_a": "...", "bg_b": "...", "ink": "...", '
         '"accent": "...", "accent2": "..."},\n'
         '    "type": {"display_font": "...", "body_font": "...", '

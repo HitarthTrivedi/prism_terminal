@@ -1110,8 +1110,11 @@ function _caretEl(size, colour) {
   const holder = document.createElement("span");
   holder.style.cssText = "display:inline-block;width:0;position:relative;visibility:hidden;";
   const bar = document.createElement("span");
-  bar.style.cssText = `position:absolute;left:${Math.round(size * 0.06)}px;top:${Math.round(size * 0.12)}px;`
-    + `width:${Math.max(2, Math.round(size * 0.07))}px;height:${Math.round(size * 0.84)}px;background:${colour};`;
+  // The holder is a zero-height inline-block, so it sits ON the baseline; the
+  // bar hangs from the baseline UP (bottom:, not top:) — from a little below
+  // it, past the cap height. Anchoring it with top: put it under the text.
+  bar.style.cssText = `position:absolute;left:${Math.round(size * 0.06)}px;bottom:${-Math.round(size * 0.18)}px;`
+    + `width:${Math.max(2, Math.round(size * 0.07))}px;height:${Math.round(size * 0.95)}px;background:${colour};`;
   holder.appendChild(bar);
   return holder;
 }

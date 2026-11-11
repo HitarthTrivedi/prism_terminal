@@ -68,6 +68,18 @@ def _node_bounds(node: dict, canvas_w: int, canvas_h: int) -> tuple[float, float
         line_height = float(node.get("line_height", 1.25) or 1.25)
         w = max(font_size, max((len(ln) for ln in lines), default=0) * font_size * 0.55)
         h = max(font_size * 1.3, len(lines) * font_size * line_height)
+    elif node_type == "ui_pill":
+        fs = float(node.get("font_size", 28) or 28)
+        lead = fs * 0.85 if (node.get("check") or node.get("dot")) else 0.0
+        w = len(str(node.get("label", ""))) * fs * 0.56 + fs * 1.9 + lead
+        h = fs * 2.0
+    elif node_type == "cursor":
+        size = float(node.get("size", 44) or 44)
+        label = str(node.get("label", ""))
+        # The tip is the position; the pill hangs to its lower right.
+        left, top = x, y
+        return (left, top, left + size * 0.55 + len(label) * size * 0.2 + size * 0.6,
+                top + size * (1.0 if not label else 1.15))
     elif node_type == "shape_arrow":
         frm = node.get("from") or [x, y]
         to = node.get("to") or [x, y]

@@ -50,10 +50,37 @@ decisions — and make a genuinely different decision than the last brief
 that felt similar, the same way rule 4 below asks for genuinely different
 easing choices scene to scene."""
 
+_LOOK_GUIDANCE = """LOOK — set project.look, and let the background colour agree with it:
+  paper — a flat light page (an off-white like #FAF9F6, hairline shadows). The
+          default for products, services, explainers, anything friendly or
+          premium. Colour is punctuation, not a field: mostly page, one or two
+          accents. Type and interface (ui_input, ui_pill, cursor) carry it.
+  ink   — a flat dark page. For a serious, cinematic or luxury piece.
+  tech  — the dark-tech backdrop: a cyan spotlight, a scrolling grid, drifting
+          particles, a vignette. Only when the subject is genuinely technical
+          and you want that atmosphere; it is NOT a neutral default and it
+          turns a light background blue-grey.
+A light background with no look is treated as paper."""
+
+
 _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
   text             — content, position, font_size, font_weight, fill, mode (see TEXT MODES).
                       A long headline may use "\\n" for a manual line break —
-                      each line is centred and stacked automatically.
+                      each line is centred and stacked automatically. Optional
+                      "runs": [{"text","fill"|"gradient","weight"}] makes parts of
+                      one line differ in colour or weight (a highlighted word);
+                      "type_on": true with "type_rate" (characters/second) types
+                      it out with a caret that follows. Set "anchor" [0,0] to
+                      start from the left, [0.5,0.5] to centre.
+  cursor           — position (the pointer tip), label (a role or name), color,
+                      size, path: [{"at","to":[x,y],"duration","easing","click"}].
+                      A labelled pointer that travels and clicks — for a film
+                      about something being operated, not for decoration.
+  ui_pill          — label, dot (a colour) or check (true = green tick), font_size,
+                      fill, ink. A status chip: "Rendering", "Finished".
+  ui_input         — width, height, placeholder, text (types itself from
+                      reveal_start at type_rate), send_at (the send button turns
+                      from grey to ink). A prompt box.
   shape_rect       — position, width, height, radius, fill, is_glass (optional).
                       For hairlines, pills, badges and chat bubbles. It is the
                       WRONG primitive for a background or a card: a flat
@@ -144,7 +171,10 @@ ANIMATION, on any node via "animation" (all times are LOCAL to this scene, start
   different fixed "types" to pick from. "from"/"to" for x/y are relative
   OFFSETS from the node's own resting position (20 means 20px away from
   where it settles, not an absolute coordinate); scale/scaleX/scaleY/
-  rotation/skewX/skewY/opacity work the same way; blur/clipInset/
+  rotation/skewX/skewY work the same way — a scale tween is an offset from
+  the node's own scale, so a pop that settles at 1x is from 0.08 to 0 (it
+  starts 1.08x), a grow-in is from -0.2 to 0; opacity is ABSOLUTE, 0 to 1;
+  blur/clipInset/
   backgroundPositionX/strokeDashoffset are absolute values in their own
   units (blur in px, clipInset 0-100 as percent revealed, strokeDashoffset
   in the node's own path-length units — leave it to the runtime's own
@@ -460,6 +490,7 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         f"WHAT THE CLIENT ASKED FOR:\n{request}"
         + brand_note + script_note + spine_note + "\n\n"
         + _PALETTE_GUIDANCE + "\n\n"
+        + _LOOK_GUIDANCE + "\n\n"
         + _rulebook(skeleton) + "\n\n"
         "This is turn one of a conversation. Right now, name the project "
         "settings, the camera's overall intent, and a STORYBOARD — one row "
@@ -471,7 +502,7 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         "nothing before or after it:\n"
         "{\n"
         '  "project": {"width": 1080, "height": 1920, "fps": 30, '
-        '"duration": 8.0, "background": "#07091A",\n'
+        '"duration": 8.0, "background": "<a hex>", "look": "paper|ink|tech",\n'
         '    "palette": {"bg_a": "...", "bg_b": "...", "ink": "...", '
         '"accent": "...", "accent2": "..."},\n'
         '    "type": {"display_font": "...", "body_font": "...", '
@@ -503,7 +534,22 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         "is the failure this stage exists to prevent. `camera.tracks` is "
         "for the WHOLE graphic; each scene's \"shot\" (see SHOT above) "
         "carries on from it.")
+        + _length_note(request)
     )
+
+
+def _length_note(request: str) -> str:
+    """The client's own length, when the request names one, stated after
+    the profile's band so it wins. A 25 s ask used to come back as 15 s
+    because only the band was ever read (study of 11 Nov 2026, M6)."""
+    from ..length import requested_seconds
+    secs = requested_seconds(request)
+    if not secs:
+        return ""
+    return (f"\n\nLENGTH: the client asked for {secs:g} seconds. The rows' "
+            f'"seconds" must add up to about {secs:g} — within 15% of it — '
+            "whatever the band above says; scale every beat's seconds "
+            "together rather than padding one scene.")
 
 
 def _brand_launch_storyboard_close() -> str:

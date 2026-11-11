@@ -7091,9 +7091,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         else:
             try:
                 from . import reel as _reel
+                from . import length as _length
                 st, an, qs = stages[feeder]
                 stages[feeder] = (st, an, qs[:-1] + [
-                    qs[-1] + "\n\n" + _reel.spec_instructions()])
+                    qs[-1] + "\n\n" + _reel.spec_instructions(
+                        requested=_length.requested_seconds(query))])
                 spec_feeder = feeder
                 ui.info(f"🎬  {stages[local_reel_at][1]} renders locally — "
                         f"{an} will write the scene spec for it")
@@ -8674,7 +8676,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 if stage_idx == motion_feeder and texts:
                     from . import motion as _motion_pkg
                     from .motion import generate as _motion
-                    from .motion import inspect as _motion_inspect
+                    from .motion import measure as _motion_measure
                     from . import assets as _assets
 
                     scene_wait = max(int(agent_cfg.get("wait_time", 60)), 180)
@@ -8714,7 +8716,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             assets=motion_assets_listing,
                             assets_table=motion_assets_table,
                             skeleton=motion_skeleton or "cinematic_glass",
-                            check=_motion_inspect.inspect,
+                            # The estimate plus, when a browser is here, the
+                            # scene laid out for real with the camera applied
+                            # (core.motion.measure — the 11 Nov 2026 study's M4).
+                            check=_motion_measure.inspect_all,
                             log=lambda m: ui.info(f"   {m}"),
                             should_stop=stage_halt,
                             on_scene=lambda i, n: emit(
@@ -8739,6 +8744,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         else:
                             ui.ok(f"   {len(validated['scenes'])} scene(s) "
                                   "written")
+                            # Whatever the model wrote, no line is left wider
+                            # than the frame (core.motion.measure.fit_to_frame).
+                            # A browser problem here must never cost the run.
+                            try:
+                                validated, _fits = _motion_measure.fit_to_frame(validated)
+                                for _f in _fits:
+                                    ui.info(f"   ↔  fitted {_f}")
+                            except Exception as _e:
+                                ui.warn(f"   couldn't check the text fits the frame ({_e})")
                             stage_responses = [_json.dumps(validated, ensure_ascii=False)]
 
                 # This stage feeds a renderer, so "it answered" isn't enough —
@@ -8758,6 +8772,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # there.
                 if stage_idx == spec_feeder:
                     from . import reel as _reel
+                    from . import length as _length
+                    asked_secs = _length.requested_seconds(query)
                     spec_texts = [t for t in texts if _reel.has_spec(t)] if texts else []
                     if spec_texts:
                         # LAST, not longest: the prompt we typed carries an
@@ -8772,7 +8788,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         # way to catch them is to look, and the only way to fix
                         # them is to say precisely what is wrong.
                         faults = _reel.lint_spec(
-                            _reel.parse_spec(stage_responses[0]))
+                            _reel.parse_spec(stage_responses[0]), requested=asked_secs)
                         if faults:
                             ui.warn(f"the scene spec has {len(faults)} problem(s) "
                                     "— sending them back to be fixed")
@@ -8788,7 +8804,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 expect='"scenes"')
                             better = [t for t in again if _reel.has_spec(t)]
                             if better:
-                                left = _reel.lint_spec(_reel.parse_spec(better[-1]))
+                                left = _reel.lint_spec(_reel.parse_spec(better[-1]),
+                                                       requested=asked_secs)
                                 # Keep the second attempt only if it is
                                 # genuinely cleaner — a "fix" that trades six
                                 # faults for seven is not a fix.
@@ -8847,7 +8864,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         api_prompt = (
                             (context or "")
                             + "\n\n".join(questions)
-                            + "\n\n" + _reel.spec_instructions()
+                            + "\n\n" + _reel.spec_instructions(requested=asked_secs)
                             + "\n\nReply with ONLY the JSON object — first "
                               "character '{', last '}'.")
                         try:

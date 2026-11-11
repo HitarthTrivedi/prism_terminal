@@ -484,6 +484,10 @@ def storyboard_instructions(request: str, brand: dict | None = None,
                       "copy inside its margins.")
     from . import spine as _spine
     spine_note = ""
+    if skeleton == STORY_SKELETON:
+        from . import story as _story
+        from ..length import requested_seconds as _secs
+        spine_note = "\n\n" + _story.storyboard_text(_secs(request) or 22.0)
     if skeleton == "cinematic_glass":
         n_rows = 7
         if script and script.strip():
@@ -535,7 +539,7 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         '  "storyboard": [\n'
         '    {"scene": 1, "seconds": 2.5,\n'
         '     "job": "what this scene is FOR in the argument",\n'
-        '     "beat": "gather",\n'
+        f'     "beat": "{"hook" if skeleton == STORY_SKELETON else "gather"}",\n'
         '     "caption": "the on-screen words for this beat (the script\'s line, verbatim)",\n'
         '     "subject": "what the carried subject IS and what STATE it is in here",\n'
         '     "look": "what is on screen and how it is composed — what is '
@@ -544,7 +548,8 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         'is still moving when the scene hands over"}\n'
         "  ]\n"
         "}\n\n"
-        + (_cinematic_glass_storyboard_close() if skeleton == "cinematic_glass"
+        + (_story_storyboard_close() if skeleton == STORY_SKELETON
+           else _cinematic_glass_storyboard_close() if skeleton == "cinematic_glass"
            else _brand_launch_storyboard_close() if skeleton == "brand_launch"
            else
         "3-6 scenes, 6-15 seconds total. ONE STORYBOARD ROW PER SCENE. Give "
@@ -581,6 +586,19 @@ def _brand_launch_storyboard_close() -> str:
         "brand. `camera.tracks` is for the WHOLE graphic; each scene's "
         "\"shot\" (see SHOT above) carries on from it."
     )
+
+
+STORY_SKELETON = "story"
+
+
+def _story_storyboard_close() -> str:
+    return (
+        "EXACTLY 5 scenes, one per part of THE STORY above, in order, 14-30 seconds total. Each "
+        "row's `look` names the interface it uses (ui_input, cursor, ui_checklist, ui_window, "
+        "ui_swatches, ui_pill) and what is on the page; its `motion` says what moves AND where it "
+        "holds. `camera.tracks` is for the WHOLE film: one continuous canvas, a few slow moves, "
+        "never a reset to the same zoom at every cut. Set project.look to paper unless the brand "
+        "is dark.")
 
 
 def _cinematic_glass_storyboard_close() -> str:
@@ -689,6 +707,8 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
         + (f"ITS SUBJECT: {subject}\n" if subject else "")
         + (("\n" + __import__("core.motion.spine", fromlist=["recipe_text"]).recipe_text(beat_name) + "\n")
            if beat_name and skeleton == "cinematic_glass" else "")
+        + (("\n" + __import__("core.motion.story", fromlist=["recipe_text"]).recipe_text(beat_name) + "\n")
+           if beat_name and skeleton == STORY_SKELETON else "")
         + (f"THE LOOK: {look}\n" if look else "")
         + (f"THE MOTION: {motion}\n" if motion else "")
         + f"\nDuration: {seconds:g} seconds. All this scene's animation "
@@ -796,6 +816,9 @@ def repair_prompt(idx: int, faults: list[str], round_no: int) -> str:
 
 def beat_check(scene: dict, row: dict, skeleton: str | None) -> list[str]:
     """The scene against its storyboard row's beat (core.motion.spine)."""
+    if skeleton == STORY_SKELETON and isinstance(row, dict):
+        from . import story as _story
+        return _story.beat_faults(scene, str(row.get("beat", "")).strip())
     if skeleton != "cinematic_glass" or not isinstance(row, dict):
         return []
     from . import spine as _spine

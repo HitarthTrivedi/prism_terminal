@@ -8753,6 +8753,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     ui.info(f"   ↔  fitted {_f}")
                             except Exception as _e:
                                 ui.warn(f"   couldn't check the text fits the frame ({_e})")
+                            # The film's own sound, generated from its timeline
+                            # (core.motion.sfx): a tick per typed character, a
+                            # click per press, a whoosh per camera move. On by
+                            # default for films made here; "none" turns it off.
+                            validated.setdefault("project", {}).setdefault("sound", "ui")
                             # How the film breathes: holds and bursts, measured
                             # at low resolution in the real runtime. Reported,
                             # not repaired — fixing it means asking the writer

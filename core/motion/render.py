@@ -349,15 +349,29 @@ def _mux_production_audio(resolved_spec: Dict[str, Any], video_path: str) -> str
     """Attach the spec's production music/voice to the finished film, in
     place. No audio named means the silent file is the deliverable."""
     audio = resolved_spec.get("audio") if isinstance(resolved_spec, dict) else None
-    if not isinstance(audio, dict) or not (audio.get("music") or audio.get("voiceover")):
+    audio = audio if isinstance(audio, dict) else {}
+    root, ext = os.path.splitext(video_path)
+    music, voice, volume = audio.get("music"), audio.get("voiceover"), float(audio.get("music_volume", 0.25))
+    sfx_path = None
+    # project.sound = "ui": the film's own sound, generated from its timeline
+    # (core.motion.sfx) — a tick per typed character, a click per press, a whoosh
+    # per camera move. Music the author supplied is theirs and wins; with a voice-
+    # over the effects sit under it like any background track.
+    if str((resolved_spec.get("project") or {}).get("sound", "")).lower() in ("ui", "sfx") and not music:
+        from . import sfx as _sfx
+        sfx_path = _sfx.build(resolved_spec, root + ".sfx.wav")
+        if sfx_path:
+            music, volume = sfx_path, (0.8 if voice else 1.0)
+    if not (music or voice):
         return video_path
     from .audio import mux_audio_and_video
-    root, ext = os.path.splitext(video_path)
-    muxed = mux_audio_and_video(video_path, audio.get("voiceover"), root + ".audio" + ext,
-                                bgm_path=audio.get("music"),
-                                bgm_volume=float(audio.get("music_volume", 0.25)))
-    if muxed != video_path and os.path.isfile(muxed):
-        os.replace(muxed, video_path)
+    try:
+        muxed = mux_audio_and_video(video_path, voice, root + ".audio" + ext, bgm_path=music, bgm_volume=volume)
+        if muxed != video_path and os.path.isfile(muxed):
+            os.replace(muxed, video_path)
+    finally:
+        if sfx_path and os.path.isfile(sfx_path):
+            os.remove(sfx_path)
     return video_path
 
 

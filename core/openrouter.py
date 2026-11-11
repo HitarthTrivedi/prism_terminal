@@ -63,7 +63,7 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
                      attachments: list[dict] | None = None,
                      temperature: float = 0.3, timeout: int = 180,
                      retries: int = 1, max_tokens: int | None = None,
-                     extra: dict | None = None) -> str:
+                     extra: dict | None = None, usage_sink: dict | None = None) -> str:
     """One OpenRouter completion. `model` is an OpenRouter model id, e.g.
     "anthropic/claude-sonnet-5.5" — addons/boq/agents.py owns the mapping
     from a Prism Agent's display name to the model id actually sent here.
@@ -109,6 +109,10 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
         payload["max_tokens"] = max_tokens
     if extra:
         payload.update(extra)
+    if usage_sink is not None:
+        # `usage_sink` is filled with OpenRouter's own usage block (tokens and
+        # `cost` in dollars) so a caller can keep a running spend and stop at a cap.
+        payload["usage"] = {"include": True}
     last = ""
     for attempt in range(retries + 1):
         try:
@@ -125,6 +129,8 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
             body = {}
 
         if resp.status_code == 200 and body.get("choices"):
+            if usage_sink is not None:
+                usage_sink.update(body.get("usage") or {})
             msg = body["choices"][0]["message"]
             # A "thinking" model can spend its whole token budget on its
             # own reasoning and return a null `content` (finish_reason

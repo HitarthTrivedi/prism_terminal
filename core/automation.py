@@ -8768,6 +8768,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     ui.warn(f"   ♪  rhythm: {_f}")
                             except Exception as _e:
                                 ui.warn(f"   couldn't measure the film's rhythm ({_e})")
+                            # A vision model's look at each scene's settled frame
+                            # (core.motion.critic). OFF unless config `motion_critic`
+                            # is true: it sends frames of the client's film to a
+                            # third party and spends the customer's OpenRouter credit
+                            # (about $0.001 a film). Reported, not repaired.
+                            try:
+                                from .motion import critic as _critic
+                                if _critic.enabled(cfg):
+                                    _r = _critic.critique(_critic.settled_frames(validated), cfg)
+                                    if _r["skipped"]:
+                                        ui.warn(f"   👁  critic: {_r['skipped']}")
+                                    else:
+                                        ui.info(f"   👁  critic: {len(_r['defects'])} point(s), ${_r['cost']:.4f}")
+                                        for _f in _critic.faults(_r["defects"])[:8]:
+                                            ui.warn(f"   👁  {_f}")
+                            except Exception as _e:
+                                ui.warn(f"   couldn't run the critic ({_e})")
                             stage_responses = [_json.dumps(validated, ensure_ascii=False)]
 
                 # This stage feeds a renderer, so "it answered" isn't enough —

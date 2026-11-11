@@ -27,25 +27,30 @@ from typing import Any, Dict, List, Optional
 BEATS: List[Dict[str, Any]] = [
     {"name": "hook", "share": 0.18, "energy": "build, then hold",
      "subject": "the name arrives on a quiet page and the camera does the work",
-     "recipe": ("a mostly empty page; the company's name typed out or revealed in large type "
-                "(text with type_on and a caret, or masked_reveal), perhaps one small descriptor "
-                "above it and a small mark; a slow camera push toward the name. End on a HOLD of "
-                "about a second — nothing drifting — so the name is read."),
-     "requires": {"text": 1}},
+     "recipe": ("a stranger must know within two seconds WHAT THIS IS FOR. So: the name AND, under "
+                "or beside it, ONE plain line saying what the business does and for whom, with a "
+                "concrete claim in it (a number, a speed, a promise: \"Precision parts, quoted the "
+                "same day\"). If the artwork list names a hero image of what the business makes, "
+                "show it — large — here; the viewer should SEE the product. The name arrives typed "
+                "or revealed on a quiet page; one slow camera push toward the focus. End on a HOLD "
+                "of about a second, nothing drifting, so it is read."),
+     "requires": {"text": 2}},
     {"name": "act", "share": 0.20, "energy": "build",
      "subject": "someone does the thing this business is for, typed or pressed",
      "recipe": ("the customer's action, shown as interface: a ui_input whose text types itself "
                 "with the request in the customer's own words (\"Send us the drawing\", \"Book a "
                 "table for four\"), and a cursor that travels to the send button and clicks it at "
                 "send_at. Keep the box large and the page empty around it. A moment of stillness "
-                "while it types is the point."),
+                "while it types is the point. Build tension: the request is specific, so the viewer "
+                "wonders how it will be answered."),
      "requires": {"any": ["ui_input", "cursor"]}},
     {"name": "promise", "share": 0.20, "energy": "build, then hold",
      "subject": "what happens for them, as work in progress, then one sentence",
      "recipe": ("a ui_checklist of three rows — the three things done for them, each with a short "
                 "label, a quieter sub-line, and a staggered \"at\" so they arrive one by one — then "
-                "a single sentence in large type that says what they get. HOLD on the sentence for "
-                "1.5 seconds or more."),
+                "a single sentence in large type that says what they get. The rows arrive FASTER "
+                "each time (their \"at\" gaps shrink) so it feels like momentum; then HOLD on the "
+                "sentence for 1.5 seconds or more."),
      "requires": {"ui_checklist": 2}},
     {"name": "proof", "share": 0.27, "energy": "build, then burst",
      "subject": "the result on screen, then a variation",
@@ -58,10 +63,11 @@ BEATS: List[Dict[str, Any]] = [
      "requires": {"ui_window": 1}},
     {"name": "payoff", "share": 0.15, "energy": "burst, then hold",
      "subject": "one decisive change, a done, the name and one way to reach them",
-     "recipe": ("a ui_pill with check true (\"Quote ready\", \"Table booked\") arriving centred; then "
-                "the name large and ONE contact line — a phone number or a web address, not both — "
-                "that fits the frame with room. End on a HOLD."),
-     "requires": {"ui_pill_check": 1}},
+     "recipe": ("the answer LANDS: a ui_pill with check true (\"Quote ready\", \"Table booked\") "
+                "arriving centred with \"hit\": true (a sound hit) and a scale pop, the one biggest "
+                "motion of the film; then the name large and ONE contact line — a phone number or "
+                "a web address, not both — that fits the frame with room. End on a HOLD."),
+     "requires": {"ui_pill_check": 1, "hit": 1}},
 ]
 
 _NAMES = [b["name"] for b in BEATS]
@@ -111,8 +117,9 @@ def beat_faults(scene: Dict[str, Any], name: str) -> List[str]:
     types = [str(n.get("type")) for n in nodes]
     out: List[str] = []
     req = b["requires"]
-    if req.get("text") and "text" not in types:
-        out.append(f'part "{name}" needs the name as text and the scene has none')
+    if req.get("text") and types.count("text") < req["text"]:
+        out.append(f'part "{name}" needs {req["text"]} text lines — the name AND one plain line saying what '
+                   f'the business does and for whom — and the scene has {types.count("text")}')
     if req.get("any") and not any(t in types for t in req["any"]):
         out.append(f'part "{name}" needs one of {", ".join(req["any"])} — the customer\'s action shown as '
                    "interface — and the scene has none")
@@ -126,4 +133,94 @@ def beat_faults(scene: Dict[str, Any], name: str) -> List[str]:
         out.append(f'part "{name}" needs a ui_window holding the demo object and the scene has none')
     if req.get("ui_pill_check") and not any(n.get("type") in ("ui_pill", "pill") and n.get("check") for n in nodes):
         out.append(f'part "{name}" needs a ui_pill with check true (the "done") and the scene has none')
-    return [f"{f} — {recipe_text(name).split('BUILD IT LIKE THIS: ')[-1][:260]}" for f in out]
+    if req.get("hit") and not any(n.get("hit") for n in nodes):
+        out.append(f'part "{name}" needs the answer to land with a sound: set "hit": true on the done pill')
+    return [f"{f} — {recipe_text(name).split('BUILD IT LIKE THIS: ')[-1][:520]}" for f in out]
+
+
+# ── what the eye does, what carries over, how it is shot ─────────────────────
+#
+# The first model-written story film (12 Nov 2026) had every part and still had
+# nowhere for the eye to land, nothing carried from scene to scene, a generic
+# camera, and an opening a stranger could not read. These check facts about
+# those, so they can be sent back like a missing prompt box.
+
+_BACKGROUND_TYPES = ("light_field", "depth_layer", "particle_field", "spline_tree")
+
+
+def _foreground(scene: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [n for n in scene.get("nodes") or []
+            if isinstance(n, dict) and n.get("type") not in _BACKGROUND_TYPES
+            and n.get("layer") not in ("background", "finish")]
+
+
+def _area(node: Dict[str, Any], width: int, height: int) -> float:
+    from .inspect import _node_bounds
+    b = _node_bounds(node, width, height)
+    return max(0.0, (b[2] - b[0]) * (b[3] - b[1])) if b else 0.0
+
+
+def focus_faults(scene: Dict[str, Any], row: Optional[Dict[str, Any]] = None,
+                 canvas: tuple = (1080, 1920)) -> List[str]:
+    """Exactly one node is the focus, it is clearly the biggest thing, and the
+    shot goes to it."""
+    nodes = list(_walk(scene))
+    flagged = [n for n in nodes if n.get("focus")]
+    said = str((row or {}).get("focus", "")).strip()
+    out: List[str] = []
+    if not flagged:
+        return [f'the scene marks no focus — set "focus": true on the ONE node the eye must land on'
+                + (f' ({said})' if said else "") + " — and make it the biggest thing on the page"]
+    if len(flagged) > 1:
+        return [f'{len(flagged)} nodes are marked focus ({", ".join(str(n.get("id")) for n in flagged)}); '
+                "exactly one — a page with two focal points has none"]
+    focus = flagged[0]
+    fid = str(focus.get("id", ""))
+    f_area = _area(focus, *canvas)
+    others = [n for n in _foreground(scene) if n is not focus and not any(c is focus for c in _walk({"nodes": [n]}))]
+    biggest = max(((_area(n, *canvas), n) for n in others), key=lambda t: t[0], default=(0.0, None))
+    if biggest[1] is not None and f_area > 0 and f_area < 1.5 * biggest[0]:
+        out.append(f'the focus "{fid}" is not clearly the biggest thing: "{biggest[1].get("id")}" is '
+                   f"{biggest[0] / f_area:.1f}x its size on the page. Make the focus at least 1.5x the next "
+                   "biggest thing, or make the other smaller, lighter or later")
+    shot = scene.get("shot") if isinstance(scene.get("shot"), dict) else {}
+    target = shot.get("target")
+    if shot.get("intent") in ("push", "macro", "reveal") and isinstance(target, str) and target and target != fid:
+        out.append(f'the shot goes toward "{target}" but the focus is "{fid}" — the camera should lead the eye to the focus')
+    return out
+
+
+def continuity_faults(scene: Dict[str, Any], prev_scene: Optional[Dict[str, Any]], is_last: bool = False) -> List[str]:
+    """Something carries from the last scene into this one, and (unless this is
+    the last) something is offered to the next."""
+    keys = {str(n["continuity_key"]) for n in _walk(scene) if n.get("continuity_key")}
+    out: List[str] = []
+    if prev_scene is not None:
+        prev = {str(n["continuity_key"]) for n in _walk(prev_scene) if n.get("continuity_key")}
+        if prev and not (prev & keys):
+            out.append(f'nothing carries over from the last scene: reuse its continuity_key ({", ".join(sorted(prev))}) '
+                       "on a node here, at a pose within reach of where it left, so the cut is one continuous film")
+    if not is_last and not keys:
+        out.append('nothing is offered to the next scene: give the carried node (the name, the mark, the box, the '
+                   'window) a stable "continuity_key"')
+    return out
+
+
+def direction_faults(scenes: List[Dict[str, Any]]) -> List[str]:
+    """The camera is directed across the film, not repeated: several kinds of
+    shot, no three alike in a row, and it does not end on a push."""
+    intents = [str((s.get("shot") or {}).get("intent", "")) for s in scenes if isinstance(s, dict)]
+    named = [i for i in intents if i]
+    if len(named) < 3:
+        return []
+    out: List[str] = []
+    if len(set(named)) < 3:
+        out.append(f"the camera is one idea ({', '.join(sorted(set(named)))}): use at least three kinds of shot — "
+                   "establish, push to the focus, pull to reveal, hold to read")
+    for i in range(len(intents) - 2):
+        if intents[i] and intents[i] == intents[i + 1] == intents[i + 2]:
+            out.append(f'three scenes in a row use the "{intents[i]}" shot (scenes {i + 1}-{i + 3}); vary it')
+            break
+    if intents[-1] == "push":
+        out.append('the film ends on a "push": end on a "resolve", "pull" or "hold" so the answer settles')
+    return out

@@ -50,6 +50,9 @@ def cues(resolved: dict[str, Any]) -> list[dict[str, Any]]:
             add(start, "whoosh_soft", 0.7)
         for node in _walk(sc.get("nodes")):
             kind = node.get("type")
+            if node.get("hit"):                      # the answer landing: a low hit as the node enters
+                enter = (node.get("animation") or {}).get("enter") or {}
+                add(enter.get("time", start), "hit", 1.0)
             if kind in ("text", "ui_input"):
                 text = (("".join(str(r.get("text", "")) for r in node["runs"]) if node.get("runs") else str(node.get("content", "")))
                         if kind == "text" else str(node.get("text", "")))
@@ -166,6 +169,18 @@ def _whoosh(rng, gain, seconds):
     return (y * np.sin(np.pi * u) ** 2 * 0.9 * gain).astype("float32")
 
 
+def _hit(rng, gain):
+    import numpy as np
+    n = int(0.55 * SR)
+    t = np.arange(n) / SR
+    f = 48.0 + 80.0 * np.exp(-t / 0.07)                    # a body that drops from ~128 Hz to ~48 Hz
+    body = np.sin(2 * np.pi * np.cumsum(f) / SR) * _env(n, 0.14) * 0.62
+    m = int(0.03 * SR)
+    snap = rng.standard_normal(m).astype("float32") * _env(m, 0.006) * 0.35
+    body[:m] += snap
+    return (body * gain).astype("float32")
+
+
 def _bed(seconds):
     import numpy as np
     n = int(seconds * SR)
@@ -193,6 +208,8 @@ def synthesize(cue_list: list[dict[str, Any]], seconds: float, bed: bool = True)
             clip = _pop(rng, gain)
         elif kind == "chime":
             clip = _chime(rng, gain)
+        elif kind == "hit":
+            clip = _hit(rng, gain)
         elif kind == "whoosh":
             clip = _whoosh(rng, gain, 0.7)
         elif kind == "whoosh_soft":

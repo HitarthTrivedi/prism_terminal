@@ -149,6 +149,9 @@ _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
                       a product photo, a screenshot. Drawn clipped to a rounded
                       rect; SVG marks work the same way as photos.
 
+  focus           — true on ONE node per scene: what the eye must land on first. It must
+                    be the biggest thing on the page and the shot goes toward it.
+  hit             — true: a low sound hit as this node enters. For the answer landing.
   continuity_key  — optional stable name for the visual subject that survives
                     across scene boundaries (for example "signal", "product",
                     or "orb"). Node ids remain unique per scene; reuse this
@@ -407,6 +410,19 @@ def _scene_rules(skeleton: str | None) -> str:
         "behind its own photo) is the one exception — that pairing is "
         "supposed to share a position.\n"
     )
+    if skeleton == STORY_SKELETON:
+        rules += (
+            '10. FOCUS: mark exactly ONE node "focus": true — what the eye must land on first. Make it at '
+            "least 1.5x the size on the page of anything else; everything else is quieter (smaller, lighter, "
+            "or arriving later). The scene's shot goes toward it.\n"
+            '11. CONTINUITY: give the node that carries the film (the name, a mark, the prompt box, the '
+            'window) a stable "continuity_key", and reuse the SAME key on a node in the next scene at a '
+            "pose within reach of where it left. Open each scene by continuing the last one's motion.\n"
+            '12. SHOT: every scene names a "shot" next to "nodes" — push toward the focus, pull to reveal, '
+            "hold to read — and the film uses at least three kinds.\n"
+            "13. HYPE: the opening states a concrete claim; the build speeds up; the answer lands with "
+            '"hit": true and the biggest motion of the film; then everything HOLDS. Never fill a hold with '
+            "decoration.\n")
     if skeleton in ("brand_launch", "cinematic_glass"):
         rules += ('10. Give every node a "layer" (see LAYERS above) — '
                   "background and foreground are both required in every "
@@ -545,7 +561,11 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         f'     "beat": "{"hook" if skeleton == STORY_SKELETON else "gather"}",\n'
         '     "caption": "the on-screen words for this beat (the script\'s line, verbatim)",\n'
         '     "subject": "what the carried subject IS and what STATE it is in here",\n'
-        '     "look": "what is on screen and how it is composed — what is '
+        + ('     "focus": "the ONE thing the eye must land on in this scene — the node you will mark focus: true",\n'
+           '     "carry": "what carries into the next scene (a node with a continuity_key) and where it leaves from",\n'
+           '     "shot": "hold|reveal|push|pull|orbit|parallax|macro|resolve — and why it fits this beat",\n'
+           if skeleton == STORY_SKELETON else "")
+        + '     "look": "what is on screen and how it is composed — what is '
         'big, what is a supporting label, what kind of node carries it",\n'
         '     "motion": "what moves, in what order, from where — and what '
         'is still moving when the scene hands over"}\n'
@@ -592,6 +612,17 @@ def _brand_launch_storyboard_close() -> str:
 
 
 STORY_SKELETON = "story"
+
+
+def _has_art(assets_table) -> bool:
+    return bool(assets_table) and any(str(k).startswith("art") for k in assets_table)
+
+
+def _canvas(project) -> tuple:
+    try:
+        return int(project.get("width", 1080) or 1080), int(project.get("height", 1920) or 1920)
+    except (AttributeError, TypeError, ValueError):
+        return 1080, 1920
 
 
 def _story_storyboard_close() -> str:
@@ -647,10 +678,11 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
     except (TypeError, ValueError):
         seconds = 3.0
     role_header = ""
-    if skeleton in ("brand_launch", "cinematic_glass"):
-        role = _scene_role(idx)
+    if skeleton in ("brand_launch", "cinematic_glass", STORY_SKELETON):
+        role = _scene_role(idx) if skeleton != STORY_SKELETON else ""
         role_header = ("PROFILE: CINEMATIC GLASS — one continuous visual spine.\n\n"
                        if skeleton == "cinematic_glass"
+                       else "PROFILE: STORY — five parts of one continuous film.\n\n" if skeleton == STORY_SKELETON
                        else f"ROLE: {role} — {_ROLE_BRIEF[role]}\n\n")
         if handoff:
             role_header += (
@@ -708,6 +740,12 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
            "exactly these words (a manual line break is fine); a scene "
            "whose text says something else is sent back.\n" if caption else "")
         + (f"ITS SUBJECT: {subject}\n" if subject else "")
+        + ((f'ITS FOCUS: {row.get("focus")} — mark this node "focus": true; it is the biggest thing here and '
+            "the shot goes toward it.\n" if row.get("focus") else "")
+           + (f'IT CARRIES: {row.get("carry")} — a node with a stable continuity_key, reused in the next scene.\n'
+              if row.get("carry") else "")
+           + (f'ITS SHOT: {row.get("shot")}\n' if row.get("shot") else "")
+           if skeleton == STORY_SKELETON else "")
         + (("\n" + __import__("core.motion.spine", fromlist=["recipe_text"]).recipe_text(beat_name) + "\n")
            if beat_name and skeleton == "cinematic_glass" else "")
         + (("\n" + __import__("core.motion.story", fromlist=["recipe_text"]).recipe_text(beat_name) + "\n")
@@ -817,11 +855,20 @@ def repair_prompt(idx: int, faults: list[str], round_no: int) -> str:
             + (" Keep every node that was not named." if round_no > 0 else ""))
 
 
-def beat_check(scene: dict, row: dict, skeleton: str | None) -> list[str]:
+def beat_check(scene: dict, row: dict, skeleton: str | None, prev_scene: dict | None = None,
+               is_last: bool = False, has_art: bool = False,
+               canvas: tuple = (1080, 1920)) -> list[str]:
     """The scene against its storyboard row's beat (core.motion.spine)."""
     if skeleton == STORY_SKELETON and isinstance(row, dict):
         from . import story as _story
-        return _story.beat_faults(scene, str(row.get("beat", "")).strip())
+        name = str(row.get("beat", "")).strip()
+        out = _story.beat_faults(scene, name)
+        out += _story.focus_faults(scene, row, canvas)
+        out += _story.continuity_faults(scene, prev_scene, is_last)
+        if name == "hook" and has_art and not any(n.get("type") == "image" for n in _story._walk(scene)):
+            out.append("the artwork list has a hero image of what the business makes: show it, large, in the "
+                       "hook, so a stranger can SEE what this is for")
+        return out
     if skeleton != "cinematic_glass" or not isinstance(row, dict):
         return []
     from . import spine as _spine
@@ -835,7 +882,7 @@ def shot_faults(scene: dict, skeleton: str | None, has_camera: bool = False) -> 
     A storyboard that authored its own `camera.tracks` is exempt — the
     resolver plays that curve when no scene names a shot, and asking for
     shots on top of it cost the third run two wasted repair rounds a scene."""
-    if skeleton != "cinematic_glass" or scene.get("shot") or has_camera:
+    if skeleton not in ("cinematic_glass", STORY_SKELETON) or scene.get("shot") or has_camera:
         return []
     return ['the scene names no "shot" — add one (see SHOT: hold, reveal, push, '
             'pull, orbit, parallax, macro, resolve) so the camera keeps moving '
@@ -1281,7 +1328,9 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
             except Exception as e:
                 say(f"couldn't check scene {i + 1} ({e})")
                 faults = []
-            faults = (caption_faults(scene, board[i]) + beat_check(scene, board[i], skeleton)
+            faults = (caption_faults(scene, board[i])
+                      + beat_check(scene, board[i], skeleton, scenes[-1] if scenes else None, i == total - 1,
+                                   _has_art(assets_table), _canvas(project))
                       + shot_faults(scene, skeleton, bool((camera or {}).get("tracks"))) + faults)
             if faults:
                 say(f"scene {i + 1} has {len(faults)} problem(s) — "
@@ -1305,7 +1354,9 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
                                    "scenes": [fixed]})
                 except Exception:
                     left = []
-                left = (caption_faults(fixed, board[i]) + beat_check(fixed, board[i], skeleton)
+                left = (caption_faults(fixed, board[i])
+                        + beat_check(fixed, board[i], skeleton, scenes[-1] if scenes else None, i == total - 1,
+                                     _has_art(assets_table), _canvas(project))
                         + shot_faults(fixed, skeleton, bool((camera or {}).get("tracks"))) + left)
                 if len(left) < len(faults):
                     scene = fixed
@@ -1315,15 +1366,19 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
                     say("   the correction was no better — keeping the first"
                         + (" and saying what to change" if round_no + 1 < REPAIR_ROUNDS else ""))
         scenes.append(scene)
-        if skeleton in ("brand_launch", "cinematic_glass"):
+        if skeleton in ("brand_launch", "cinematic_glass", STORY_SKELETON):
             handoff = _scene_handoff(scene) or handoff
         say(f"scene {i + 1}/{total} written — "
             f"{len(scene.get('nodes', []))} node(s)")
 
     if not scenes:
         raise MotionValidationError("No scenes were written.")
-    if skeleton == "cinematic_glass" and len(scenes) > 1:
+    if skeleton in ("cinematic_glass", STORY_SKELETON) and len(scenes) > 1:
         _repair_continuity(scenes, project, camera, ask, say, check)
+    if skeleton == STORY_SKELETON:
+        from . import story as _story
+        for _f in _story.direction_faults(scenes):
+            say(f"   direction: {_f}")
     spec: dict[str, Any] = {"project": project, "scenes": scenes}
     if camera:
         spec["camera"] = camera

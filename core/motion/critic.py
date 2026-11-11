@@ -37,7 +37,11 @@ _RUBRIC = (
     "edge; text overlapping other text; text too small to read on a phone; a big empty "
     "area with nothing to look at; weak hierarchy (the most important line is not the most "
     "prominent); an empty card or panel; a number or phone line that outweighs the brand; "
-    "a photo or logo covered by text. Do not praise. Each defect names its scene "
+    "a photo or logo covered by text. Also judge it as a viewer who knows nothing: in "
+    "scene 1, can a stranger tell WHAT IS BEING SOLD and TO WHOM? If not, report \"purpose "
+    "unclear\" (severity 3). In every scene, is there ONE obvious thing the eye lands on "
+    "first? If the eye has nowhere to go, or two things compete, report \"no focus\" "
+    "(severity 2-3). Do not praise. Each defect names its scene "
     "(1-based), what it is, where, and a severity from 1 (minor) to 3 (reject).")
 
 _SCHEMA = {"type": "json_schema", "json_schema": {"name": "defects", "strict": True, "schema": {

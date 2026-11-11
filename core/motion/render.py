@@ -70,13 +70,6 @@ def _playwright_available() -> bool:
 # from source, frozen Windows/macOS/Linux bundles, and saved re-renders.
 _DISABLED_PENDING_ASSET_FIX = False
 
-# Profiled 11 Nov 2026 on a 1080x1920 five-scene spec: seeking a frame
-# costs 8-19 ms, the JPEG screenshot at quality 95 costs 710-1310 ms, the
-# same screenshot at 80 costs 230-380 ms. The encode is the render. At 80
-# the frame is still re-encoded by x264 at CRF 19 below, which discards
-# more than the drop from 95 ever kept — so this is a 3-4x faster render
-# for no visible difference in the MP4.
-SCREENSHOT_JPEG_QUALITY = 80
 
 
 def is_available() -> tuple[bool, str]:
@@ -211,8 +204,7 @@ def _render_via_playwright(
             for frame_idx in range(total_frames):
                 page.evaluate(f"window.__seek({frame_idx})")
                 try:
-                    ff_proc.stdin.write(page.screenshot(
-                        type="jpeg", quality=SCREENSHOT_JPEG_QUALITY))
+                    ff_proc.stdin.write(page.screenshot(type="jpeg", quality=95))
                 except BrokenPipeError:
                     err = ff_proc.stderr.read().decode("utf-8", "ignore")
                     raise MotionRenderError(f"FFmpeg stopped early: {err[:400]}")

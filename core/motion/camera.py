@@ -161,10 +161,13 @@ def _resolve_target(target: Any, world_pos: Dict[str, Tuple[float, float]],
 
 
 def keep_in_view(pos: Tuple[float, float], zoom: float, box: Sequence[float],
-                 width: int, height: int, margin: float = 0.04
+                 width: int, height: int, margin: Optional[float] = None
                  ) -> Tuple[Tuple[float, float], float]:
     """The camera state nearest the wanted one from which `box` (left, top,
-    right, bottom, in authored space) is entirely visible, with a margin.
+    right, bottom, in authored space) is entirely visible INSIDE the safe
+    area (see safe_area(): a vertical frame keeps its top 11 % and bottom
+    20 % clear for platform chrome). `margin`, when given, replaces the safe
+    area with a plain margin (a fraction of each dimension) on every side.
 
     Zoom is capped at the most the box allows (never below 1.0 — a box wider
     than the frame at 1x is the text-fit pass's business, not a reason to
@@ -172,20 +175,27 @@ def keep_in_view(pos: Tuple[float, float], zoom: float, box: Sequence[float],
     view, or put on the box's own centre when no such range exists."""
     l, t, r, b = (float(v) for v in box)
     bw, bh = max(0.0, r - l), max(0.0, b - t)
-    mx, my = width * margin, height * margin
     if bw <= 0 or bh <= 0:
         return pos, zoom
-    zmax = max(1.0, min(width / (bw + 2 * mx), height / (bh + 2 * my)))
+    if margin is not None:
+        ml = mr = width * margin
+        mt = mb = height * margin
+    else:
+        zone = safe_area(width, height)
+        ml, mr = float(zone["left"]), float(width - zone["right"])
+        mt, mb = float(zone["top"]), float(height - zone["bottom"])
+    zmax = max(1.0, min(width / (bw + ml + mr), height / (bh + mt + mb)))
     z = min(zoom, zmax)
     hw, hh = width / (2.0 * z), height / (2.0 * z)
 
-    def axis(c, lo_edge, hi_edge, half, m):
-        low, high = hi_edge + m - half, lo_edge - m + half   # allowed centre range
+    def axis(c, lo_edge, hi_edge, half, m_lo, m_hi):
+        # the view spans [c-half, c+half]; it must contain [lo_edge-m_lo, hi_edge+m_hi]
+        low, high = hi_edge + m_hi - half, lo_edge - m_lo + half
         if low > high:
-            return (lo_edge + hi_edge) / 2.0
+            return (lo_edge - m_lo + hi_edge + m_hi) / 2.0
         return min(max(c, low), high)
 
-    return (axis(pos[0], l, r, hw, mx), axis(pos[1], t, b, hh, my)), z
+    return (axis(pos[0], l, r, hw, ml, mr), axis(pos[1], t, b, hh, mt, mb)), z
 
 
 def compile_tracks(scenes: Sequence[Dict[str, Any]], width: int, height: int,

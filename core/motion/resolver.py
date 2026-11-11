@@ -316,7 +316,15 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
       the result on `_continuity_compiled` (threads, bridges, errors,
       warnings).
     """
-    spec = dict(spec)
+    # A copy, not the caller's dict. This function shifts every scene-local
+    # time by its scene's start, IN PLACE, and a second pass over the same nodes
+    # shifts them again: a caller that measured a film (rhythm.probe,
+    # critic.settled_frames) and then rendered the same spec drew every scene
+    # after the first late, and the result was blank frames (12 Nov 2026). The
+    # `_scene_times_resolved` flag below protects a RESOLVED spec; this protects
+    # the one the caller is still holding.
+    import copy as _copy
+    spec = _copy.deepcopy(spec)
     scenes = spec.get("scenes", [])
     camera = spec.get("camera", {})
     _auto_look(spec)

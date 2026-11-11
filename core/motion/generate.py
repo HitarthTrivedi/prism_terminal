@@ -293,7 +293,7 @@ _CINEMATIC_GLASS_DOCTRINE = """CONTINUOUS CINEMATIC PROFILE — this is a motion
     front — each in its own depth_layer (far ≈ 0.55, subject 1.0, near ≈ 1.45).
     Restrained border light and specular beat many identical cards. Preserve
     generous negative space and a clear typographic hierarchy.
-  · Keep headlines and logos inside the safe area: on a 9:16 frame nothing
+  · Keep headlines and logos inside the safe area: on a vertical (9:16) frame nothing
     that must be read sits in the top 11% or the bottom 20%.
   · The reference grammar in one line: a particle_field of scattered tiles
     gathers into a band, streams into a column, converges on icons and a
@@ -397,7 +397,7 @@ def _scene_rules(skeleton: str | None) -> str:
         "text/image node's box already placed in the same scene. Two photos, "
         "or a headline and a photo, sharing the same region reads as debris, "
         "not layout, no matter how good either looks alone. Give each one "
-        "its own clear region of the 1080x1920 frame (stack vertically, "
+        "its own clear region of the frame (stack vertically, "
         "or split left/right) rather than centering everything on the "
         "same point. A shape_rect used as an intentional backdrop directly "
         "behind one specific node (a badge behind its own label, a card "
@@ -472,6 +472,16 @@ def storyboard_instructions(request: str, brand: dict | None = None,
             f"{brand.get('deep')}. Use these as the accent colour running "
             "through the piece rather than inventing your own — this is "
             "their actual brand, not a suggestion.")
+    from ..aspect import requested_frame as _requested_frame
+    # The cinematic profile's recipes are written in 1080x1920 coordinates, so it
+    # keeps the vertical frame whatever was asked.
+    _frame = None if skeleton in ("cinematic_glass", SPINE_SKELETON) else _requested_frame(request)
+    _fw, _fh = (_frame[1], _frame[2]) if _frame else (1080, 1920)
+    frame_note = ""
+    if _frame:
+        frame_note = (f"\n\nFRAME: the client asked for a {_frame[0]} film, {_fw}x{_fh}. Author every "
+                      f"position for that frame — the x range is 0-{_fw}, the y range 0-{_fh} — and keep "
+                      "copy inside its margins.")
     from . import spine as _spine
     spine_note = ""
     if skeleton == "cinematic_glass":
@@ -497,7 +507,7 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         "You are Prism's Senior Visual Director and Motion Designer, "
         "planning a short vertical motion graphic.\n\n"
         f"WHAT THE CLIENT ASKED FOR:\n{request}"
-        + brand_note + script_note + spine_note + "\n\n"
+        + brand_note + frame_note + script_note + spine_note + "\n\n"
         + _PALETTE_GUIDANCE + "\n\n"
         + _LOOK_GUIDANCE + "\n\n"
         + _rulebook(skeleton) + "\n\n"
@@ -510,7 +520,7 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         "Reply with ONLY this JSON object, in a ```json fenced code block, "
         "nothing before or after it:\n"
         "{\n"
-        '  "project": {"width": 1080, "height": 1920, "fps": 30, '
+        f'  "project": {{"width": {_fw}, "height": {_fh}, "fps": 30, '
         '"duration": 8.0, "background": "<a hex>", "look": "paper|ink|tech",\n'
         '    "palette": {"bg_a": "...", "bg_b": "...", "ink": "...", '
         '"accent": "...", "accent2": "..."},\n'

@@ -39,7 +39,10 @@ _PULL_FACTOR = 1.0 / 1.15
 _MACRO_ZOOM = 1.6
 _ORBIT_TILT_DEG = 3.0
 _PARALLAX_DRIFT_PX = 60.0
-ZOOM_MIN, ZOOM_MAX = 0.5, 3.0
+# 12, not 3: the reference film of 11 Nov 2026 pushes about 8x into one word,
+# and text, shapes and UI are vector — they stay crisp. A raster `image` does
+# not, so an author zooming past ~3x onto a photo should aim at its subject.
+ZOOM_MIN, ZOOM_MAX = 0.5, 12.0
 
 
 def safe_area(width: int, height: int) -> Dict[str, Any]:

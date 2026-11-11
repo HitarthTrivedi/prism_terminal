@@ -140,6 +140,19 @@ def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
                     node[key] = float(node.get(key, 0.0) or 0.0) + offset
                 except (TypeError, ValueError):
                     node[key] = offset
+    # A cursor's moves and a prompt box's send moment are scene-local too.
+    if node_type == "cursor" and isinstance(node.get("path"), list):
+        for seg in node["path"]:
+            if isinstance(seg, dict):
+                try:
+                    seg["at"] = float(seg.get("at", 0.0) or 0.0) + offset
+                except (TypeError, ValueError):
+                    seg["at"] = offset
+    if node_type == "ui_input" and node.get("send_at") is not None:
+        try:
+            node["send_at"] = float(node["send_at"]) + offset
+        except (TypeError, ValueError):
+            node.pop("send_at", None)
     phases = node.get("phases")
     if node_type == "particle_field" and isinstance(phases, list):
         for phase in phases:
@@ -160,6 +173,7 @@ def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
 # an absent reveal_start means "at this scene's start", not "at t=0".
 _CONTENT_TIME_TYPES = {
     "text": ("reveal_start",),
+    "ui_input": ("reveal_start",),
     "domain_chart": ("reveal_start",), "chart": ("reveal_start",),
     "domain_diagram": ("reveal_start",), "diagram": ("reveal_start",), "workflow": ("reveal_start",),
     "shape_arrow": ("draw_start",), "arrow": ("draw_start",),

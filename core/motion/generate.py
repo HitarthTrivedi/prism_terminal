@@ -53,7 +53,21 @@ easing choices scene to scene."""
 _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
   text             — content, position, font_size, font_weight, fill, mode (see TEXT MODES).
                       A long headline may use "\\n" for a manual line break —
-                      each line is centred and stacked automatically.
+                      each line is centred and stacked automatically. Optional
+                      "runs": [{"text","fill"|"gradient","weight"}] makes parts of
+                      one line differ in colour or weight (a highlighted word);
+                      "type_on": true with "type_rate" (characters/second) types
+                      it out with a caret that follows. Set "anchor" [0,0] to
+                      start from the left, [0.5,0.5] to centre.
+  cursor           — position (the pointer tip), label (a role or name), color,
+                      size, path: [{"at","to":[x,y],"duration","easing","click"}].
+                      A labelled pointer that travels and clicks — for a film
+                      about something being operated, not for decoration.
+  ui_pill          — label, dot (a colour) or check (true = green tick), font_size,
+                      fill, ink. A status chip: "Rendering", "Finished".
+  ui_input         — width, height, placeholder, text (types itself from
+                      reveal_start at type_rate), send_at (the send button turns
+                      from grey to ink). A prompt box.
   shape_rect       — position, width, height, radius, fill, is_glass (optional).
                       For hairlines, pills, badges and chat bubbles. It is the
                       WRONG primitive for a background or a card: a flat

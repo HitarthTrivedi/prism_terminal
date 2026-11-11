@@ -160,9 +160,38 @@ def _resolve_target(target: Any, world_pos: Dict[str, Tuple[float, float]],
     return fallback
 
 
+def keep_in_view(pos: Tuple[float, float], zoom: float, box: Sequence[float],
+                 width: int, height: int, margin: float = 0.04
+                 ) -> Tuple[Tuple[float, float], float]:
+    """The camera state nearest the wanted one from which `box` (left, top,
+    right, bottom, in authored space) is entirely visible, with a margin.
+
+    Zoom is capped at the most the box allows (never below 1.0 — a box wider
+    than the frame at 1x is the text-fit pass's business, not a reason to
+    pull out); the centre is clamped into the range that keeps the box in
+    view, or put on the box's own centre when no such range exists."""
+    l, t, r, b = (float(v) for v in box)
+    bw, bh = max(0.0, r - l), max(0.0, b - t)
+    mx, my = width * margin, height * margin
+    if bw <= 0 or bh <= 0:
+        return pos, zoom
+    zmax = max(1.0, min(width / (bw + 2 * mx), height / (bh + 2 * my)))
+    z = min(zoom, zmax)
+    hw, hh = width / (2.0 * z), height / (2.0 * z)
+
+    def axis(c, lo_edge, hi_edge, half, m):
+        low, high = hi_edge + m - half, lo_edge - m + half   # allowed centre range
+        if low > high:
+            return (lo_edge + hi_edge) / 2.0
+        return min(max(c, low), high)
+
+    return (axis(pos[0], l, r, hw, mx), axis(pos[1], t, b, hh, my)), z
+
+
 def compile_tracks(scenes: Sequence[Dict[str, Any]], width: int, height: int,
                    world_pos: Dict[str, Tuple[float, float]],
-                   authored: Optional[List[Dict[str, Any]]] = None
+                   authored: Optional[List[Dict[str, Any]]] = None,
+                   content_boxes: Optional[Sequence[Optional[Sequence[float]]]] = None
                    ) -> Optional[List[Dict[str, Any]]]:
     """One continuous `camera.tracks` list from the scenes' shots.
 
@@ -196,7 +225,7 @@ def compile_tracks(scenes: Sequence[Dict[str, Any]], width: int, height: int,
         "zoom": round(zoom, 4), "rotation": round(rot, 3), "_shot": "open",
     }]
     orbit_sign = 1.0
-    for scene in scenes:
+    for scene_index, scene in enumerate(scenes):
         shot = scene.get("shot")
         if not isinstance(shot, dict):
             # A scene that names no shot must not inherit a corner: the
@@ -269,6 +298,16 @@ def compile_tracks(scenes: Sequence[Dict[str, Any]], width: int, height: int,
             duration = seconds * 0.85
             easing = easing or "power2.inOut"
         new_zoom = max(ZOOM_MIN, min(ZOOM_MAX, new_zoom))
+        # The scene's copy must still be in frame where the camera settles.
+        # Shots compound — each `push` multiplies the zoom the last one left —
+        # and a `hold` inherits it, so a model-written film ended on a 1.75x
+        # camera filming a last scene it had composed for 1x: the name was
+        # off the top and the phone number off the left (12 Nov 2026).
+        # `crop: true` on the shot means the close-up is deliberate.
+        if (content_boxes is not None and scene_index < len(content_boxes)
+                and content_boxes[scene_index] and not shot.get("crop")):
+            new_pos, new_zoom = keep_in_view(new_pos, new_zoom, content_boxes[scene_index],
+                                             width, height)
         delay = 0.0
         if shot.get("delay") is not None:
             delay = min(max(0.0, seconds - 0.05), _num(shot["delay"], 0.0))

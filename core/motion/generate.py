@@ -171,7 +171,10 @@ ANIMATION, on any node via "animation" (all times are LOCAL to this scene, start
   different fixed "types" to pick from. "from"/"to" for x/y are relative
   OFFSETS from the node's own resting position (20 means 20px away from
   where it settles, not an absolute coordinate); scale/scaleX/scaleY/
-  rotation/skewX/skewY/opacity work the same way; blur/clipInset/
+  rotation/skewX/skewY work the same way — a scale tween is an offset from
+  the node's own scale, so a pop that settles at 1x is from 0.08 to 0 (it
+  starts 1.08x), a grow-in is from -0.2 to 0; opacity is ABSOLUTE, 0 to 1;
+  blur/clipInset/
   backgroundPositionX/strokeDashoffset are absolute values in their own
   units (blur in px, clipInset 0-100 as percent revealed, strokeDashoffset
   in the node's own path-length units — leave it to the runtime's own

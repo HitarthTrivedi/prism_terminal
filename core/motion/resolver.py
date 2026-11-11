@@ -99,6 +99,39 @@ def _resolve_asset_srcs(node: Dict[str, Any], uris: Dict[str, str]) -> None:
                 _resolve_asset_srcs(child, uris)
 
 
+def _absolute_scale_tweens(node: Dict[str, Any]) -> None:
+    """Read a scale tween written as ABSOLUTE values as absolute.
+
+    The runtime adds a scale tween's from/to to the node's own scale (the
+    catalogue says so: "from -0.3" means 0.3 smaller than where it settles).
+    A model asked for "a pop down to 1x" writes scale 1.08 -> 1.0, and the
+    runtime drew the node at 2.08x -> 2.0x: a model-written headline was
+    twice its size and cut off at both edges (found 12 Nov 2026, by reading the
+    node's host transform, matrix(2, 0, 0, 2, ...)). Offsets people mean are
+    small or negative; a scale tween whose two ends are both >= 0.4 is
+    absolute and is converted to offsets from the node's scale. Idempotent: the
+    converted values are below 0.4.
+    """
+    anim = node.get("animation")
+    if isinstance(anim, dict):
+        scale = node.get("scale") or [1.0, 1.0]
+        for block in ("enter", "exit"):
+            tweens = (anim.get(block) or {}).get("tweens") if isinstance(anim.get(block), dict) else None
+            for tw in tweens or []:
+                if not isinstance(tw, dict) or tw.get("channel") not in ("scale", "scaleX", "scaleY"):
+                    continue
+                try:
+                    frm, to = float(tw["from"]), float(tw["to"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if frm >= 0.4 and to >= 0.4:
+                    base = float(scale[1] if tw["channel"] == "scaleY" and len(scale) > 1 else scale[0])
+                    tw["from"], tw["to"] = round(frm - base, 4), round(to - base, 4)
+    for child in node.get("children", []) or []:
+        if isinstance(child, dict):
+            _absolute_scale_tweens(child)
+
+
 def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
     """Shift a node's (and its children's) authored animation times by
     `offset`, in place. Scenes are written scene-local (a node's `enter`/
@@ -106,6 +139,7 @@ def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
     matching how core.reel_web's per-scene prompts work) — this is what
     turns that into the single global timeline runtime.js actually plays.
     """
+    _absolute_scale_tweens(node)
     anim = node.get("animation")
     if isinstance(anim, dict):
         for block_name in ("enter", "exit"):
@@ -410,7 +444,8 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
         height = int((spec.get("project") or {}).get("height", 1920) or 1920)
         compiled = _camera.compile_tracks(
             scenes, width, height, world,
-            authored if isinstance(authored, list) else None)
+            authored if isinstance(authored, list) else None,
+            content_boxes=spec.get("_content_boxes"))
         if compiled is not None:
             if not isinstance(camera, dict):
                 camera = {}

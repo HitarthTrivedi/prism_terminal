@@ -8744,6 +8744,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         else:
                             ui.ok(f"   {len(validated['scenes'])} scene(s) "
                                   "written")
+                            # Whatever the model wrote, no line is left wider
+                            # than the frame (core.motion.measure.fit_to_frame).
+                            # A browser problem here must never cost the run.
+                            try:
+                                validated, _fits = _motion_measure.fit_to_frame(validated)
+                                for _f in _fits:
+                                    ui.info(f"   ↔  fitted {_f}")
+                            except Exception as _e:
+                                ui.warn(f"   couldn't check the text fits the frame ({_e})")
                             stage_responses = [_json.dumps(validated, ensure_ascii=False)]
 
                 # This stage feeds a renderer, so "it answered" isn't enough —

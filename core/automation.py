@@ -6543,6 +6543,17 @@ def _run_footage(prior_text, attachments, cfg: dict, on_progress=None):
     return out, f"client footage edited — {os.path.basename(out)} ({', '.join(details)})"
 
 
+def _motion_skeleton(explicit: str, cfg) -> str:
+    """Which Motion story profile a run uses: the caller's own choice, else
+    config `motion_skeleton` ("story" is the five-part grammar for any
+    business, see core.motion.story), else the cinematic profile that has always
+    been the default. Changing the default is a product decision, so it stays a
+    one-line change here."""
+    allowed = ("cinematic_glass", "story", "brand_launch", "spine")
+    chosen = explicit or (cfg.get("motion_skeleton") if isinstance(cfg, dict) else "")
+    return chosen if chosen in allowed else "cinematic_glass"
+
+
 def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
                brand: dict | None = None, studio: dict | None = None,
                on_progress=None, query: str = "", skill_text: str = ""):
@@ -7167,8 +7178,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             stages.insert(motion_at, ("motion_plan", planner,
                                       [_motion_gen.storyboard_instructions(
                                           query,
-                                          skeleton=motion_skeleton or
-                                          "cinematic_glass")]))
+                                          skeleton=_motion_skeleton(motion_skeleton, cfg))]))
             motion_at += 1
             motion_feeder = motion_at - 1
             machine_stages[motion_feeder] = (
@@ -8715,7 +8725,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             texts[-1], _ask,
                             assets=motion_assets_listing,
                             assets_table=motion_assets_table,
-                            skeleton=motion_skeleton or "cinematic_glass",
+                            skeleton=_motion_skeleton(motion_skeleton, cfg),
                             # The estimate plus, when a browser is here, the
                             # scene laid out for real with the camera applied
                             # (core.motion.measure — the 11 Nov 2026 study's M4).

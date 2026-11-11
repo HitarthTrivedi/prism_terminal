@@ -699,7 +699,10 @@ class LightFieldNode extends Node {
     box.style.height = `${h}px`;
     box.style.overflow = "visible";
     box.style.pointerEvents = "none";
-    box.style.filter = `blur(${Math.round(Math.min(w, h) * 0.04)}px)`;
+    // No CSS blur() on the box. The lobes' own radial gradients already fade to
+    // transparent, so the filter softened nothing a viewer can see (mean pixel
+    // difference 0.25 of 255 on a real film) while costing about a third of every
+    // frame's render time on the software compositor (585 -> 385 ms, 12 Nov 2026).
     const stop = Math.round(58 * this.spread);
     const lobe = (color, size, left, top, opacity) => {
       const el = document.createElement("div");

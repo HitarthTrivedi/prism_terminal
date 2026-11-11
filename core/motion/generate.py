@@ -55,6 +55,9 @@ _LOOK_GUIDANCE = """LOOK — set project.look, and let the background colour agr
           default for products, services, explainers, anything friendly or
           premium. Colour is punctuation, not a field: mostly page, one or two
           accents. Type and interface (ui_input, ui_pill, cursor) carry it.
+          Do NOT add light_field or glass_panel on a flat page: a glow is almost
+          invisible there and each light_field makes the film render about
+          four times slower.
   ink   — a flat dark page. For a serious, cinematic or luxury piece.
   tech  — the dark-tech backdrop: a cyan spotlight, a scrolling grid, drifting
           particles, a vignette. Only when the subject is genuinely technical

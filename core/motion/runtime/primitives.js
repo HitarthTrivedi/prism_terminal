@@ -224,7 +224,11 @@ class TextNode extends Node {
     this.fontSize       = props.font_size      || 48;
     this.fontWeight     = props.font_weight    || 700;
     this.fill           = props.fill           || "#FFFFFF";
-    this.align          = props.align          || "center";
+    // Lines inside a left-anchored block read left, a right-anchored one
+    // right — unless the spec says otherwise. Centred lines in a block
+    // whose anchor is its left edge look like a mistake, not a choice.
+    this.align          = props.align
+      || (this.anchor[0] < 0.34 ? "left" : this.anchor[0] > 0.66 ? "right" : "center");
     this.lineHeight     = props.line_height    || 1.25;
     this.mode           = props.mode           || "standard";
     this.revealStart    = props.reveal_start   || 0.0;
@@ -269,7 +273,16 @@ class TextNode extends Node {
   }
 
   initDOM(box) {
-    box.style.transform = "translate(-50%,-50%)";
+    // The anchor, honoured the way every other primitive honours it. A
+    // percentage translate is measured against the box's OWN laid-out
+    // size, so [0.5, 0.5] is the old translate(-50%,-50%) exactly and
+    // [0, 0] puts the text's top-left corner on `position` — which is
+    // what generate.py's catalogue promises the model and what
+    // inspect._node_bounds measures. Before this, text was the one node
+    // type that ignored its anchor: a headline the model left-anchored
+    // at x=80 was centred ON x=80 and lost its first half off the frame
+    // (the 11 Nov 2026 study, finding M1).
+    box.style.transform = `translate(${-this.anchor[0] * 100}%, ${-this.anchor[1] * 100}%)`;
     box.style.textAlign = this.align;
     this._lines = this.content ? String(this.content).split(/\r?\n/) : [];
     this._lineEls = [];

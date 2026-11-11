@@ -8674,7 +8674,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 if stage_idx == motion_feeder and texts:
                     from . import motion as _motion_pkg
                     from .motion import generate as _motion
-                    from .motion import inspect as _motion_inspect
+                    from .motion import measure as _motion_measure
                     from . import assets as _assets
 
                     scene_wait = max(int(agent_cfg.get("wait_time", 60)), 180)
@@ -8714,7 +8714,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             assets=motion_assets_listing,
                             assets_table=motion_assets_table,
                             skeleton=motion_skeleton or "cinematic_glass",
-                            check=_motion_inspect.inspect,
+                            # The estimate plus, when a browser is here, the
+                            # scene laid out for real with the camera applied
+                            # (core.motion.measure — the 11 Nov 2026 study's M4).
+                            check=_motion_measure.inspect_all,
                             log=lambda m: ui.info(f"   {m}"),
                             should_stop=stage_halt,
                             on_scene=lambda i, n: emit(

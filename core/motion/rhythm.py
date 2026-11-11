@@ -68,9 +68,18 @@ def probe(spec: dict[str, Any], fps: int = SAMPLE_FPS) -> dict[str, Any] | None:
                 frames.append(np.asarray(im, dtype=np.float32))
         finally:
             chromium.close()
+    return profile_from_frames(frames, fps)
+
+
+def profile_from_frames(frames, fps: int = SAMPLE_FPS) -> dict[str, Any]:
+    """The rhythm profile of a list of grayscale frames (2-D float arrays)
+    sampled at `fps`. The one place the numbers are made, so a film measured from
+    its spec (probe) and one measured from its video file (probe_video) are
+    measured identically."""
+    import numpy as np
     if len(frames) < 3:
         return {"seconds": 0.0, "static_pct": 0.0, "per_second": [], "holds": [], "top10_share": 0.0,
-                "luminance": [0.0, 0.0], "mean_motion": 0.0}
+                "luminance": [0.0, 0.0], "mean_motion": 0.0, "longest_hold": 0.0, "holds_ge_1s": 0}
     diffs = np.abs(np.diff(np.stack(frames), axis=0)).mean(axis=(1, 2))
     per_second = [float(diffs[i * fps:(i + 1) * fps].mean()) for i in range(len(diffs) // fps)]
     holds, run = [], 0
@@ -98,6 +107,37 @@ def probe(spec: dict[str, Any], fps: int = SAMPLE_FPS) -> dict[str, Any] | None:
         "top10_share": round(sum(ordered[:top]) / total * 100, 0),
         "luminance": [round(min(lum), 0), round(max(lum), 0)],
     }
+
+
+def probe_video(path: str, fps: int = SAMPLE_FPS) -> dict[str, Any] | None:
+    """The rhythm profile of a finished video FILE — a Motion film, a Studio reel,
+    a Reel, a reference — with FFmpeg only, no browser. Same maths, same
+    thresholds. None when FFmpeg cannot read it."""
+    import json as _json
+    import subprocess
+    import numpy as np
+    from .. import ffmpeg
+    ff = ffmpeg.locate()
+    if not ff or not os.path.exists(path):
+        return None
+    ffprobe = os.path.join(os.path.dirname(ff), "ffprobe")
+    try:
+        j = _json.loads(subprocess.run(
+            [ffprobe if os.path.exists(ffprobe) else "ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "json", path],
+            capture_output=True, text=True).stdout)["streams"][0]
+        w0, h0 = int(j["width"]), int(j["height"])
+    except Exception:  # noqa: BLE001
+        return None
+    w = ANALYSIS_WIDTH
+    h = max(2, round(w * h0 / w0) // 2 * 2)
+    raw = subprocess.run([ff, "-v", "error", "-i", path, "-vf", f"fps={fps},scale={w}:{h},format=gray",
+                          "-f", "rawvideo", "-"], capture_output=True).stdout
+    n = len(raw) // (w * h)
+    if n < 3:
+        return None
+    arr = np.frombuffer(raw[:n * w * h], np.uint8).reshape(n, h, w).astype(np.float32)
+    return profile_from_frames(list(arr), fps)
 
 
 def faults(profile: dict[str, Any] | None, static_range: tuple[float, float] = (15.0, 45.0)) -> list[str]:

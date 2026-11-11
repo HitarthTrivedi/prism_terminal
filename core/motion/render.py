@@ -92,9 +92,15 @@ def is_available() -> tuple[bool, str]:
     except Exception as e:
         return False, f"FFmpeg error: {e}"
 
+    # The same two paths render() itself has — and nothing else. A bare
+    # `node` on PATH used to count, but render() never uses node on its
+    # own: it needs Playwright's Chromium or an Electron binary, and a
+    # machine with only node passed here and then failed mid-run with
+    # "No headless browser available" after the storyboard had already
+    # been written (study of 11 Nov 2026, finding M5).
     if _playwright_available():
         return True, ""
-    if _find_electron_binary() or shutil.which("node"):
+    if _find_electron_binary():
         return True, ""
     return False, (
         "No headless browser available. Install Playwright: "

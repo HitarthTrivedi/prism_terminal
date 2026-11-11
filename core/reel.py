@@ -1505,8 +1505,14 @@ def lint_spec(spec: dict) -> list[str]:
                                "as text. Delete it; the renderer handles motion.")
                     break
             # Two or more big numbers in one string is a series, and a series
-            # belongs in a chart.
-            if key != "value" and len(re.findall(r"\d[\d,]{2,}", val)) >= 2:
+            # belongs in a chart. A phone number is not a series: "+91 98765
+            # 43210" is two five-digit groups, and this sent every endcard
+            # with an Indian number back to be charted (study of 11 Nov
+            # 2026, finding R1). The endcard's own 'contact' line and any
+            # phone-shaped string are left alone.
+            phone_like = re.search(r"\+?\d[\d\s\-()]{7,}\d", val) is not None
+            if (key not in ("value", "contact") and not phone_like
+                    and len(re.findall(r"\d[\d,]{2,}", val)) >= 2):
                 out.append(f"{where}: '{key}' has a series of numbers in it. "
                            "Move them into a 'trend' scene as real numeric "
                            "points — the renderer charts those.")

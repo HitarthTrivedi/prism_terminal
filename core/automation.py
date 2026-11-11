@@ -7091,9 +7091,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         else:
             try:
                 from . import reel as _reel
+                from . import length as _length
                 st, an, qs = stages[feeder]
                 stages[feeder] = (st, an, qs[:-1] + [
-                    qs[-1] + "\n\n" + _reel.spec_instructions()])
+                    qs[-1] + "\n\n" + _reel.spec_instructions(
+                        requested=_length.requested_seconds(query))])
                 spec_feeder = feeder
                 ui.info(f"🎬  {stages[local_reel_at][1]} renders locally — "
                         f"{an} will write the scene spec for it")
@@ -8761,6 +8763,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # there.
                 if stage_idx == spec_feeder:
                     from . import reel as _reel
+                    from . import length as _length
+                    asked_secs = _length.requested_seconds(query)
                     spec_texts = [t for t in texts if _reel.has_spec(t)] if texts else []
                     if spec_texts:
                         # LAST, not longest: the prompt we typed carries an
@@ -8775,7 +8779,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         # way to catch them is to look, and the only way to fix
                         # them is to say precisely what is wrong.
                         faults = _reel.lint_spec(
-                            _reel.parse_spec(stage_responses[0]))
+                            _reel.parse_spec(stage_responses[0]), requested=asked_secs)
                         if faults:
                             ui.warn(f"the scene spec has {len(faults)} problem(s) "
                                     "— sending them back to be fixed")
@@ -8791,7 +8795,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                 expect='"scenes"')
                             better = [t for t in again if _reel.has_spec(t)]
                             if better:
-                                left = _reel.lint_spec(_reel.parse_spec(better[-1]))
+                                left = _reel.lint_spec(_reel.parse_spec(better[-1]),
+                                                       requested=asked_secs)
                                 # Keep the second attempt only if it is
                                 # genuinely cleaner — a "fix" that trades six
                                 # faults for seven is not a fix.
@@ -8850,7 +8855,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         api_prompt = (
                             (context or "")
                             + "\n\n".join(questions)
-                            + "\n\n" + _reel.spec_instructions()
+                            + "\n\n" + _reel.spec_instructions(requested=asked_secs)
                             + "\n\nReply with ONLY the JSON object — first "
                               "character '{', last '}'.")
                         try:

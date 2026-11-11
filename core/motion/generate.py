@@ -503,7 +503,22 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         "is the failure this stage exists to prevent. `camera.tracks` is "
         "for the WHOLE graphic; each scene's \"shot\" (see SHOT above) "
         "carries on from it.")
+        + _length_note(request)
     )
+
+
+def _length_note(request: str) -> str:
+    """The client's own length, when the request names one, stated after
+    the profile's band so it wins. A 25 s ask used to come back as 15 s
+    because only the band was ever read (study of 11 Nov 2026, M6)."""
+    from ..length import requested_seconds
+    secs = requested_seconds(request)
+    if not secs:
+        return ""
+    return (f"\n\nLENGTH: the client asked for {secs:g} seconds. The rows' "
+            f'"seconds" must add up to about {secs:g} — within 15% of it — '
+            "whatever the band above says; scale every beat's seconds "
+            "together rather than padding one scene.")
 
 
 def _brand_launch_storyboard_close() -> str:

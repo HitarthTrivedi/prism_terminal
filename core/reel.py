@@ -1156,10 +1156,13 @@ def render(spec: dict, out_path: str, on_progress=None) -> str:
     return out_path
 
 
-def spec_instructions() -> str:
+def spec_instructions(requested: float | None = None) -> str:
     """What an AI stage must produce. The agent decides the WORDS and the
     running order; this module decides the pixels — so the layout can never
     be broken by a model having an off day.
+
+    `requested`: the length the client asked for, in seconds (see
+    core.length) — the pacing line then names it instead of the house band.
 
     Appended, not sent alone: the router plans this stage's task before it
     knows a local renderer is downstream, so the brief it writes routinely
@@ -1264,7 +1267,11 @@ def spec_instructions() -> str:
         "PACING — a viewer reads three words in under two seconds:\n"
         "  statement 3–6s · figure 4–6.5s · trend 5–8s · list 4–7s\n"
         "  pillar 3–6s · hub 4–7s · brand 4–6s · endcard 3–5s\n"
-        "  4 to 7 scenes, 20–35 seconds in total. A reel is not a film.\n\n"
+        + (f"  4 to 7 scenes, about {requested:g} seconds in total — the client "
+           f"asked for {requested:g}; land within 15% of it. A reel is not a "
+           "film.\n\n" if requested
+           else "  4 to 7 scenes, 20–35 seconds in total. A reel is not a film.\n\n")
+        +
         "COPY LIMITS — these are what keeps type large enough to read:\n"
         "  heading under 34 characters · caption under 90 · statement at most "
         "3 lines · list at most 4 items · pillar exactly 3 icons · hub exactly "
@@ -1424,8 +1431,11 @@ def _scene_text(sc: dict):
                 yield k, item["label"]
 
 
-def lint_spec(spec: dict) -> list[str]:
+def lint_spec(spec: dict, requested: float | None = None) -> list[str]:
     """What is wrong with this spec, in words the writer can act on.
+
+    `requested`: the length the client asked for, in seconds; the total is
+    then held to ±15 % of it instead of the house REEL_SECONDS band.
 
     Not a schema check — parse_spec already guarantees the shape. This catches
     the mistakes that render as something embarrassing: a data series typed
@@ -1443,7 +1453,18 @@ def lint_spec(spec: dict) -> list[str]:
 
     total = sum(float(sc.get("_seconds_asked", sc.get("seconds", 4)) or 4)
                 for sc in scenes)
-    if total < REEL_SECONDS[0]:
+    if requested:
+        from .length import bounds
+        lo, hi = bounds(requested)
+        if total < lo:
+            out.append(f"The reel is only {total:.0f}s long — the client asked "
+                       f"for {requested:g}s; lengthen the scenes that carry the "
+                       "most, or add one, to land within 15% of that.")
+        elif total > hi:
+            out.append(f"The reel runs {total:.0f}s — the client asked for "
+                       f"{requested:g}s; cut to within 15% of that by dropping "
+                       "a scene, not by shortening every one.")
+    elif total < REEL_SECONDS[0]:
         out.append(f"The reel is only {total:.0f}s long — aim for 20 to 35s.")
     elif total > REEL_SECONDS[1]:
         out.append(f"The reel runs {total:.0f}s — too long for a feed. "

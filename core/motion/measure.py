@@ -123,6 +123,7 @@ def inspect_rendered(spec: dict[str, Any], at: float = 0.75,
             page.goto(index.as_uri(), wait_until="domcontentloaded")
             page.wait_for_function("typeof window.__loadSpec === 'function'", timeout=15_000)
             page.evaluate("spec => window.__loadSpec(spec)", resolved)
+            _browser.warm_fonts(page)
             try:
                 page.wait_for_function("document.fonts.ready.then(() => true)", timeout=8000)
             except Exception:  # noqa: BLE001
@@ -266,6 +267,7 @@ def content_boxes(spec: dict[str, Any]) -> list | None:
             page.goto(index.as_uri(), wait_until="domcontentloaded")
             page.wait_for_function("typeof window.__loadSpec === 'function'", timeout=15_000)
             page.evaluate("s => window.__loadSpec(s)", resolved)
+            _browser.warm_fonts(page)
             try:
                 page.wait_for_function("document.fonts.ready.then(() => true)", timeout=8000)
             except Exception:  # noqa: BLE001
@@ -346,6 +348,7 @@ def fit_to_frame(spec: dict[str, Any], margin: float = 0.06, min_scale: float = 
                 page.goto(index.as_uri(), wait_until="domcontentloaded")
                 page.wait_for_function("typeof window.__loadSpec === 'function'", timeout=15_000)
                 page.evaluate("s => window.__loadSpec(s)", resolved)
+                _browser.warm_fonts(page)
                 try:
                     page.wait_for_function("document.fonts.ready.then(() => true)", timeout=8000)
                 except Exception:  # noqa: BLE001

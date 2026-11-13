@@ -179,6 +179,7 @@ def _render_via_playwright(
             # without this wait, frame 0 (and likely several after it)
             # can screenshot genuinely blank text. Mirrors core.reel_web's
             # own harness.
+            _browser.warm_fonts(page)
             try:
                 page.wait_for_function(
                     "document.fonts.ready.then(() => true)", timeout=8000)

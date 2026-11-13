@@ -82,13 +82,20 @@ def settled_frames(spec: dict[str, Any], at: float = 0.8) -> list[tuple[int, byt
             page.goto(index.as_uri(), wait_until="domcontentloaded")
             page.wait_for_function("typeof window.__loadSpec === 'function'", timeout=15_000)
             page.evaluate("s => window.__loadSpec(s)", resolved)
+            _browser.warm_fonts(page)
             try:
                 page.wait_for_function("document.fonts.ready.then(() => true)", timeout=8000)
             except Exception:  # noqa: BLE001
                 pass
             for si, sc in enumerate(resolved.get("scenes", [])[:MAX_FRAMES]):
                 moment = float(sc.get("start", 0.0) or 0.0) + float(sc.get("duration", 0.0) or 0.0) * at
-                page.evaluate(f"window.__seek({int(round(moment * fps))})")
+                # Two animation frames after the seek, so the paint has settled: the
+                # first frame of a fresh page was sometimes screenshotted blank
+                # (found 13 Nov 2026 on a 16:9 film), and the critic then reported
+                # an empty scene that was not empty.
+                page.evaluate("""async f => { window.__seek(f);
+                    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); }""",
+                              int(round(moment * fps)))
                 out.append((si, page.screenshot(type="png")))
         finally:
             chromium.close()
@@ -150,3 +157,73 @@ def faults(defects: list[dict[str, Any]], min_severity: int = 2) -> list[str]:
     keep = [d for d in defects if d["severity"] >= min_severity]
     keep.sort(key=lambda d: (-d["severity"], d["scene"]))
     return [f"Scene {d['scene']}: {d['type']} — {d['where']}".rstrip(" —") for d in keep]
+
+
+# ── the repair loop: a defect found in a finished frame goes back to its scene ─
+
+def repair(scenes: list[dict], spec_of, ask, parse, keep, say, look, expect,
+           min_severity: int = 2, max_scenes: int = 3) -> None:
+    """Send scenes the critic rejected back to the writer once each; keep a
+    correction only when the whole film then has fewer serious defects.
+
+    `look(spec) -> list[defect] | None` is the critic on a whole film (None when
+    it could not answer: unknown is never taken as "fixed"). `parse(text)` reads
+    a scene reply (`expect` is what the reply must contain); `keep(old, new)` carries the scene's id/length/etc. onto the
+    new one. In place on `scenes`. Never raises."""
+    def serious(defects):
+        return [d for d in defects or [] if d["severity"] >= min_severity and 1 <= d["scene"] <= len(scenes)]
+
+    try:
+        before = look(spec_of(scenes))
+    except Exception as e:                                      # noqa: BLE001
+        say(f"critic: could not look ({e})")
+        return
+    if before is None:
+        return
+    bad = serious(before)
+    if not bad:
+        say("critic: no serious defects")
+        return
+    by: dict[int, list[dict]] = {}
+    for d in bad:
+        by.setdefault(d["scene"], []).append(d)
+    order = sorted(by, key=lambda n: -sum(d["severity"] for d in by[n]))[:max_scenes]
+    say(f"critic: {len(bad)} serious defect(s) across {len(by)} scene(s) — sending {len(order)} back")
+    current = bad
+    for n in sorted(order):
+        idx = n - 1
+        lines = "\n".join(f"{k}. {d['type']} — {d['where']}".rstrip(" —") for k, d in enumerate(by[n][:6], 1))
+        fixed = parse(ask(
+            f"A reviewer looked at the finished frame of scene {n} and rejected it:\n\n{lines}\n\n"
+            f"Send the corrected scene {n}: ONLY the JSON object, same shape, in a ```json fenced block. "
+            "Keep its words and everything not mentioned.", expect) or "")
+        if not fixed:
+            say(f"   scene {n} never came back — stopping the critic pass")
+            break
+        keep(scenes[idx], fixed)
+        trial = list(scenes)
+        trial[idx] = fixed
+        try:
+            after = look(spec_of(trial))
+        except Exception:                                       # noqa: BLE001
+            after = None
+        if after is None:
+            say("   the critic could not re-check — keeping the first")
+            continue
+        now = serious(after)
+        own_before = sum(1 for d in current if d["scene"] == n)
+        own_after = sum(1 for d in now if d["scene"] == n)
+        rest_before = len(current) - own_before
+        rest_after = len(now) - own_after
+        # Rewriting scene n cannot clear other scenes' defects. When their count collapses on the same
+        # reading, the critic is not reading the film steadily (16 → 0 → 11 on one film), so the whole
+        # reading is discarded rather than trusted for scene n.
+        if rest_before >= 2 and rest_after * 2 < rest_before:
+            say("   the critic's re-check is not steady (other scenes' defects vanished too) — keeping the first")
+            continue
+        if own_after < own_before and rest_after <= rest_before:
+            scenes[idx] = fixed
+            say(f"   scene {n} fixed — its serious defects {own_before} → {own_after}")
+            current = now
+        else:
+            say(f"   scene {n}'s correction was no better — keeping the first")

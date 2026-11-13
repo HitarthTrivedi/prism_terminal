@@ -57,10 +57,15 @@ def probe(spec: dict[str, Any], fps: int = SAMPLE_FPS) -> dict[str, Any] | None:
             page.goto(index.as_uri(), wait_until="domcontentloaded")
             page.wait_for_function("typeof window.__loadSpec === 'function'", timeout=15_000)
             page.evaluate("s => window.__loadSpec(s)", resolved)
+            _browser.warm_fonts(page)
             try:
                 page.wait_for_function("document.fonts.ready.then(() => true)", timeout=8000)
             except Exception:  # noqa: BLE001
                 pass
+            # Let the first paint settle before sampling: an unsettled frame 0 reads
+            # as motion (a replay of frame 0 differed by 0.66 grey levels, 13 Nov 2026).
+            page.evaluate("""async () => { window.__seek(0);
+                await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); }""")
             n = int(duration * fps)
             for i in range(n):
                 page.evaluate(f"window.__seek({int(round(i / fps * src_fps))})")
@@ -175,3 +180,88 @@ def faults(profile: dict[str, Any] | None, static_range: tuple[float, float] = (
                    "the busiest tenth of the seconds; a film with a payoff has 30-45%). Hold, then "
                    "spend one decisive change.")
     return out
+
+
+# ── repair: which scenes to send back, and what to tell the writer ───────────
+
+def kind(profile: dict[str, Any] | None, static_range: tuple[float, float] = (15.0, 45.0)) -> str | None:
+    """"never_rests", "mostly_still" or None (fine, or nothing measured)."""
+    if not profile or profile.get("seconds", 0) < 4:
+        return None
+    lo, hi = static_range
+    if profile["static_pct"] < lo:
+        return "never_rests"
+    if profile["static_pct"] > hi:
+        return "mostly_still"
+    return None
+
+
+def distance(profile: dict[str, Any] | None, static_range: tuple[float, float] = (15.0, 45.0)) -> float:
+    """How far the still-frame share is outside the band (0 inside it)."""
+    if not profile:
+        return 0.0
+    lo, hi = static_range
+    s = profile["static_pct"]
+    return max(0.0, lo - s, s - hi)
+
+
+def better(before: dict[str, Any] | None, after: dict[str, Any] | None,
+           static_range: tuple[float, float] = (15.0, 45.0), margin: float = 2.0) -> bool:
+    """A repaired film must land clearly nearer the band: by at least `margin`
+    points of still-frame share. Same rule the per-scene repair uses, a "fix"
+    that does not move the number is not a fix."""
+    if not after:
+        return False
+    return distance(after, static_range) <= distance(before, static_range) - margin
+
+
+def scene_activity(profile: dict[str, Any], durations: list[float]) -> list[float]:
+    """Mean motion (grey levels) per scene: the per-second series averaged over
+    each scene's own seconds."""
+    per = profile.get("per_second") or []
+    out, t = [], 0.0
+    for d in durations:
+        lo, hi = int(t), max(int(t) + 1, int(round(t + d)))
+        seg = per[lo:hi]
+        out.append(round(sum(seg) / len(seg), 2) if seg else 0.0)
+        t += d
+    return out
+
+
+def targets(profile: dict[str, Any], durations: list[float], what: str, limit: int = 2) -> list[int]:
+    """The scenes to send back. A film that never rests: its busiest scenes, but
+    never the last (the payoff keeps its burst). A film that never moves: its
+    quietest, but never the first (the opening may be a deliberate hold)."""
+    act = scene_activity(profile, durations)
+    idx = list(range(len(act)))
+    if what == "never_rests":
+        idx = [i for i in idx if i != len(act) - 1] or idx
+        idx.sort(key=lambda i: -act[i])
+    else:
+        idx = [i for i in idx if i != 0] or idx
+        idx.sort(key=lambda i: act[i])
+    return sorted(idx[:limit])
+
+
+def repair_text(scene_no: int, what: str, profile: dict[str, Any], activity: float,
+                static_range: tuple[float, float] = (15.0, 45.0), medium: str = "motion") -> str:
+    lo, hi = static_range
+    head = (f"The finished film was measured. {profile['static_pct']:.0f}% of its frames are still "
+            f"(a film that breathes is {lo:.0f}-{hi:.0f}%) and its longest hold is {profile['longest_hold']:g}s. "
+            f"Scene {scene_no} moves at {activity:g} grey levels a second on average. ")
+    if what == "never_rests":
+        body = ("Nothing in the film ever settles, so nothing is given time to be read. Rewrite this scene "
+                "so it has a real hold: its elements arrive in the first third, then NOTHING moves for at "
+                "least 1.5 seconds. Remove looping secondary_motion and drift, and particle fields that keep "
+                "moving after the arrival. Do not fill the hold with decoration.")
+    elif medium == "studio":
+        body = ("The reel is mostly still. Rewrite this scene so something is always changing in it: a slow "
+                "zoom or drift on the photo or the main shape across the whole scene, lines that arrive one "
+                "after another (staggered animation-delay), a stroke that draws itself, a number that "
+                "counts. Give each change a clear start and end, keep the words, and keep every change "
+                "inside the frame.")
+    else:
+        body = ("The film is mostly still. Rewrite this scene so something is always changing in it: a camera "
+                "shot (push toward the focus or pull to reveal), staggered entrances, a typed line or a "
+                "travelling cursor. Give the change a clear start and end.")
+    return head + body

@@ -3918,7 +3918,9 @@ def motion_script(all_responses: dict) -> str:
     return ""
 
 
-def motion_turn_one(query: str, skeleton: str, all_responses: dict) -> str:
+def motion_turn_one(query: str, skeleton: str, all_responses: dict,
+                    brand: dict | None = None, look: str = "",
+                    kit: dict | None = None, has_logo: bool = False) -> str:
     """The motion writer's rebuilt first prompt — the storyboard turn with
     the script threaded in — or "" when no script was written, in which
     case the planned prompt stands."""
@@ -3927,7 +3929,8 @@ def motion_turn_one(query: str, skeleton: str, all_responses: dict) -> str:
         return ""
     from .motion import generate as _motion_gen
     return _motion_gen.storyboard_instructions(
-        query, skeleton=skeleton or "cinematic_glass", script=script)
+        query, brand=brand or None, skeleton=skeleton or "cinematic_glass",
+        script=script, look=look, kit=kit, has_logo=has_logo)
 
 
 def _keep_failed_spec(sources) -> str:
@@ -5880,6 +5883,16 @@ def _brand_from_images(files: list) -> dict:
     return (_pillow.sample_brand(imgs) or {}) if imgs else {}
 
 
+def _film_look(query: str) -> str:
+    """The art direction this run's film takes (core.looks): the one the client
+    named, else one the last few films did not use. Recorded so the next film
+    is steered away from it."""
+    from . import looks as _looks
+    name = _looks.pick(query, _looks.recent())
+    _looks.remember(name)
+    return name
+
+
 def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
                 studio: dict | None = None):
     """Film the page the art-direction stage wrote.
@@ -6543,13 +6556,39 @@ def _run_footage(prior_text, attachments, cfg: dict, on_progress=None):
     return out, f"client footage edited — {os.path.basename(out)} ({', '.join(details)})"
 
 
+def _critic_look(cfg: dict, frames_of, ui=None, cap: float = 0.10):
+    """The vision critic as the `critic` callable build_spec takes, or None when
+    it is off (config motion_critic + an OpenRouter key: the same explicit choice
+    the BOQ add-on asks before it sends a drawing). Remembers what it has spent;
+    once over `cap` dollars it answers None, which the repair loop reads as
+    "could not look", never as "fixed"."""
+    from .motion import critic as _critic
+    if not _critic.enabled(cfg):
+        return None
+    spent = [0.0]
+
+    def look(spec):
+        if spent[0] >= cap:
+            return None
+        got = _critic.critique(frames_of(spec), cfg, max_cost=cap)
+        spent[0] += got.get("cost") or 0.0
+        if got.get("skipped") and not got.get("defects"):
+            return None
+        if ui:
+            ui.info(f"   critic: ${spent[0]:.3f} spent")
+        return got["defects"]
+
+    return look
+
+
 def _motion_skeleton(explicit: str, cfg) -> str:
     """Which Motion story profile a run uses: the caller's own choice, else
     config `motion_skeleton` ("story" is the five-part grammar for any
-    business, see core.motion.story), else the cinematic profile that has always
+    business, see core.motion.story; "blocks" composes the film from the
+    tested block library, see core.motion.blocks), else the cinematic profile that has always
     been the default. Changing the default is a product decision, so it stays a
     one-line change here."""
-    allowed = ("cinematic_glass", "story", "brand_launch", "spine")
+    allowed = ("cinematic_glass", "story", "brand_launch", "spine", "blocks")
     chosen = explicit or (cfg.get("motion_skeleton") if isinstance(cfg, dict) else "")
     return chosen if chosen in allowed else "cinematic_glass"
 
@@ -6913,6 +6952,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     research_stage = ""
     studio_brand: dict = {}
     design_assets: dict = {}
+    # The client's identity (core.brandkit) and this film's art direction
+    # (core.looks), shared by Studio and Motion. The direction is chosen once,
+    # by whichever film stage is planned first.
+    from . import brandkit as _brandkit
+    film_kit = _brandkit.from_config(cfg)
+    film_look = ""
+    motion_brand: dict = {}
+    motion_has_logo = False
     # Stages whose reply is READ BY A PROGRAM, not handed to another chat.
     # The pipeline's normal rules demand a prose "HANDOFF FOR <next agent>"
     # section as the last thing in the answer, which flatly contradicts "reply
@@ -6978,6 +7025,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # stage is already on their website — asking for the hex codes
             # while it is there costs nothing, where having Prism open the
             # site again to sample it would cost a whole extra page load.
+            # Colours the client typed into their brand kit win over ones
+            # measured off this run's attachments.
+            brand = _brandkit.colours(film_kit, brand)
             if not brand:
                 # `ragent`, not `an`: reusing the writer's name here rebound it
                 # and the plan banner then credited the script to whichever
@@ -7043,10 +7093,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # run. A token stands in and is substituted the moment before this
             # prompt is typed.
             studio_brand = dict(brand or {})
+            film_look = film_look or _film_look(query)
+            ui.info(f"🎨  art direction for this reel: {film_look}")
             stages.insert(studio_at, ("design", director,
                                       [_web.design_instructions(
                                           brand or None, query,
-                                          _web.ASSET_TOKEN)]))
+                                          _web.ASSET_TOKEN,
+                                          look=film_look, kit=film_kit)]))
             studio_at += 1
             design_feeder = studio_at - 1
             script_stage = stages[writer][0]
@@ -7175,10 +7228,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 motion_at += 1
                 ui.info(f"🖼️   {maker_m} will make up to "
                         f"{_web_m.MAX_GENERATED} images for the motion graphic")
+            # Motion was never told the client's colours at all (the
+            # parameter existed; nothing passed it). Same reading Studio uses.
+            motion_brand = _brandkit.colours(film_kit, _brand_from_images(attachments or []))
+            try:
+                from . import assets as _assets_m
+                motion_has_logo = "logo" in _assets_m.collect(attachments or [])
+            except Exception:                              # noqa: BLE001
+                motion_has_logo = False
+            film_look = film_look or _film_look(query)
+            ui.info(f"🎨  art direction for this motion graphic: {film_look}"
+                    + (f" — brand accent {motion_brand.get('accent')}" if motion_brand else ""))
             stages.insert(motion_at, ("motion_plan", planner,
                                       [_motion_gen.storyboard_instructions(
-                                          query,
-                                          skeleton=_motion_skeleton(motion_skeleton, cfg))]))
+                                          query, brand=motion_brand or None,
+                                          skeleton=_motion_skeleton(motion_skeleton, cfg),
+                                          look=film_look, kit=film_kit,
+                                          has_logo=motion_has_logo)]))
             motion_at += 1
             motion_feeder = motion_at - 1
             machine_stages[motion_feeder] = (
@@ -7299,8 +7365,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 str(a.get("path", "")).lower().endswith(
                     (".png", ".jpg", ".jpeg", ".webp", ".bmp"))
                 for a in (attachments or []))
+            # A reel or motion graphic (film_look is set by whichever film
+            # stage was planned) gets whole scene pictures in its own art
+            # direction and colours; any other use keeps the cut-out subjects.
             paths, note = _image_gen.generate_artwork(
-                query, prior_text, cfg, has_own_artwork=has_own_artwork)
+                query, prior_text, cfg, has_own_artwork=has_own_artwork,
+                film=bool(film_look), look=film_look,
+                brand=studio_brand or motion_brand or None)
             if not paths:
                 ui.err(note)
                 emit("stage_error", {"stage": stage, "error": note, "url": ""})
@@ -7612,7 +7683,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # the writer plans its own story (the Alphakore run, 10 Sep
             # 2026, invented a slogan per scene while the script sat unused
             # one stage earlier).
-            rebuilt = motion_turn_one(query, motion_skeleton, all_responses)
+            rebuilt = motion_turn_one(query, motion_skeleton, all_responses,
+                                      brand=motion_brand, look=film_look,
+                                      kit=film_kit, has_logo=motion_has_logo)
             if rebuilt:
                 questions = [rebuilt]
 
@@ -8650,6 +8723,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             script=script_txt, assets=listing,
                             assets_table=design_assets,
                             check=_web.inspect, brand=studio_brand,
+                            measure=_web.rhythm_probe,
+                            critic=_critic_look(cfg, _web.settled_frames, ui),
                             log=lambda m: ui.info(f"   {m}"),
                             should_stop=stage_halt,
                             on_scene=lambda i, n: emit(
@@ -8687,6 +8762,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     from . import motion as _motion_pkg
                     from .motion import generate as _motion
                     from .motion import measure as _motion_measure
+                    from .motion import rhythm as _motion_rhythm
+                    from .motion import critic as _critic_mod
                     from . import assets as _assets
 
                     scene_wait = max(int(agent_cfg.get("wait_time", 60)), 180)
@@ -8726,6 +8803,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             assets=motion_assets_listing,
                             assets_table=motion_assets_table,
                             skeleton=_motion_skeleton(motion_skeleton, cfg),
+                            # What the client supplied: their words and their
+                            # kit. A name or number from the kit is theirs to show.
+                            request=(query + "\n" + _brandkit.corpus(film_kit)).strip(),
+                            measure=_motion_rhythm.probe,
+                            critic=_critic_look(cfg, _critic_mod.settled_frames, ui),
                             # The estimate plus, when a browser is here, the
                             # scene laid out for real with the camera applied
                             # (core.motion.measure — the 11 Nov 2026 study's M4).

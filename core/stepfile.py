@@ -54,10 +54,12 @@ from __future__ import annotations
 
 from . import skills as _SK
 
+import csv
 import datetime as _dt
 import math as _math
 import os
 import re
+from dataclasses import dataclass, field
 from urllib.parse import quote as _quote
 
 try:
@@ -2817,3 +2819,271 @@ def review_html(report: dict, plan: dict, out_dir: str,
     with open(path, "w", encoding="utf-8") as f:
         f.write(page)
     return path
+
+
+# ── material / mould catalog lookup ─────────────────────────────────────
+#
+# A shop that moulds oil seals/O-rings keeps its own spreadsheet of what
+# Sr No of raw material and which mould make each size. An inquiry gives
+# the finished part's ID and OD; the person's job used to be "scan the
+# sheet by eye." This reads that sheet once (CSV or XLSX, the customer's
+# own file, never touched or re-saved by Prism) and answers the one
+# question a shop actually asks: for this ID x OD, which Sr Nos?
+#
+# No AI is involved anywhere in this path -- it is the same offline rule
+# as the rest of this module, just arithmetic (|catalog - inquiry| against
+# a tolerance) instead of geometry.
+
+class CatalogError(Exception):
+    """A sentence for the user, not a stack trace -- same contract as
+    StepError above."""
+
+
+# Header spellings this accepts, canonicalised the same loose way as
+# core.quoting's own rate-list reader: lower-case, collapsed whitespace.
+# Deliberately narrow on the Sr No columns (always "material"/"mould" +
+# "sr no") so the catalog's own running Sr No column (just "Sr No") is
+# never mistaken for either of them.
+_CATALOG_ALIASES = {
+    "product_id_mm": ("product id mm", "id mm", "inner diameter mm", "id",
+                      "inner dia mm", "inner diameter", "bore mm"),
+    "product_od_mm": ("product od mm", "od mm", "outer diameter mm", "od",
+                      "outer dia mm", "outer diameter"),
+    "id_tolerance_mm": ("id tolerance mm", "id tolerance", "id tol mm",
+                        "id tol"),
+    "od_tolerance_mm": ("od tolerance mm", "od tolerance", "od tol mm",
+                        "od tol"),
+    "material_sr_no": ("material sr no", "material sr. no",
+                       "material serial no", "material no", "mat sr no"),
+    "mould_sr_no": ("mould sr no", "mould sr. no", "mould serial no",
+                   "mould no", "mold sr no", "mold sr. no"),
+}
+
+# How far the inquiry's ID/OD may sit from a catalog row before it no
+# longer counts as that size -- used only when the row's own file has no
+# tolerance column to say otherwise. Oil-seal ID/OD is usually held to a
+# few tenths of a millimetre, so a wrong row is not mistaken for a match
+# just because nobody typed a tolerance column into the spreadsheet.
+_DEFAULT_CATALOG_TOLERANCE_MM = 0.30
+
+
+def _catalog_key(header: str) -> str | None:
+    h = (header or "").strip().lower().replace("_", " ")
+    h = re.sub(r"\s+", " ", h).strip(" .:")
+    for key, aliases in _CATALOG_ALIASES.items():
+        if h in aliases:
+            return key
+    return None
+
+
+def _catalog_rows_from_csv(path: str) -> list[list[str]]:
+    with open(path, "r", encoding="utf-8-sig", errors="replace",
+             newline="") as f:
+        sample = f.read(8192)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        return [[(c or "").strip() for c in row]
+               for row in csv.reader(f, dialect)]
+
+
+def _catalog_rows_from_xlsx(path: str) -> list[list[str]]:
+    if not HAVE_XLSX:
+        raise CatalogError(
+            "Prism can't open Excel files in this build. In Excel choose "
+            "File → Save As → CSV, and attach that instead -- the Sr Nos "
+            "are identical.")
+    book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = book[book.sheetnames[0]]
+        return [["" if c is None else str(c).strip() for c in row]
+               for row in sheet.iter_rows(values_only=True)]
+    finally:
+        book.close()
+
+
+def _catalog_header_row(rows: list[list[str]]) -> tuple[int | None, dict]:
+    """The first row naming both ID and OD columns -- scanned a reasonable
+    way down so a letterhead or a title row above the table doesn't hide
+    it, same approach as core.quoting's rate-list header finder."""
+    for index, row in enumerate(rows[:40]):
+        mapping = {}
+        for position, cell in enumerate(row):
+            key = _catalog_key(cell)
+            if key and key not in mapping:
+                mapping[key] = position
+        if "product_id_mm" in mapping and "product_od_mm" in mapping:
+            return index, mapping
+    return None, {}
+
+
+def _catalog_num(row: list[str], mapping: dict, key: str) -> float | None:
+    pos = mapping.get(key)
+    if pos is None or pos >= len(row):
+        return None
+    text = (row[pos] or "").strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _catalog_text(row: list[str], mapping: dict, key: str) -> str:
+    pos = mapping.get(key)
+    if pos is None or pos >= len(row):
+        return ""
+    return (row[pos] or "").strip()
+
+
+@dataclass
+class CatalogRow:
+    """One size in the customer's material/mould sheet -- the numbers used
+    to match it, the two Sr Nos the shop actually wants, and every original
+    column (header -> cell text) so the result can show the full row, not
+    just the two Sr Nos, without this module having to know every heading
+    a customer's spreadsheet might use."""
+    id_mm: float
+    od_mm: float
+    id_tolerance_mm: float
+    od_tolerance_mm: float
+    material_sr_no: str
+    mould_sr_no: str
+    raw: dict = field(default_factory=dict)
+
+
+def load_catalog(path: str) -> list[CatalogRow]:
+    """Read a material/mould reference sheet (CSV or XLSX) into
+    CatalogRows. Raises CatalogError, with a fix in the message, when the
+    file can't be understood -- same contract as core.quoting.load_rates,
+    which this mirrors."""
+    if not path or not os.path.exists(path):
+        raise CatalogError(f"No catalog file at {path or '(none)'}.")
+    extension = os.path.splitext(path)[1].lower()
+    if extension in (".xlsx", ".xlsm"):
+        rows = _catalog_rows_from_xlsx(path)
+    elif extension == ".xls":
+        raise CatalogError(
+            "That is the old .xls format, which Prism can't read. Open it "
+            "in Excel and use File → Save As → CSV.")
+    else:
+        rows = _catalog_rows_from_csv(path)
+
+    header_index, mapping = _catalog_header_row(rows)
+    if header_index is None:
+        raise CatalogError(
+            "Prism couldn't find the ID/OD columns in that file. It needs "
+            "a row of headings including something like \"Product ID mm\" "
+            "and \"Product OD mm\", plus \"Material Sr No\" and "
+            "\"Mould Sr No\".")
+
+    header_cells = [c.strip() for c in rows[header_index]]
+    out: list[CatalogRow] = []
+    for raw_row in rows[header_index + 1:]:
+        if not any((c or "").strip() for c in raw_row):
+            continue
+        id_mm = _catalog_num(raw_row, mapping, "product_id_mm")
+        od_mm = _catalog_num(raw_row, mapping, "product_od_mm")
+        if id_mm is None or od_mm is None:
+            continue
+        id_tol = _catalog_num(raw_row, mapping, "id_tolerance_mm")
+        od_tol = _catalog_num(raw_row, mapping, "od_tolerance_mm")
+        raw = {header_cells[i]: (raw_row[i] if i < len(raw_row) else "")
+              for i in range(len(header_cells)) if header_cells[i]}
+        out.append(CatalogRow(
+            id_mm=id_mm, od_mm=od_mm,
+            id_tolerance_mm=(id_tol if id_tol is not None
+                            else _DEFAULT_CATALOG_TOLERANCE_MM),
+            od_tolerance_mm=(od_tol if od_tol is not None
+                            else _DEFAULT_CATALOG_TOLERANCE_MM),
+            material_sr_no=_catalog_text(raw_row, mapping, "material_sr_no"),
+            mould_sr_no=_catalog_text(raw_row, mapping, "mould_sr_no"),
+            raw=raw))
+    if not out:
+        raise CatalogError(
+            "That file has the right headings but no usable rows under "
+            "them -- check that the ID and OD columns have numbers in "
+            "them.")
+    return out
+
+
+def match_catalog(rows: list[CatalogRow], id_mm: float, od_mm: float
+                  ) -> tuple[CatalogRow | None, CatalogRow | None]:
+    """(match, nearest). `match` is the closest row whose ID and OD both
+    sit within THAT ROW's own tolerance of the inquiry's figures -- never
+    the nearest row regardless of how far off it really is, because a
+    confident-looking wrong Sr No is worse than no match at all. `nearest`
+    is always the closest row by plain distance (shown even on a miss, so
+    the person can see how far off the catalog's closest size is) and is
+    None only when the catalog itself is empty."""
+    if not rows:
+        return None, None
+    scored = sorted(
+        ((abs(r.id_mm - id_mm) + abs(r.od_mm - od_mm),
+         abs(r.id_mm - id_mm), abs(r.od_mm - od_mm), r) for r in rows),
+        key=lambda t: t[0])
+    nearest = scored[0][3]
+    match = next((r for _, d_id, d_od, r in scored
+                 if d_id <= r.id_tolerance_mm and d_od <= r.od_tolerance_mm),
+                None)
+    return match, nearest
+
+
+def catalog_match_text(id_mm: float, od_mm: float,
+                       match: CatalogRow | None,
+                       nearest: CatalogRow | None) -> str:
+    """One plain-English block for the report/chat -- never translated
+    here (see report_text() above: this module's own sentences are the
+    engine's output, not UI chrome; the dialog wraps UI labels, not this)."""
+    head = f"Material/mould lookup for ID {id_mm:.2f} x OD {od_mm:.2f} mm:"
+    if match is not None:
+        size = match.raw.get("Seal Size (IDxODxW)") or match.raw.get("Size") or ""
+        compound = match.raw.get("Compound") or ""
+        tail = " — " + ", ".join(p for p in (size, compound) if p) if (size or compound) else ""
+        return (f"{head} MATCH -- Material Sr No {match.material_sr_no or '?'}, "
+               f"Mould Sr No {match.mould_sr_no or '?'}{tail}.")
+    if nearest is None:
+        return f"{head} the catalog has no rows to compare against."
+    d_id = abs(nearest.id_mm - id_mm)
+    d_od = abs(nearest.od_mm - od_mm)
+    return (f"{head} no catalog row within tolerance. Nearest is "
+           f"Material Sr No {nearest.material_sr_no or '?'} / Mould Sr No "
+           f"{nearest.mould_sr_no or '?'} at ID {nearest.id_mm:.2f} x OD "
+           f"{nearest.od_mm:.2f} mm (off by {d_id:.2f}/{d_od:.2f} mm) -- "
+           "check this one by hand before using it.")
+
+
+def catalog_explain_prompt(id_mm: float, od_mm: float,
+                          nearest: CatalogRow) -> str:
+    """A second opinion for the one case the deterministic match is
+    genuinely ambiguous about: a miss. Numbers only -- the inquiry's own
+    ID/OD and the nearest row's figures and Sr Nos -- never the catalog
+    file, never the STEP file. On a confident match no AI is called at
+    all (see dialog.py): there is nothing to explain, only this case is.
+    """
+    d_id = abs(nearest.id_mm - id_mm)
+    d_od = abs(nearest.od_mm - od_mm)
+    size = (nearest.raw.get("Seal Size (IDxODxW)")
+           or nearest.raw.get("Size") or "")
+    compound = nearest.raw.get("Compound") or ""
+    tail = f" ({size}, {compound})" if (size or compound) else ""
+    return (
+        "A small fabrication shop's oil-seal/O-ring inquiry did not match "
+        "any row in their own material/mould catalog within tolerance. "
+        "In ONE or TWO short, plain sentences: say why this is likely not "
+        "the same size, and give one practical next step (check the "
+        "drawing's tolerance class, ask the customer to confirm ID/OD, or "
+        "use the nearest size only if the shop's own practice allows it). "
+        "No preamble, no headings, no bullet points -- a shop-floor "
+        "answer, not a report.\n\n"
+        f"Inquiry: ID {id_mm:.2f} mm, OD {od_mm:.2f} mm.\n"
+        f"Nearest catalog size: ID {nearest.id_mm:.2f} mm, OD "
+        f"{nearest.od_mm:.2f} mm{tail}. Off by {d_id:.2f} mm on ID and "
+        f"{d_od:.2f} mm on OD; tolerance was "
+        f"{nearest.id_tolerance_mm:.2f}/{nearest.od_tolerance_mm:.2f} mm.\n"
+        f"Material Sr No {nearest.material_sr_no or '?'}, Mould Sr No "
+        f"{nearest.mould_sr_no or '?'} (nearest size only -- not a "
+        "confirmed match).")

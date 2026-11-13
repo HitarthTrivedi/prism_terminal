@@ -63,7 +63,9 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
                      attachments: list[dict] | None = None,
                      temperature: float = 0.3, timeout: int = 180,
                      retries: int = 1, max_tokens: int | None = None,
-                     extra: dict | None = None, usage_sink: dict | None = None) -> str:
+                     extra: dict | None = None,
+                     usage_out: dict | None = None,
+                     usage_sink: dict | None = None) -> str:
     """One OpenRouter completion. `model` is an OpenRouter model id, e.g.
     "anthropic/claude-sonnet-5.5" — addons/boq/agents.py owns the mapping
     from a Prism Agent's display name to the model id actually sent here.
@@ -86,7 +88,14 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
     empty final answer (finish_reason "length") until reasoning was
     turned off. Neither parameter is read by any caller before this
     one asked for it, so every existing call keeps behaving exactly as
-    it always has."""
+    it always has.
+
+    `usage_out`: when given, filled in place with whatever `usage` object
+    OpenRouter's own response carried (`prompt_tokens`/`completion_tokens`/
+    `total_tokens`) — a BOQ counter (addons/boq/history.py) sums these
+    across runs for the token-usage figure it shows. A mutated-in-place
+    dict rather than a second return value, so this stays a plain string
+    return for the many existing callers that already match on that."""
     if not api_key:
         raise RuntimeError(
             "No OpenRouter key set. Add one in Settings → AI tools.")
@@ -132,6 +141,15 @@ def openrouter_chat(api_key: str, model: str, prompt: str, *,
             if usage_sink is not None:
                 usage_sink.update(body.get("usage") or {})
             msg = body["choices"][0]["message"]
+            if usage_out is not None:
+                usage_out.update(body.get("usage") or {})
+                # Whether the answer is whole: "length" means the model hit
+                # its output limit and the text stops mid-way; a null
+                # `content` means the string returned below is the model's
+                # own working notes, not an answer. A caller that saves the
+                # result as a document reads these before trusting it.
+                usage_out["finish_reason"] = body["choices"][0].get("finish_reason")
+                usage_out["answer_from_reasoning"] = not msg.get("content")
             # A "thinking" model can spend its whole token budget on its
             # own reasoning and return a null `content` (finish_reason
             # "length") -- fall back to the reasoning text itself rather

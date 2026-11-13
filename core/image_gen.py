@@ -57,6 +57,37 @@ _WORDMARK_ROLE = ("a wordmark/emblem for the business — its name spelled "
                   "out EXACTLY as given, in a style matching its industry")
 
 
+# Film mode. Until 13 Nov 2026 a reel's pictures were six subjects on flat white,
+# cut out and set on cards — which is what a slide deck looks like. A film needs
+# whole pictures: full-frame vertical plates the scenes can sit on and move over,
+# in the film's own art direction and palette, plus two cut-out subjects.
+_SCENE_ROLES = (
+    "SCENE PLATE 1 — the opening place or moment this film is about, wide and atmospheric",
+    "SCENE PLATE 2 — a closer, more intimate view: hands, materials or a detail in use",
+    "SCENE PLATE 3 — the feeling the film ends on: warm, resolved, a place to rest the eye",
+)
+_FILM_ROLES = _SCENE_ROLES + _ASSET_ROLES[:2]
+_PLATE_RULES = (
+    "A full-frame vertical picture with real depth — foreground, middle, background — "
+    "lit with intent and filling the whole frame, not an object on a plain ground. "
+    "Keep one calm, uncluttered area (a third of the frame, top or bottom) where type "
+    "can sit. No text, letters, numbers or logos anywhere. If people appear, show them "
+    "from behind or at a distance, never a close-up face.")
+
+
+def _film_style(look: str, brand: dict | None) -> str:
+    """The film's picture style: its art direction's, and its brand colours."""
+    from . import looks as _looks
+    style = _looks.image_style(look)
+    accent = (brand or {}).get("accent")
+    bits = []
+    if style:
+        bits.append(f"Picture style: {style}.")
+    if accent:
+        bits.append(f"Let {accent} be the dominant accent colour in the scene, with neutral tones around it.")
+    return " ".join(bits)
+
+
 def _prompt_from(prior_text) -> str:
     """The brief the stage before 'visual' wrote, turned into one image
     prompt. `prior_text` is either a single string or the earlier stages'
@@ -353,11 +384,14 @@ def generate(query: str, prior_text, cfg: dict, attachments=None, *,
 # with nothing missing, never from a bare request it cannot complete itself.
 
 def _brief_meta_prompt(query: str, context: str, n: int,
-                       has_own_artwork: bool) -> str:
+                       has_own_artwork: bool, film: str = "") -> str:
     """What the text model is asked, to turn one request into N prompts a
     picture-only model can draw with nothing else to go on."""
     today = _dt.date.today().strftime("%d %B %Y")
-    roles = ([] if has_own_artwork else [_WORDMARK_ROLE]) + list(_ASSET_ROLES)
+    if film:
+        roles = list(_FILM_ROLES)
+    else:
+        roles = ([] if has_own_artwork else [_WORDMARK_ROLE]) + list(_ASSET_ROLES)
     roles = roles[:n]
     numbered = "\n".join(f"{i}. {r}" for i, r in enumerate(roles, 1))
     return (
@@ -379,13 +413,19 @@ def _brief_meta_prompt(query: str, context: str, n: int,
         "place or an industry, describe the visual character that "
         "actually implies. Never invent a specific real fact — an "
         "address, a person, a logo — that was not given to you above.\n\n"
+        + (f"THE FILM'S LOOK — every prompt carries this: {film}\n"
+           f"For the SCENE PLATES: {_PLATE_RULES}\n"
+           "For the other prompts (cut-out subjects): ONE flat solid plain background colour "
+           "and nothing else behind the subject, exactly one clear subject, no text.\n\n"
+           if film else "") +
+        ("" if film else
         "Every single prompt must ALSO say, verbatim in substance: ONE "
         "flat solid plain background colour and nothing else behind the "
         "subject — no scene, no gradient, no shadow, no texture; exactly "
         "one clear subject with generous empty space around it; no "
         "people, no faces; no on-image text or lettering (except prompt "
         "1, the wordmark, which may show the business name and nothing "
-        "else).\n\n"
+        "else).\n\n") +
         f"Answer with exactly {len(roles)} lines and nothing else — no "
         "numbering, no headers, no blank lines between them, no "
         "commentary before or after."
@@ -393,7 +433,7 @@ def _brief_meta_prompt(query: str, context: str, n: int,
 
 
 def build_prompts(query: str, context: str, cfg: dict, *, n: int = 6,
-                  has_own_artwork: bool = False) -> list[str]:
+                  has_own_artwork: bool = False, film: str = "") -> list[str]:
     """N complete, self-contained FLUX prompts, written by a real text
     model (Claude Haiku 5.5) that can reason about dates, festivals and
     whatever research already ran earlier in this pipeline — the research
@@ -405,7 +445,7 @@ def build_prompts(query: str, context: str, cfg: dict, *, n: int = 6,
     try:
         text = _openrouter.openrouter_chat(
             api_key, BRIEF_MODEL,
-            _brief_meta_prompt(query, context, n, has_own_artwork),
+            _brief_meta_prompt(query, context, n, has_own_artwork, film),
             temperature=0.5, timeout=60)
     except Exception:                                         # noqa: BLE001
         return []
@@ -415,7 +455,8 @@ def build_prompts(query: str, context: str, cfg: dict, *, n: int = 6,
 
 def generate_artwork(query: str, prior_text, cfg: dict, *,
                      has_own_artwork: bool = False,
-                     n: int = 6) -> tuple[list[str], str]:
+                     n: int = 6, look: str = "", brand: dict | None = None,
+                     film: bool = False) -> tuple[list[str], str]:
     """The "artwork" stage's own local path, end to end: write N
     self-contained prompts, draw each on a flat background, then cut that
     background out with Prism's own existing cutout tool (core.assets) —
@@ -425,8 +466,11 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
     Returns ([paths], message) — paths empty only when nothing at all
     could be made; one failed asset among several does not sink the rest."""
     context = _context_from(prior_text)
+    style = (_film_style(look, brand) or "Picture style: natural, considered.") if film else ""
+    if film:
+        n = len(_FILM_ROLES)
     prompts = build_prompts(query, context, cfg, n=n,
-                            has_own_artwork=has_own_artwork)
+                            has_own_artwork=has_own_artwork, film=style)
     if not prompts:
         return [], ("FLUX 3 Klein needs an OpenRouter key to write the "
                     "image briefs — add one in Settings → AI tools.")
@@ -438,19 +482,22 @@ def generate_artwork(query: str, prior_text, cfg: dict, *,
 
     out_paths = []
     for i, prompt in enumerate(prompts, 1):
-        full = (prompt + " Background: one flat solid plain white colour "
-                "(#FFFFFF), absolutely nothing else behind the subject.")
+        plate = film and i <= len(_SCENE_ROLES)
+        full = prompt if plate else (
+            prompt + " Background: one flat solid plain white colour "
+            "(#FFFFFF), absolutely nothing else behind the subject.")
         try:
             data = _openrouter.openrouter_image(
-                api_key, MODEL, full, aspect_ratio="4:5", resolution="1K")
+                api_key, MODEL, full, aspect_ratio="9:16" if plate else "4:5",
+                resolution="1K")
         except Exception as e:                                # noqa: BLE001
             continue
         raw = os.path.join(_config.RUNS_DIR,
                            f"flux_{int(time.time())}_{i}.png")
         with open(raw, "wb") as f:
             f.write(data)
-        prep = _assets.prepare(raw, _config.RUNS_DIR)
-        out_paths.append(prep["path"])
+        # A scene plate is kept whole; only a cut-out subject has its ground removed.
+        out_paths.append(raw if plate else _assets.prepare(raw, _config.RUNS_DIR)["path"])
 
     if not out_paths:
         return [], "FLUX 3 Klein could not draw any of the images."

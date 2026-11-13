@@ -1315,6 +1315,49 @@ def spec_instructions(requested: float | None = None) -> str:
 
 # ── brand extraction & spec parsing ─────────────────────────────────────────
 
+def _is_green(rgb) -> bool:
+    r, g, b = rgb
+    return g > r + 18 and g > b + 18
+
+
+def _leading_colour(image_paths: list[str]):
+    """The artwork's leading saturated colour, any hue, as (r, g, b) — or None
+    when it is all greys, whites and blacks. Colours are grouped into twelve
+    hue families first, so a logo's one red beats a photograph's scatter of
+    many different ones; the family is ranked like the green reading, by how
+    much there is of it and how vivid it is."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    import colorsys
+    from collections import Counter
+    family: dict[int, float] = {}
+    members: dict[int, Counter] = {}
+    exact: dict[tuple, Counter] = {}
+    for p in image_paths:
+        try:
+            im = Image.open(p).convert("RGB")
+        except Exception:
+            continue
+        im.thumbnail((320, 320))
+        for px in im.getdata():
+            r, g, b = px
+            sat = max(px) - min(px)
+            if sat <= 70 or max(px) < 70:
+                continue                          # grey, white, black or mud
+            h = int(colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)[0] * 12) % 12
+            family[h] = family.get(h, 0.0) + sat ** 1.6
+            near = (r & 0xF8, g & 0xF8, b & 0xF8)   # anti-aliased edges vote with their neighbours
+            members.setdefault(h, Counter())[near] += 1
+            exact.setdefault(near, Counter())[px] += 1
+    if not family:
+        return None
+    best = max(family, key=family.get)
+    near, _ = max(members[best].items(), key=lambda kv: kv[1] * (max(kv[0]) - min(kv[0])) ** 1.6)
+    return exact[near].most_common(1)[0][0]
+
+
 def sample_brand(image_paths: list[str]) -> dict:
     """Read the client's palette off their own artwork — a business card, a
     logo, a brochure — instead of asking anyone to type hex codes.
@@ -1352,6 +1395,15 @@ def sample_brand(image_paths: list[str]) -> dict:
                 deep_votes[px] += 1
 
     out = {}
+    # The green reading above was written for the first client, whose brand is
+    # green; a red, blue or orange brand came back with no colours at all. So
+    # every hue is read too, and green keeps its own tuned reading only when
+    # green really is the artwork's leading colour.
+    lead = _leading_colour(image_paths)
+    if lead and not (accent_votes and _is_green(lead)):
+        r, g, b = lead
+        return {"accent": "#%02X%02X%02X" % lead,
+                "deep": "#%02X%02X%02X" % (int(r * .72), int(g * .72), int(b * .72))}
     if accent_votes:
         # Rank by frequency AND vividness, not frequency alone. A logo mark
         # covers more pixels than a heading, but the heading usually carries
